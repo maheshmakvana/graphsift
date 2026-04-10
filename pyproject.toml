@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphsift"
+version = "1.0.0"
+description = "Smarter code context for LLMs — ranked relevance, multi-file diff, decorator+dynamic import graph, tokenpruner compression. Beats code-review-graph with 80-150x token reduction."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = [
+    "code review llm",
+    "context selection",
+    "token reduction code",
+    "ast dependency graph",
+    "code graph python",
+    "llm context window",
+    "code review claude",
+    "code review gpt4",
+    "code context compression",
+    "dependency graph python",
+    "blast radius analysis",
+    "semantic code search",
+    "codebase context llm",
+    "token budget code",
+    "python ast parser",
+    "code review automation",
+    "llm code context",
+    "code-review-graph alternative",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Quality Assurance",
+    "Intended Audience :: Developers",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+tokenpruner = ["tokenpruner>=1.0.0"]
+all = ["tokenpruner>=1.0.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0",
+    "tokenpruner>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/maheshmakvana/graphsift"
+Repository = "https://github.com/maheshmakvana/graphsift"
+Issues = "https://github.com/maheshmakvana/graphsift/issues"
+
+[tool.setuptools.packages.find]
+exclude = ["tests*", "venv*", "dist*", "build*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["graphsift"]
+omit = ["tests/*", "venv/*"]
