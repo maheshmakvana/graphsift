@@ -1,4 +1,4 @@
-"""graphsift CLI — install, serve, build, update, status."""
+"""graphsift CLI - install, serve, build, update, status."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def cmd_install(args: argparse.Namespace) -> int:
 
         settings.setdefault("hooks", {})
 
-        # SessionInit — prime Claude with graph awareness
+        # SessionInit - prime Claude with graph awareness
         settings["hooks"].setdefault("SessionInit", [])
         session_hook = {
             "matcher": "",
@@ -97,7 +97,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         if not any("graphsift" in c for c in existing_cmds):
             settings["hooks"]["SessionInit"].append(session_hook)
 
-        # PostToolUse — auto-update graph after Write/Edit/Bash
+        # PostToolUse - auto-update graph after Write/Edit/Bash
         settings["hooks"].setdefault("PostToolUse", [])
         post_hook = {
             "matcher": "Write|Edit|Bash",
@@ -120,7 +120,7 @@ def cmd_install(args: argparse.Namespace) -> int:
             settings["hooks"]["PostToolUse"].append(post_hook)
 
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        print(f"[graphsift] Wrote hooks → {settings_path}")
+        print(f"[graphsift] Wrote hooks -> {settings_path}")
 
     # 3. Write skill files
     if not args.no_skills:
@@ -164,7 +164,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         "dist", "build", ".mypy_cache", ".pytest_cache",
     }
 
-    print(f"[graphsift] Indexing {root} …")
+    print(f"[graphsift] Indexing {root} ...")
     source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
     builder = ContextBuilder(ContextConfig())
     stats = builder.index_files(source_map)
@@ -185,12 +185,12 @@ def cmd_build(args: argparse.Namespace) -> int:
     print(f"[graphsift] Indexed {stats.files_indexed} files, "
           f"{stats.symbols_extracted} symbols, {stats.edges_created} edges "
           f"in {stats.duration_ms:.0f} ms")
-    print(f"[graphsift] Manifest → {manifest_path}")
+    print(f"[graphsift] Manifest -> {manifest_path}")
     return 0
 
 
 # ---------------------------------------------------------------------------
-# update command  (incremental — called by PostToolUse hook)
+# update command  (incremental - called by PostToolUse hook)
 # ---------------------------------------------------------------------------
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -198,7 +198,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     manifest_path = root / ".graphsift" / "manifest.json"
 
     if not manifest_path.exists():
-        # Silent — no graph built yet, nothing to update
+        # Silent - no graph built yet, nothing to update
         return 0
 
     try:
@@ -329,7 +329,7 @@ def _write_skills(project_root: Path) -> None:
     _write_skill(
         skills_root / "graphsift-review" / "SKILL.md",
         title="graphsift: Code Review",
-        description="Review changed files using graphsift's ranked context selection — minimal tokens, maximum relevance.",
+        description="Review changed files using graphsift's ranked context selection - minimal tokens, maximum relevance.",
         steps=[
             "Call `graph_status` to check if the graph is built. If not, call `build_graph` first.",
             "Call `get_context` with the changed_files list and a query describing what to review.",
@@ -342,7 +342,7 @@ def _write_skills(project_root: Path) -> None:
     _write_skill(
         skills_root / "graphsift-impact" / "SKILL.md",
         title="graphsift: Impact Analysis",
-        description="Find all files affected by a change — blast radius analysis with relevance scores.",
+        description="Find all files affected by a change - blast radius analysis with relevance scores.",
         steps=[
             "Call `get_impact` with the changed_files list.",
             "Present the top affected files sorted by score (0-1).",
@@ -351,7 +351,7 @@ def _write_skills(project_root: Path) -> None:
         example="What is the blast radius of changes to src/auth.py?",
     )
 
-    print(f"[graphsift] Wrote 3 skill files → {skills_root}")
+    print(f"[graphsift] Wrote 3 skill files -> {skills_root}")
 
 
 def _write_skill(path: Path, title: str, description: str, steps: list[str], example: str) -> None:
@@ -373,7 +373,7 @@ def _write_skill(path: Path, title: str, description: str, steps: list[str], exa
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="graphsift",
-        description="graphsift — smarter code context for LLMs",
+        description="graphsift - smarter code context for LLMs",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
