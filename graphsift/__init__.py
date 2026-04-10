@@ -80,7 +80,7 @@ from .advanced import (
     stream_context,
 )
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 __all__ = [
     # Core
     "ContextBuilder",
@@ -131,4 +131,8 @@ __all__ = [
     "ContextDiff",
     "CircuitBreaker",
     "CircuitState",
+    # MCP / CLI
+    "run_server",
 ]
+
+from .mcp_server import run_server
