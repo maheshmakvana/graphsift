@@ -9,6 +9,10 @@
 
 ---
 
+![graphsift hero banner — smarter code context selection for LLMs, 80-150x token reduction, F1 0.85, 14 languages, 28 MCP tools, schema v7](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png)
+
+---
+
 ## Overview
 
 When an LLM reviews a code change, it needs to see the files that *matter* — not an indiscriminate blast of every file that shares an import. **graphsift** solves this by:
@@ -93,6 +97,8 @@ print(result.rendered_context)
 
 ## Why graphsift beats code-review-graph
 
+![graphsift vs code-review-graph head-to-head comparison: F1 0.85 vs 0.54, 80-150x token reduction, 14 languages, 28 MCP tools, async batch, streaming, TF-IDF embeddings, schema v7](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/comparison_chart.png)
+
 | Feature | code-review-graph | graphsift |
 |---|---|---|
 | **Selection logic** | Binary blast-radius | Ranked 0–1 relevance score |
@@ -118,6 +124,8 @@ print(result.rendered_context)
 ---
 
 ## How it works
+
+![How graphsift saves 80-150x tokens — step-by-step pipeline: AST parse, dependency graph, BM25+graph rank, token budget, compress, render context — with token reduction funnel from 500k to 3500 tokens](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/how_it_works.png)
 
 ### 1. Parsing — AST dependency graph
 
@@ -274,6 +282,8 @@ graphsift register --repo ./services/auth --name auth-service
 ---
 
 ## MCP server
+
+![graphsift v1.5 token savings chart — per-tool token comparison before and after: list_graph_stats 75% savings, get_impact_radius 93% savings, get_review_context 90% savings, get_docs_section 89% savings — average 87% reduction per call](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/token_savings_chart.png)
 
 graphsift ships a full MCP (Model Context Protocol) server, compatible with Claude Code, Claude desktop, and any MCP client:
 
@@ -489,6 +499,8 @@ graphsiftError
 
 ## Architecture
 
+![graphsift architecture flow diagram — AST parser, dependency graph, BM25+graph rank fusion, context selector, token-budget rendering, community detection, flow tracing, risk scoring, wiki generator, embed_graph, MCP server tools, SQLite schema v7](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/architecture_flow.png)
+
 graphsift follows strict hexagonal architecture (ports & adapters):
 
 ```
@@ -534,6 +546,12 @@ Key design constraints enforced throughout:
 | Bash/Shell | Regex | Functions, `source` imports |
 | Terraform/HCL | Custom parser | Resources, variables, locals, modules |
 | Helm Charts | Template parser | Go templates in YAML, Chart.yaml |
+
+---
+
+## SQLite schema evolution
+
+![graphsift SQLite schema evolution timeline v1 to v7 — nodes table, edges table, files table, community_id, FTS5 full-text search, flow_snapshots risk_index community_summaries, graph_meta TF-IDF embed store — automatic zero-downtime migrations](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/schema_timeline.png)
 
 ---
 
