@@ -146,27 +146,29 @@ def _tool_build_graph(params: dict) -> dict:
     # -- Gather stats from builder graph
     with _lock:
         stats = builder.index_files(source_map)
-        graph = getattr(builder, "graph", None)
+        graph = getattr(builder, "_graph", None)
 
     # -- Persist nodes + edges + files to SQLite
     if graph is not None:
         try:
             # Collect nodes
+            from graphsift.models import NodeKind as _NodeKind
             for file_node in graph.all_files():
                 all_file_nodes.append(file_node)
                 for sym in file_node.symbols:
-                    # sym is a string name; build minimal GraphNode for storage
-                    node_id = f"{file_node.path}::{sym}"
-                    all_nodes.append(
-                        GraphNode(
-                            node_id=node_id,
-                            file_path=file_node.path,
-                            kind=__import__("graphsift.models", fromlist=["NodeKind"]).NodeKind.FUNCTION,
-                            name=sym,
-                            qualified_name=sym,
-                            language=file_node.language,
+                    if hasattr(sym, "node_id"):
+                        all_nodes.append(sym)
+                    else:
+                        all_nodes.append(
+                            GraphNode(
+                                node_id=f"{file_node.path}::{sym}",
+                                file_path=file_node.path,
+                                kind=_NodeKind.FUNCTION,
+                                name=str(sym),
+                                qualified_name=str(sym),
+                                language=file_node.language,
+                            )
                         )
-                    )
             store.save_nodes(all_nodes)
             store.save_files(all_file_nodes)
             logger.info(

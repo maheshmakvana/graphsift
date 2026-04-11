@@ -95,7 +95,7 @@ from .advanced import (
 )
 from .adapters.storage import GraphStore
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __all__ = [
     # Core
     "ContextBuilder",

@@ -154,10 +154,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # build command  (index repo from CLI)
 # ---------------------------------------------------------------------------
 
-def cmd_build(args: argparse.Namespace) -> int:
-    import logging as _logging
-    _logging.basicConfig(level=_logging.INFO, format="%(message)s", stream=sys.stderr)
-
+def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
+    import time
     from graphsift.adapters.filesystem import load_source_map
     from graphsift.adapters.storage import GraphStore
     from graphsift.core import ContextBuilder
@@ -173,52 +171,138 @@ def cmd_build(args: argparse.Namespace) -> int:
     }
     progress_interval = int(getattr(args, "progress_interval", 200))
 
-    # Open SQLite store — runs all pending migrations and logs them
-    db_path = _db_path_for_root(str(root))
-    store = GraphStore(db_path)
+    # ── Header ────────────────────────────────────────────────────────────────
+    print()
+    print("  graphsift: building knowledge graph")
+    print(f"  repo   : {root}")
+    print()
 
-    print(f"[graphsift] Indexing {root} ...")
+    # ── Step 1: Open / migrate SQLite DB ─────────────────────────────────────
+    print("  [1/5] Opening database ...")
+    db_path = _db_path_for_root(str(root))
+    _t0 = time.monotonic()
+
+    class _MigrationPrinter:
+        """Redirect graphsift storage logger to stdout during migration."""
+        def write(self, msg: str) -> None:
+            msg = msg.strip()
+            if msg:
+                print(f"        {msg}")
+        def flush(self) -> None:
+            pass
+
+    import logging as _logging
+    _storage_handler = _logging.StreamHandler(_MigrationPrinter())  # type: ignore[arg-type]
+    _storage_handler.setFormatter(_logging.Formatter("%(message)s"))
+    _storage_logger = _logging.getLogger("graphsift.adapters.storage")
+    _storage_logger.setLevel(_logging.INFO)
+    _storage_logger.addHandler(_storage_handler)
+    _storage_logger.propagate = False
+
+    store = GraphStore(db_path)
+    db_stats = store.stats()
+    print(f"        schema version : {db_stats['schema_version']}")
+    print(f"        db path        : {db_path}")
+    print()
+
+    # ── Step 2: Discover files ────────────────────────────────────────────────
+    print("  [2/5] Scanning files ...")
     source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
     total_files = len(source_map)
 
-    builder = ContextBuilder(ContextConfig())
+    # Count by extension
+    from collections import Counter
+    ext_counts: Counter = Counter(Path(p).suffix.lower() for p in source_map)
+    print(f"        found {total_files} files")
+    for ext, cnt in ext_counts.most_common(8):
+        print(f"          {ext or '(no ext)':10s}  {cnt}")
+    print()
 
-    # Index file-by-file with progress reporting
+    # ── Step 3: Parse & index ─────────────────────────────────────────────────
+    print(f"  [3/5] Parsing {total_files} files ...")
+    builder = ContextBuilder(ContextConfig())
     all_paths = list(source_map.keys())
+    skipped = 0
+    t_parse_start = time.monotonic()
+
     for i, path in enumerate(all_paths, 1):
         try:
             builder.index_file(path, source_map[path])
         except Exception:
-            pass
+            skipped += 1
         if progress_interval > 0 and i % progress_interval == 0:
-            print(f"INFO: Progress: {i}/{total_files} files parsed", file=sys.stderr)
+            elapsed = time.monotonic() - t_parse_start
+            rate = i / elapsed if elapsed > 0 else 0
+            pct = i * 100 // total_files
+            print(f"        Progress: {i:>6}/{total_files}  [{pct:>3}%]  {rate:.0f} files/s")
 
-    print(f"INFO: Progress: {total_files}/{total_files} files parsed", file=sys.stderr)
+    if total_files % progress_interval != 0 or total_files == 0:
+        elapsed = time.monotonic() - t_parse_start
+        rate = total_files / elapsed if elapsed > 0 else 0
+        print(f"        Progress: {total_files:>6}/{total_files}  [100%]  {rate:.0f} files/s")
 
+    parse_ms = (time.monotonic() - t_parse_start) * 1000
+    print(f"        done in {parse_ms:.0f} ms  ({skipped} skipped)")
+    print()
+
+    # ── Step 4: Build final graph stats ──────────────────────────────────────
+    print("  [4/5] Building dependency graph ...")
+    t_graph = time.monotonic()
     stats = builder.index_files(source_map)
+    graph_ms = (time.monotonic() - t_graph) * 1000
 
-    # Persist nodes + files to SQLite
-    graph = getattr(builder, "graph", None)
-    if graph is not None:
+    # Language breakdown from stats
+    lang_counts = stats.languages
+    print(f"        files indexed  : {stats.files_indexed}")
+    print(f"        files skipped  : {stats.files_skipped}")
+    print(f"        symbols        : {stats.symbols_extracted}")
+    print(f"        edges          : {stats.edges_created}")
+    print(f"        dynamic imports: {stats.dynamic_imports_found}")
+    if lang_counts:
+        print(f"        languages      :", ", ".join(f"{k}:{v}" for k, v in sorted(lang_counts.items(), key=lambda x: -x[1])[:6]))
+    print(f"        time           : {graph_ms:.0f} ms")
+    print()
+
+    # ── Step 5: Persist to SQLite ─────────────────────────────────────────────
+    print("  [5/5] Persisting to database ...")
+    t_db = time.monotonic()
+    graph_obj = getattr(builder, "_graph", None)
+    nodes_saved = 0
+    files_saved = 0
+
+    if graph_obj is not None:
         all_nodes: list[GraphNode] = []
         all_file_nodes = []
-        for file_node in graph.all_files():
+        for file_node in graph_obj.all_files():
             all_file_nodes.append(file_node)
             for sym in file_node.symbols:
-                all_nodes.append(
-                    GraphNode(
-                        node_id=f"{file_node.path}::{sym}",
-                        file_path=file_node.path,
-                        kind=NodeKind.FUNCTION,
-                        name=sym,
-                        qualified_name=sym,
-                        language=file_node.language,
+                if hasattr(sym, "node_id"):
+                    # sym is already a GraphNode
+                    all_nodes.append(sym)
+                else:
+                    # sym is a string name
+                    all_nodes.append(
+                        GraphNode(
+                            node_id=f"{file_node.path}::{sym}",
+                            file_path=file_node.path,
+                            kind=NodeKind.FUNCTION,
+                            name=str(sym),
+                            qualified_name=str(sym),
+                            language=file_node.language,
+                        )
                     )
-                )
         store.save_nodes(all_nodes)
         store.save_files(all_file_nodes)
+        nodes_saved = len(all_nodes)
+        files_saved = len(all_file_nodes)
 
-    # Persist a lightweight index manifest (paths + token estimates only)
+    db_ms = (time.monotonic() - t_db) * 1000
+    print(f"        nodes saved    : {nodes_saved}")
+    print(f"        files saved    : {files_saved}")
+    print(f"        time           : {db_ms:.0f} ms")
+    print()
+
+    # ── Manifest ──────────────────────────────────────────────────────────────
     manifest = {
         "root": str(root),
         "files_indexed": stats.files_indexed,
@@ -231,11 +315,16 @@ def cmd_build(args: argparse.Namespace) -> int:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    print(f"[graphsift] Indexed {stats.files_indexed} files, "
-          f"{stats.symbols_extracted} symbols, {stats.edges_created} edges "
-          f"in {stats.duration_ms:.0f} ms")
-    print(f"[graphsift] DB      -> {db_path}")
-    print(f"[graphsift] Manifest-> {manifest_path}")
+    total_ms = (time.monotonic() - _t0) * 1000
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("  " + "-" * 45)
+    print(f"  Build complete in {total_ms:.0f} ms")
+    print(f"  {stats.files_indexed} files  |  {stats.symbols_extracted} symbols  |  {stats.edges_created} edges")
+    print(f"  db       : {db_path}")
+    print(f"  manifest : {manifest_path}")
+    print()
+
     return 0
 
 

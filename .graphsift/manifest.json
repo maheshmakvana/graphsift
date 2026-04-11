@@ -1,0 +1,25 @@
+{
+  "root": "C:\\Users\\mahes\\works\\pypi\\graphsift",
+  "files_indexed": 16,
+  "symbols_extracted": 413,
+  "edges_created": 157,
+  "duration_ms": 172.0,
+  "files": [
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\advanced.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\cli.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\core.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\exceptions.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\mcp_server.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\models.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\__init__.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\adapters\\claude.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\adapters\\filesystem.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\adapters\\storage.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\adapters\\__init__.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\graphsift\\utils\\__init__.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\tests\\conftest.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\tests\\test_advanced.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\tests\\test_core.py",
+    "C:\\Users\\mahes\\works\\pypi\\graphsift\\tests\\__init__.py"
+  ]
+}
