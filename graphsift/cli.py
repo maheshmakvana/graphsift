@@ -302,6 +302,36 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     print(f"        time           : {db_ms:.0f} ms")
     print()
 
+    # ── Step 6: Post-processing (flows, communities, risk, FTS) ───────────────
+    pp_result: dict = {}
+    if not getattr(args, "skip_postprocess", False):
+        print("  [6/6] Post-processing (flows, communities, risk, FTS) ...")
+        t_pp = time.monotonic()
+        from graphsift.adapters.postprocess import Postprocessor
+
+        class _PPPrinter:
+            def write(self, msg: str) -> None:
+                msg = msg.strip()
+                if msg:
+                    print(f"        {msg}")
+            def flush(self) -> None:
+                pass
+
+        import logging as _logging
+        _pp_handler = _logging.StreamHandler(_PPPrinter())  # type: ignore[arg-type]
+        _pp_handler.setFormatter(_logging.Formatter("%(message)s"))
+        _pp_logger = _logging.getLogger("graphsift.adapters.postprocess")
+        _pp_logger.setLevel(_logging.INFO)
+        _pp_logger.addHandler(_pp_handler)
+        _pp_logger.propagate = False
+
+        if graph_obj is not None:
+            pp = Postprocessor()
+            pp_result = pp.run(graph_obj, store, source_map)
+        pp_ms = (time.monotonic() - t_pp) * 1000
+        print(f"        time           : {pp_ms:.0f} ms")
+        print()
+
     # ── Manifest ──────────────────────────────────────────────────────────────
     manifest = {
         "root": str(root),
@@ -321,6 +351,8 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     print("  " + "-" * 45)
     print(f"  Build complete in {total_ms:.0f} ms")
     print(f"  {stats.files_indexed} files  |  {stats.symbols_extracted} symbols  |  {stats.edges_created} edges")
+    if pp_result:
+        print(f"  flows    : {pp_result.get('flows_detected', 0)}  |  communities: {pp_result.get('communities_detected', 0)}  |  fts rows: {pp_result.get('fts_indexed', 0)}")
     print(f"  db       : {db_path}")
     print(f"  manifest : {manifest_path}")
     print()
@@ -927,6 +959,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--exclude-dirs", nargs="*", metavar="DIR")
     p_build.add_argument("--progress-interval", type=int, default=200,
                          help="Log progress every N files (default 200, 0=disable)")
+    p_build.add_argument("--skip-postprocess", action="store_true",
+                         help="Skip flow/community/risk/FTS post-processing after indexing")
 
     # update
     p_update = sub.add_parser("update", help="Incrementally update graph (changed files only)")

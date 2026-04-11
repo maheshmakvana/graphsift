@@ -710,7 +710,9 @@ class Postprocessor:
             try:
                 store._conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
                 store._conn.commit()
-                result["fts_indexed"] = store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+                row_count = store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+                result["fts_indexed"] = row_count
+                logger.info("INFO: FTS index rebuilt: %d rows indexed", row_count)
             except Exception as exc:
                 logger.warning("Postprocessor: FTS rebuild failed: %s", exc)
 

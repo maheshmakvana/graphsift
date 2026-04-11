@@ -103,7 +103,7 @@ from .adapters.postprocess import (
     WikiGenerator,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.4.3"
 __all__ = [
     # Core
     "ContextBuilder",
