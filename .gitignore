@@ -13,3 +13,4 @@ __pycache__/
 htmlcov/
 *.log
 .graphsift/
+docs/gen_images.py
