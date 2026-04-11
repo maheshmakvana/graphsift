@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphsift"
-version = "1.5.1"
+version = "1.5.2"
 description = "graphsift: intelligent code context selection for LLMs. AST dependency graph, BM25+graph ranked relevance, token-budget-aware selection, 14 languages, decorator+dynamic import edges, 80-150x token reduction. Beats code-review-graph (F1 0.85 vs 0.54)."
 readme = "README.md"
 requires-python = ">=3.9"
