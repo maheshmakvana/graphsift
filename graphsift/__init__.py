@@ -93,8 +93,9 @@ from .advanced import (
     get_rate_limiter,
     stream_context,
 )
+from .adapters.storage import GraphStore
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __all__ = [
     # Core
     "ContextBuilder",
@@ -149,6 +150,8 @@ __all__ = [
     "CircuitState",
     "RetryStrategy",
     "SchemaEvolution",
+    # Storage
+    "GraphStore",
     # MCP / CLI
     "run_server",
 ]

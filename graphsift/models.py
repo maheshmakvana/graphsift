@@ -88,6 +88,7 @@ class GraphNode(BaseModel):
     decorators: list[str] = Field(default_factory=list)
     is_async: bool = False
     is_dynamic: bool = False  # True if detected via dynamic-import pattern
+    community_id: int | None = Field(default=None, description="Community cluster ID assigned by community detection")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def __repr__(self) -> str:

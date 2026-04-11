@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +36,37 @@ def _err(req_id: Any, code: int, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SQLite store — one DB per repo, stored at ~/.graphsift/<repo_hash>/graph.db
+# ---------------------------------------------------------------------------
+
+_store_lock = threading.RLock()
+_stores: dict[str, Any] = {}  # root_path -> GraphStore
+
+
+def _db_path_for(root: str) -> str:
+    """Compute the DB path for a given repo root."""
+    key = hashlib.sha1(root.encode()).hexdigest()[:12]
+    home = Path.home() / ".graphsift" / key
+    home.mkdir(parents=True, exist_ok=True)
+    return str(home / "graph.db")
+
+
+def _get_store(root: str) -> Any:
+    """Return (creating if absent) the GraphStore for *root*.
+
+    Runs SQLite migrations on first open — migration progress is logged to
+    stderr so the caller sees the same INFO lines as code-review-graph.
+    """
+    from graphsift.adapters.storage import GraphStore
+
+    with _store_lock:
+        if root not in _stores:
+            db_path = _db_path_for(root)
+            _stores[root] = GraphStore(db_path)
+        return _stores[root]
+
+
+# ---------------------------------------------------------------------------
 # Graphsift state — one builder per working directory
 # ---------------------------------------------------------------------------
 
@@ -62,6 +94,8 @@ def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
 def _tool_build_graph(params: dict) -> dict:
     """Index all source files under root_path and build the dependency graph."""
     from graphsift.adapters.filesystem import load_source_map
+    from graphsift.core import ContextBuilder, estimate_tokens
+    from graphsift.models import ContextConfig, FileNode, GraphEdge, GraphNode
 
     root = params.get("root_path", os.getcwd())
     extensions_raw = params.get("extensions")
@@ -72,18 +106,75 @@ def _tool_build_graph(params: dict) -> dict:
         "venv", ".venv", "node_modules", ".git", "__pycache__",
         "dist", "build", ".mypy_cache", ".pytest_cache",
     ]))
+    progress_interval = int(params.get("progress_interval", 200))
+
+    # -- Ensure SQLite DB is open and migrated (logs migration steps to stderr)
+    store = _get_store(root)
 
     source_map = load_source_map(root, extensions=extensions, exclude_dirs=exclude_dirs)
-    builder, _ = _get_builder(root)
+    total_files = len(source_map)
 
     with _lock:
-        builder2, _ = _get_builder(root)
-        from graphsift.core import ContextBuilder
         from graphsift.models import ContextConfig
         _builders[root] = ContextBuilder(ContextConfig())
-        builder2 = _builders[root]
-        stats = builder2.index_files(source_map)
+        builder = _builders[root]
         _source_maps[root] = source_map
+
+    # -- Index with per-file progress logging
+    all_paths = list(source_map.keys())
+    parsed_count = 0
+    all_nodes: list[GraphNode] = []
+    all_edges: list[GraphEdge] = []
+    all_file_nodes: list[FileNode] = []
+
+    for path in all_paths:
+        source = source_map[path]
+        try:
+            with _lock:
+                builder.index_file(path, source)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("build_graph: skipped %s: %s", path, exc)
+
+        parsed_count += 1
+        if progress_interval > 0 and parsed_count % progress_interval == 0:
+            logger.info(
+                "INFO: Progress: %d/%d files parsed", parsed_count, total_files
+            )
+
+    logger.info("INFO: Progress: %d/%d files parsed", total_files, total_files)
+
+    # -- Gather stats from builder graph
+    with _lock:
+        stats = builder.index_files(source_map)
+        graph = getattr(builder, "graph", None)
+
+    # -- Persist nodes + edges + files to SQLite
+    if graph is not None:
+        try:
+            # Collect nodes
+            for file_node in graph.all_files():
+                all_file_nodes.append(file_node)
+                for sym in file_node.symbols:
+                    # sym is a string name; build minimal GraphNode for storage
+                    node_id = f"{file_node.path}::{sym}"
+                    all_nodes.append(
+                        GraphNode(
+                            node_id=node_id,
+                            file_path=file_node.path,
+                            kind=__import__("graphsift.models", fromlist=["NodeKind"]).NodeKind.FUNCTION,
+                            name=sym,
+                            qualified_name=sym,
+                            language=file_node.language,
+                        )
+                    )
+            store.save_nodes(all_nodes)
+            store.save_files(all_file_nodes)
+            logger.info(
+                "INFO: Persisted %d nodes, %d files to SQLite",
+                len(all_nodes), len(all_file_nodes),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("build_graph: SQLite persist failed: %s", exc)
 
     return {
         "status": "indexed",
@@ -93,6 +184,7 @@ def _tool_build_graph(params: dict) -> dict:
         "symbols_extracted": stats.symbols_extracted,
         "edges_created": stats.edges_created,
         "duration_ms": stats.duration_ms,
+        "db_path": _db_path_for(root),
     }
 
 
@@ -192,18 +284,30 @@ def _tool_get_impact(params: dict) -> dict:
 
 
 def _tool_graph_status(params: dict) -> dict:
-    """Return current graph statistics."""
+    """Return current graph statistics including SQLite DB stats."""
     root = params.get("root_path", os.getcwd())
     builder, source_map = _get_builder(root)
 
+    db_stats: dict[str, Any] = {}
+    try:
+        store = _get_store(root)
+        db_stats = store.stats()
+    except Exception:
+        pass
+
     if not source_map:
-        return {"status": "empty", "message": "No graph built yet. Run build_graph."}
+        return {
+            "status": "empty",
+            "message": "No graph built yet. Run build_graph.",
+            "db": db_stats,
+        }
 
     stats = builder.graph_stats() if hasattr(builder, "graph_stats") else {}
     return {
         "status": "ready",
         "root": root,
         "files_in_source_map": len(source_map),
+        "db": db_stats,
         **stats,
     }
 
@@ -469,10 +573,17 @@ _TOOLS = {
 # ---------------------------------------------------------------------------
 
 def _handle_initialize(req_id: Any, params: dict) -> None:
+    # Open the default-cwd store on startup so migrations run immediately
+    # and the INFO migration lines appear in stderr (same as code-review-graph).
+    try:
+        _get_store(os.getcwd())
+    except Exception as exc:
+        logger.warning("graphsift: startup DB init failed: %s", exc)
+
     _ok(req_id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "graphsift", "version": "1.1.0"},
+        "serverInfo": {"name": "graphsift", "version": "1.3.0"},
     })
 
 
@@ -522,8 +633,8 @@ _HANDLERS = {
 def run_server() -> None:
     """Run the graphsift MCP server over stdio."""
     logging.basicConfig(
-        level=logging.WARNING,
-        format="%(levelname)s %(name)s %(message)s",
+        level=logging.INFO,
+        format="%(message)s",
         stream=sys.stderr,
     )
 

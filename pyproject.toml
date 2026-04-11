@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphsift"
-version = "1.2.0"
+version = "1.3.0"
 description = "Smarter code context for LLMs — ranked relevance, multi-file diff, Bash/HCL/Helm parsing, Go receiver methods, monorepo support, incremental indexing, 10 advanced features. Beats code-review-graph with 80-150x token reduction."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -1,12 +1,16 @@
-"""graphsift CLI - install, serve, build, update, status."""
+"""graphsift CLI - install, serve, build, update, status, register, list-repos."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +155,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_build(args: argparse.Namespace) -> int:
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO, format="%(message)s", stream=sys.stderr)
+
     from graphsift.adapters.filesystem import load_source_map
+    from graphsift.adapters.storage import GraphStore
     from graphsift.core import ContextBuilder
-    from graphsift.models import ContextConfig
+    from graphsift.models import ContextConfig, GraphNode, NodeKind
 
     root = Path(args.project_root).resolve()
     extensions = set(args.extensions) if args.extensions else {
@@ -163,11 +171,52 @@ def cmd_build(args: argparse.Namespace) -> int:
         "venv", ".venv", "node_modules", ".git", "__pycache__",
         "dist", "build", ".mypy_cache", ".pytest_cache",
     }
+    progress_interval = int(getattr(args, "progress_interval", 200))
+
+    # Open SQLite store — runs all pending migrations and logs them
+    db_path = _db_path_for_root(str(root))
+    store = GraphStore(db_path)
 
     print(f"[graphsift] Indexing {root} ...")
     source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
+    total_files = len(source_map)
+
     builder = ContextBuilder(ContextConfig())
+
+    # Index file-by-file with progress reporting
+    all_paths = list(source_map.keys())
+    for i, path in enumerate(all_paths, 1):
+        try:
+            builder.index_file(path, source_map[path])
+        except Exception:
+            pass
+        if progress_interval > 0 and i % progress_interval == 0:
+            print(f"INFO: Progress: {i}/{total_files} files parsed", file=sys.stderr)
+
+    print(f"INFO: Progress: {total_files}/{total_files} files parsed", file=sys.stderr)
+
     stats = builder.index_files(source_map)
+
+    # Persist nodes + files to SQLite
+    graph = getattr(builder, "graph", None)
+    if graph is not None:
+        all_nodes: list[GraphNode] = []
+        all_file_nodes = []
+        for file_node in graph.all_files():
+            all_file_nodes.append(file_node)
+            for sym in file_node.symbols:
+                all_nodes.append(
+                    GraphNode(
+                        node_id=f"{file_node.path}::{sym}",
+                        file_path=file_node.path,
+                        kind=NodeKind.FUNCTION,
+                        name=sym,
+                        qualified_name=sym,
+                        language=file_node.language,
+                    )
+                )
+        store.save_nodes(all_nodes)
+        store.save_files(all_file_nodes)
 
     # Persist a lightweight index manifest (paths + token estimates only)
     manifest = {
@@ -185,8 +234,17 @@ def cmd_build(args: argparse.Namespace) -> int:
     print(f"[graphsift] Indexed {stats.files_indexed} files, "
           f"{stats.symbols_extracted} symbols, {stats.edges_created} edges "
           f"in {stats.duration_ms:.0f} ms")
-    print(f"[graphsift] Manifest -> {manifest_path}")
+    print(f"[graphsift] DB      -> {db_path}")
+    print(f"[graphsift] Manifest-> {manifest_path}")
     return 0
+
+
+def _db_path_for_root(root: str) -> str:
+    """Compute the per-repo DB path, stored under ~/.graphsift/<sha1>/graph.db."""
+    key = hashlib.sha1(root.encode()).hexdigest()[:12]
+    db_dir = Path.home() / ".graphsift" / key
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return str(db_dir / "graph.db")
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +425,67 @@ def _write_skill(path: Path, title: str, description: str, steps: list[str], exa
 
 
 # ---------------------------------------------------------------------------
+# Registry helpers  (~/.graphsift/registry.json)
+# ---------------------------------------------------------------------------
+
+_REGISTRY_PATH = Path.home() / ".graphsift" / "registry.json"
+
+
+def _load_registry() -> dict[str, dict]:
+    if _REGISTRY_PATH.exists():
+        try:
+            return json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_registry(registry: dict[str, dict]) -> None:
+    _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _REGISTRY_PATH.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# register command
+# ---------------------------------------------------------------------------
+
+def cmd_register(args: argparse.Namespace) -> int:
+    root = str(Path(args.project_root).resolve())
+    registry = _load_registry()
+    registry[root] = {
+        "root": root,
+        "db_path": _db_path_for_root(root),
+        "name": args.name or Path(root).name,
+    }
+    _save_registry(registry)
+    print(f"[graphsift] Registered repo: {root}")
+    print(f"[graphsift] Registry      -> {_REGISTRY_PATH}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# list-repos command
+# ---------------------------------------------------------------------------
+
+def cmd_list_repos(args: argparse.Namespace) -> int:
+    registry = _load_registry()
+    if not registry:
+        print("[graphsift] No repos registered. Run: graphsift register")
+        return 0
+
+    count = len(registry)
+    print(f"[graphsift] {count} registered repo(s):\n")
+    for i, (root, info) in enumerate(registry.items(), 1):
+        name = info.get("name", Path(root).name)
+        db = info.get("db_path", "?")
+        print(f"  {i}. {name}")
+        print(f"     root   : {root}")
+        print(f"     db     : {db}")
+        print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -391,6 +510,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--project-root", default=_cwd())
     p_build.add_argument("--extensions", nargs="*", metavar="EXT")
     p_build.add_argument("--exclude-dirs", nargs="*", metavar="DIR")
+    p_build.add_argument("--progress-interval", type=int, default=200,
+                         help="Log progress every N files (default 200, 0=disable)")
 
     # update
     p_update = sub.add_parser("update", help="Incrementally update graph (changed files only)")
@@ -403,6 +524,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # uninstall
     p_uninstall = sub.add_parser("uninstall", help="Remove graphsift from Claude Code config")
     p_uninstall.add_argument("--project-root", default=_cwd())
+
+    # register
+    p_register = sub.add_parser("register", help="Register a repo in the global graphsift registry")
+    p_register.add_argument("--project-root", default=_cwd(), help="Repo root to register (default: cwd)")
+    p_register.add_argument("--name", default="", help="Optional display name for this repo")
+
+    # list-repos
+    sub.add_parser("list-repos", help="List all registered repos")
 
     return parser
 
@@ -418,6 +547,8 @@ def main() -> None:
         "update": cmd_update,
         "status": cmd_status,
         "uninstall": cmd_uninstall,
+        "register": cmd_register,
+        "list-repos": cmd_list_repos,
     }
 
     fn = commands.get(args.command)
