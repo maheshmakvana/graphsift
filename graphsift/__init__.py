@@ -7,6 +7,10 @@ Strictly better than code-review-graph:
 - tokenpruner integration for token-budget-aware compression
 - Async incremental indexer with depth cap (no hangs on large repos)
 - BM25 + graph rank fusion
+- Bash/Shell, Terraform/HCL, Helm chart parsing
+- Go receiver method detection
+- Monorepo multi-root indexing
+- Incremental re-indexing via SHA-256 change detection
 - 80–150x token reduction on real codebases
 
 Quick start::
@@ -24,13 +28,21 @@ Quick start::
     # ContextResult(selected=9/143, tokens=12,400, saved=94%)
 
     # Paste result.rendered_context directly into your LLM call
+
+    # Monorepo support
+    stats_list = builder.index_roots([pkg_a_map, pkg_b_map])
+
+    # Incremental updates (skips unchanged files)
+    builder.index_files_incremental(updated_source_map)
 """
 
 from .core import (
+    BashParser,
     ContextBuilder,
     ContextSelector,
     DependencyGraph,
     GenericParser,
+    HCLParser,
     LanguageParser,
     PythonParser,
     RelevanceRanker,
@@ -72,6 +84,8 @@ from .advanced import (
     DiffValidator,
     GraphCache,
     RateLimiter,
+    RetryStrategy,
+    SchemaEvolution,
     async_batch_build,
     async_batch_index,
     async_stream_context,
@@ -80,7 +94,7 @@ from .advanced import (
     stream_context,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __all__ = [
     # Core
     "ContextBuilder",
@@ -89,6 +103,8 @@ __all__ = [
     "RelevanceRanker",
     "PythonParser",
     "GenericParser",
+    "BashParser",
+    "HCLParser",
     "LanguageParser",
     "detect_language",
     "estimate_tokens",
@@ -131,6 +147,8 @@ __all__ = [
     "ContextDiff",
     "CircuitBreaker",
     "CircuitState",
+    "RetryStrategy",
+    "SchemaEvolution",
     # MCP / CLI
     "run_server",
 ]

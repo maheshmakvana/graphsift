@@ -481,3 +481,152 @@ def test_circuit_breaker_reset():
 def test_circuit_breaker_repr():
     cb = CircuitBreaker()
     assert "CircuitBreaker" in repr(cb)
+
+
+# ---------------------------------------------------------------------------
+# 9. RetryStrategy
+# ---------------------------------------------------------------------------
+
+from graphsift import RetryStrategy  # noqa: E402
+
+
+def test_retry_strategy_succeeds_first_try():
+    strategy = RetryStrategy(max_attempts=3, base_delay=0.01)
+    result = strategy.call(lambda: 42)
+    assert result == 42
+    assert strategy.audit_log() == []
+
+
+def test_retry_strategy_retries_and_succeeds():
+    attempts = [0]
+
+    def flaky():
+        attempts[0] += 1
+        if attempts[0] < 3:
+            raise ValueError("not yet")
+        return "ok"
+
+    strategy = RetryStrategy(max_attempts=4, base_delay=0.01, jitter=False)
+    result = strategy.call(flaky)
+    assert result == "ok"
+    assert attempts[0] == 3
+    assert len(strategy.audit_log()) == 2  # 2 failures before success
+
+
+def test_retry_strategy_exhausts_and_raises():
+    strategy = RetryStrategy(max_attempts=2, base_delay=0.01, jitter=False)
+    with pytest.raises(RuntimeError):
+        strategy.call(lambda: (_ for _ in ()).throw(RuntimeError("fail")))
+
+
+def test_retry_strategy_no_retry_on_unmatched():
+    strategy = RetryStrategy(max_attempts=3, base_delay=0.01, retry_on=(TimeoutError,))
+    with pytest.raises(ValueError):
+        strategy.call(lambda: (_ for _ in ()).throw(ValueError("wrong type")))
+    assert strategy.audit_log() == []  # not retried
+
+
+def test_retry_strategy_decorator():
+    calls = [0]
+
+    strategy = RetryStrategy(max_attempts=3, base_delay=0.01, jitter=False)
+
+    @strategy.retry
+    def fragile():
+        calls[0] += 1
+        if calls[0] < 2:
+            raise OSError("retry me")
+        return "done"
+
+    assert fragile() == "done"
+    assert calls[0] == 2
+
+
+def test_retry_strategy_repr():
+    s = RetryStrategy(max_attempts=5, base_delay=1.0)
+    assert "RetryStrategy" in repr(s)
+
+
+@pytest.mark.asyncio
+async def test_retry_strategy_acall():
+    calls = [0]
+
+    async def async_fn():
+        calls[0] += 1
+        if calls[0] < 2:
+            raise OSError("retry")
+        return "async_ok"
+
+    strategy = RetryStrategy(max_attempts=3, base_delay=0.01, jitter=False)
+    result = await strategy.acall(async_fn)
+    assert result == "async_ok"
+
+
+# ---------------------------------------------------------------------------
+# 10. SchemaEvolution
+# ---------------------------------------------------------------------------
+
+from graphsift import SchemaEvolution  # noqa: E402
+
+
+def test_schema_evolution_migrate_single_step():
+    evo = SchemaEvolution(current_version=2)
+
+    @evo.migration(from_version=1, to_version=2, description="add field")
+    def v1_to_v2(data):
+        data["new_field"] = "default"
+        return data
+
+    payload = {"existing": "value"}
+    migrated, audit = evo.migrate(payload, from_version=1)
+    assert migrated["new_field"] == "default"
+    assert migrated["__schema_version__"] == 2
+    assert len(audit) == 1
+    assert audit[0]["status"] == "ok"
+
+
+def test_schema_evolution_migrate_chain():
+    evo = SchemaEvolution(current_version=3)
+
+    @evo.migration(from_version=1, to_version=2, description="v1→v2")
+    def v1_to_v2(data):
+        data["v2"] = True
+        return data
+
+    @evo.migration(from_version=2, to_version=3, description="v2→v3")
+    def v2_to_v3(data):
+        data["v3"] = True
+        return data
+
+    migrated, audit = evo.migrate({}, from_version=1)
+    assert migrated["v2"] is True
+    assert migrated["v3"] is True
+    assert len(audit) == 2
+
+
+def test_schema_evolution_check_compatibility():
+    evo = SchemaEvolution(current_version=2)
+    assert evo.check_compatibility({"__schema_version__": 2}) is True
+    assert evo.check_compatibility({"__schema_version__": 1}) is False
+    assert evo.check_compatibility({}) is False  # defaults to 1
+
+
+def test_schema_evolution_missing_path_raises():
+    evo = SchemaEvolution(current_version=3)
+    # No migrations registered → can't reach v3
+    with pytest.raises(Exception):
+        evo.migrate({}, from_version=1)
+
+
+def test_schema_evolution_migration_path():
+    evo = SchemaEvolution(current_version=3)
+    evo.register(1, 2, lambda d: d, "first step")
+    evo.register(2, 3, lambda d: d, "second step")
+    path = evo.migration_path(from_version=1)
+    assert len(path) == 2
+    assert "first step" in path[0]
+
+
+def test_schema_evolution_repr():
+    evo = SchemaEvolution(current_version=2)
+    assert "SchemaEvolution" in repr(evo)

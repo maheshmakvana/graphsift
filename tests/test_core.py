@@ -321,3 +321,149 @@ def test_file_node_repr(source_map):
     parser = PythonParser()
     fn = parser.parse_file("src/auth.py", source_map["src/auth.py"])
     assert "FileNode" in repr(fn)
+
+
+# ---------------------------------------------------------------------------
+# BashParser
+# ---------------------------------------------------------------------------
+
+from graphsift import BashParser, Language  # noqa: E402
+
+
+def test_bash_parser_functions():
+    parser = BashParser()
+    source = "function deploy() {\n  echo 'deploying'\n}\n\nrollback() {\n  echo 'rolling back'\n}\n"
+    fn = parser.parse_file("scripts/deploy.sh", source)
+    assert fn.language == Language.BASH
+    names = [s.name for s in fn.symbols]
+    assert "deploy" in names
+
+
+def test_bash_parser_source_import():
+    parser = BashParser()
+    source = "source ./lib/common.sh\n. ./lib/helpers.sh\n"
+    fn = parser.parse_file("scripts/run.sh", source)
+    assert any("common.sh" in i for i in fn.imports)
+
+
+def test_bash_parser_variables():
+    parser = BashParser()
+    source = "export AWS_REGION=us-east-1\nDB_HOST=localhost\n"
+    fn = parser.parse_file("scripts/env.sh", source)
+    names = [s.name for s in fn.symbols]
+    assert "AWS_REGION" in names
+
+
+def test_bash_detect_language():
+    from graphsift import detect_language
+    assert detect_language("deploy.sh") == Language.BASH
+    assert detect_language("setup.bash") == Language.BASH
+    assert detect_language("startup.zsh") == Language.BASH
+
+
+# ---------------------------------------------------------------------------
+# HCLParser
+# ---------------------------------------------------------------------------
+
+from graphsift import HCLParser  # noqa: E402
+
+
+def test_hcl_parser_resource():
+    parser = HCLParser()
+    source = 'resource "aws_s3_bucket" "my_bucket" {\n  bucket = "my-bucket"\n}\n'
+    fn = parser.parse_file("main.tf", source)
+    assert fn.language == Language.HCL
+    qual_names = [s.qualified_name for s in fn.symbols]
+    assert "aws_s3_bucket.my_bucket" in qual_names
+
+
+def test_hcl_parser_variable():
+    parser = HCLParser()
+    source = 'variable "instance_type" {\n  default = "t3.micro"\n}\n'
+    fn = parser.parse_file("variables.tf", source)
+    names = [s.qualified_name for s in fn.symbols]
+    assert "var.instance_type" in names
+
+
+def test_hcl_parser_module_source():
+    parser = HCLParser()
+    source = 'module "vpc" {\n  source = "./modules/vpc"\n}\n'
+    fn = parser.parse_file("main.tf", source)
+    assert any("./modules/vpc" in i for i in fn.imports)
+
+
+def test_hcl_detect_language():
+    from graphsift import detect_language
+    assert detect_language("main.tf") == Language.HCL
+    assert detect_language("terraform.tfvars") == Language.HCL
+
+
+# ---------------------------------------------------------------------------
+# Go receiver method parsing
+# ---------------------------------------------------------------------------
+
+
+def test_go_receiver_method():
+    parser = GenericParser()
+    source = (
+        "type MyStruct struct {}\n\n"
+        "func (r *MyStruct) DoSomething(ctx context.Context) error {\n"
+        "    return nil\n"
+        "}\n"
+    )
+    fn = parser.parse_file("service.go", source)
+    qual_names = [s.qualified_name for s in fn.symbols]
+    assert "MyStruct.DoSomething" in qual_names
+
+
+def test_go_interface_parsed():
+    parser = GenericParser()
+    source = "type Storage interface {\n    Get(key string) (string, error)\n}\n"
+    fn = parser.parse_file("storage.go", source)
+    names = [s.name for s in fn.symbols]
+    assert "Storage" in names
+
+
+# ---------------------------------------------------------------------------
+# Incremental indexing
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_index_skips_unchanged(source_map):
+    builder = ContextBuilder(ContextConfig())
+    # First index
+    stats1 = builder.index_files_incremental(source_map)
+    assert stats1.files_indexed > 0
+    # Second index with same content — should skip all
+    stats2 = builder.index_files_incremental(source_map)
+    assert stats2.files_indexed == 0
+    assert stats2.files_skipped == stats1.files_indexed
+
+
+def test_incremental_index_reindexes_changed(source_map):
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files_incremental(source_map)
+    # Modify one file
+    updated = dict(source_map)
+    first_path = next(iter(updated))
+    updated[first_path] = updated[first_path] + "\n# updated\n"
+    stats = builder.index_files_incremental(updated)
+    assert stats.files_indexed == 1
+
+
+# ---------------------------------------------------------------------------
+# Monorepo multi-root
+# ---------------------------------------------------------------------------
+
+
+def test_index_roots_multiple(source_map):
+    builder = ContextBuilder(ContextConfig())
+    # Split source_map into two fake roots
+    items = list(source_map.items())
+    half = len(items) // 2 or 1
+    root_a = dict(items[:half])
+    root_b = dict(items[half:])
+    stats_list = builder.index_roots([root_a, root_b])
+    assert len(stats_list) == 2
+    total = sum(s.files_indexed for s in stats_list)
+    assert total == len(source_map) - sum(s.files_skipped for s in stats_list)

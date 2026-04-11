@@ -878,3 +878,410 @@ class CircuitBreaker:
             self._state = CircuitState.CLOSED
             self._failures = 0
             self._last_opened = None
+
+
+# ===========================================================================
+# 9. Retry Strategy — exponential backoff with jitter, per-exception routing
+# ===========================================================================
+
+
+@dataclass
+class _RetryAttempt:
+    attempt: int
+    exception: Exception
+    delay_ms: float
+    exc_type: str
+
+
+class RetryStrategy:
+    """Exponential backoff with jitter and per-exception routing.
+
+    Supports deadline (max wall-clock seconds), per-exception class routing
+    (retry only specific errors, fail fast on others), and per-attempt audit log.
+
+    Args:
+        max_attempts: Maximum total attempts (including first).
+        base_delay: Initial retry delay in seconds.
+        max_delay: Cap on computed delay (before jitter).
+        jitter: If True, multiply computed delay by random(0.5, 1.5).
+        deadline: Optional max wall-clock seconds from first call.
+        retry_on: Exception types to retry; None = retry on all exceptions.
+
+    Example::
+
+        strategy = RetryStrategy(max_attempts=4, base_delay=0.5, retry_on=(TimeoutError,))
+
+        @strategy.retry
+        def call_api(prompt: str) -> str:
+            ...
+
+        result = strategy.call(call_api, prompt)
+        print(strategy.audit_log())
+    """
+
+    def __init__(
+        self,
+        max_attempts: int = 3,
+        base_delay: float = 0.5,
+        max_delay: float = 30.0,
+        jitter: bool = True,
+        deadline: float | None = None,
+        retry_on: tuple[type[Exception], ...] | None = None,
+    ) -> None:
+        if max_attempts < 1:
+            raise ConfigurationError("max_attempts must be >= 1.")
+        if base_delay <= 0:
+            raise ConfigurationError("base_delay must be > 0.")
+        self._max_attempts = max_attempts
+        self._base = base_delay
+        self._max_delay = max_delay
+        self._jitter = jitter
+        self._deadline = deadline
+        self._retry_on = retry_on
+        self._log: list[_RetryAttempt] = []
+        self._lock = threading.RLock()
+
+    def __repr__(self) -> str:
+        return (
+            f"RetryStrategy(max={self._max_attempts}, base={self._base}s, "
+            f"jitter={self._jitter})"
+        )
+
+    def _compute_delay(self, attempt: int) -> float:
+        import random  # noqa: PLC0415
+
+        delay = min(self._base * (2 ** attempt), self._max_delay)
+        if self._jitter:
+            delay *= random.uniform(0.5, 1.5)
+        return delay
+
+    def _should_retry(self, exc: Exception) -> bool:
+        if self._retry_on is None:
+            return True
+        return isinstance(exc, self._retry_on)
+
+    def call(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Execute fn with retry strategy.
+
+        Args:
+            fn: Callable to invoke.
+            *args: Positional arguments for fn.
+            **kwargs: Keyword arguments for fn.
+
+        Returns:
+            Return value of fn on success.
+
+        Raises:
+            The last exception raised after all retries exhausted.
+            graphsiftError: If deadline exceeded.
+        """
+        import random  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        with self._lock:
+            self._log = []
+
+        t_start = time.monotonic()
+        last_exc: Exception | None = None
+
+        for attempt in range(self._max_attempts):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not self._should_retry(exc):
+                    raise
+
+                delay = self._compute_delay(attempt)
+                with self._lock:
+                    self._log.append(_RetryAttempt(
+                        attempt=attempt + 1,
+                        exception=exc,
+                        delay_ms=round(delay * 1000, 1),
+                        exc_type=type(exc).__name__,
+                    ))
+
+                if attempt + 1 >= self._max_attempts:
+                    break
+
+                if self._deadline is not None:
+                    elapsed = time.monotonic() - t_start
+                    if elapsed + delay > self._deadline:
+                        raise graphsiftError(
+                            f"RetryStrategy: deadline {self._deadline}s exceeded after {elapsed:.1f}s."
+                        ) from exc
+
+                time.sleep(delay)
+
+        raise last_exc  # type: ignore[misc]
+
+    async def acall(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Async version of call — wraps blocking fn via asyncio.to_thread.
+
+        Args:
+            fn: Callable to invoke (sync or async).
+            *args: Positional arguments.
+            **kwargs: Keyword arguments.
+
+        Returns:
+            Return value of fn on success.
+        """
+        import asyncio as _asyncio  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        with self._lock:
+            self._log = []
+
+        t_start = time.monotonic()
+        last_exc: Exception | None = None
+
+        for attempt in range(self._max_attempts):
+            try:
+                if _asyncio.iscoroutinefunction(fn):
+                    return await fn(*args, **kwargs)
+                return await _asyncio.to_thread(fn, *args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not self._should_retry(exc):
+                    raise
+
+                delay = self._compute_delay(attempt)
+                with self._lock:
+                    self._log.append(_RetryAttempt(
+                        attempt=attempt + 1,
+                        exception=exc,
+                        delay_ms=round(delay * 1000, 1),
+                        exc_type=type(exc).__name__,
+                    ))
+
+                if attempt + 1 >= self._max_attempts:
+                    break
+
+                if self._deadline is not None:
+                    elapsed = time.monotonic() - t_start
+                    if elapsed + delay > self._deadline:
+                        raise graphsiftError(
+                            f"RetryStrategy: deadline exceeded."
+                        ) from exc
+
+                await _asyncio.sleep(delay)
+
+        raise last_exc  # type: ignore[misc]
+
+    def retry(self, fn: Callable[..., T]) -> Callable[..., T]:
+        """Decorator: wrap function with this retry strategy."""
+
+        @wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> T:
+            return self.call(fn, *args, **kwargs)
+
+        return wrapper
+
+    def audit_log(self) -> list[dict[str, Any]]:
+        """Return per-attempt audit records (attempt, exc type, delay ms)."""
+        with self._lock:
+            return [
+                {
+                    "attempt": r.attempt,
+                    "exc_type": r.exc_type,
+                    "error": str(r.exception),
+                    "delay_ms": r.delay_ms,
+                }
+                for r in self._log
+            ]
+
+
+# ===========================================================================
+# 10. Schema Evolution — versioned model migration, compatibility checks
+# ===========================================================================
+
+
+@dataclass
+class _Migration:
+    from_version: int
+    to_version: int
+    transform: Callable[[dict[str, Any]], dict[str, Any]]
+    description: str
+
+
+class SchemaEvolution:
+    """Versioned schema migration registry for graphsift data payloads.
+
+    Enables safe rolling upgrades: serialised ContextResult / DiffSpec dicts
+    from older versions are migrated forward to the current schema before
+    being deserialised. Provides compatibility checks and a migration audit log.
+
+    Args:
+        current_version: The schema version this instance targets.
+
+    Example::
+
+        evo = SchemaEvolution(current_version=3)
+
+        @evo.migration(from_version=1, to_version=2, description="add diff_text field")
+        def v1_to_v2(data: dict) -> dict:
+            data.setdefault("diff_text", "")
+            return data
+
+        migrated, audit = evo.migrate(old_payload, from_version=1)
+        evo.check_compatibility(other_payload)  # raises if incompatible
+    """
+
+    def __init__(self, current_version: int = 1) -> None:
+        if current_version < 1:
+            raise ConfigurationError("current_version must be >= 1.")
+        self._current = current_version
+        self._migrations: list[_Migration] = []
+        self._lock = threading.RLock()
+
+    def __repr__(self) -> str:
+        return f"SchemaEvolution(current_version={self._current}, migrations={len(self._migrations)})"
+
+    def migration(
+        self,
+        from_version: int,
+        to_version: int,
+        description: str = "",
+    ) -> Callable[[Callable[[dict[str, Any]], dict[str, Any]]], Callable[[dict[str, Any]], dict[str, Any]]]:
+        """Decorator: register a migration function.
+
+        Args:
+            from_version: Source schema version.
+            to_version: Target schema version.
+            description: Human-readable description of what changed.
+
+        Returns:
+            Decorator that registers fn as a migration.
+        """
+
+        def decorator(
+            fn: Callable[[dict[str, Any]], dict[str, Any]],
+        ) -> Callable[[dict[str, Any]], dict[str, Any]]:
+            with self._lock:
+                self._migrations.append(_Migration(
+                    from_version=from_version,
+                    to_version=to_version,
+                    transform=fn,
+                    description=description or fn.__name__,
+                ))
+                self._migrations.sort(key=lambda m: (m.from_version, m.to_version))
+            return fn
+
+        return decorator
+
+    def register(
+        self,
+        from_version: int,
+        to_version: int,
+        fn: Callable[[dict[str, Any]], dict[str, Any]],
+        description: str = "",
+    ) -> None:
+        """Register a migration without using the decorator syntax.
+
+        Args:
+            from_version: Source schema version.
+            to_version: Target schema version.
+            fn: Transform function ``dict → dict``.
+            description: Human-readable description.
+        """
+        with self._lock:
+            self._migrations.append(_Migration(
+                from_version=from_version,
+                to_version=to_version,
+                transform=fn,
+                description=description or fn.__name__,
+            ))
+            self._migrations.sort(key=lambda m: (m.from_version, m.to_version))
+
+    def migrate(
+        self,
+        data: dict[str, Any],
+        from_version: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Migrate data from from_version to current_version.
+
+        Applies migrations in order, chaining each output into the next.
+
+        Args:
+            data: Raw serialised payload dict.
+            from_version: Schema version of the input data.
+
+        Returns:
+            Tuple of (migrated_data, audit_log).
+
+        Raises:
+            ConfigurationError: If no migration path exists.
+            ValidationError: If migration raises.
+        """
+        audit: list[dict[str, Any]] = []
+        current = dict(data)  # copy
+        version = from_version
+
+        with self._lock:
+            migrations = list(self._migrations)
+
+        while version < self._current:
+            step = next(
+                (m for m in migrations if m.from_version == version),
+                None,
+            )
+            if step is None:
+                raise ConfigurationError(
+                    f"No migration from version {version} to {version + 1}. "
+                    f"Cannot reach current version {self._current}."
+                )
+            try:
+                current = step.transform(current)
+                audit.append({
+                    "from": step.from_version,
+                    "to": step.to_version,
+                    "description": step.description,
+                    "status": "ok",
+                })
+                version = step.to_version
+            except Exception as exc:
+                audit.append({
+                    "from": step.from_version,
+                    "to": step.to_version,
+                    "description": step.description,
+                    "status": "error",
+                    "error": str(exc),
+                })
+                raise ValidationError(
+                    f"Migration v{step.from_version}→v{step.to_version} failed: {exc}"
+                ) from exc
+
+        current["__schema_version__"] = self._current
+        return current, audit
+
+    def check_compatibility(self, data: dict[str, Any]) -> bool:
+        """Return True if data is at current_version, False if it needs migration.
+
+        Args:
+            data: Payload dict, optionally containing ``__schema_version__`` key.
+
+        Returns:
+            True if schema_version matches current_version.
+        """
+        return data.get("__schema_version__", 1) == self._current
+
+    def migration_path(self, from_version: int) -> list[str]:
+        """Return human-readable list of migration steps from from_version.
+
+        Args:
+            from_version: Starting schema version.
+
+        Returns:
+            List of step descriptions.
+        """
+        path: list[str] = []
+        version = from_version
+        with self._lock:
+            migrations = list(self._migrations)
+        while version < self._current:
+            step = next((m for m in migrations if m.from_version == version), None)
+            if step is None:
+                break
+            path.append(f"v{step.from_version}→v{step.to_version}: {step.description}")
+            version = step.to_version
+        return path

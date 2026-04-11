@@ -27,6 +27,9 @@ class Language(str, Enum):
     C = "c"
     RUBY = "ruby"
     PHP = "php"
+    BASH = "bash"
+    HCL = "hcl"         # Terraform / OpenTofu
+    HELM = "helm"       # Helm chart templates (YAML+Go template)
     UNKNOWN = "unknown"
 
 

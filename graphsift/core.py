@@ -66,11 +66,20 @@ _EXT_MAP: dict[str, Language] = {
     ".h": Language.C,
     ".rb": Language.RUBY,
     ".php": Language.PHP,
+    ".sh": Language.BASH,
+    ".bash": Language.BASH,
+    ".zsh": Language.BASH,
+    ".tf": Language.HCL,
+    ".tfvars": Language.HCL,
+    ".hcl": Language.HCL,
 }
 
 
 def detect_language(path: str) -> Language:
     """Detect language from file extension.
+
+    Helm charts are detected by the presence of ``templates/`` in the path
+    for ``.yaml``/``.yml`` files, or by ``Chart.yaml`` filename.
 
     Args:
         path: File path.
@@ -78,7 +87,17 @@ def detect_language(path: str) -> Language:
     Returns:
         Language enum value.
     """
-    return _EXT_MAP.get(Path(path).suffix.lower(), Language.UNKNOWN)
+    p = Path(path)
+    suffix = p.suffix.lower()
+    mapped = _EXT_MAP.get(suffix)
+    if mapped is not None:
+        return mapped
+    # Helm chart detection: templates/*.yaml or Chart.yaml
+    if suffix in (".yaml", ".yml"):
+        parts = p.parts
+        if "templates" in parts or p.name in ("Chart.yaml", "values.yaml"):
+            return Language.HELM
+    return Language.UNKNOWN
 
 
 def estimate_tokens(text: str) -> int:
@@ -369,7 +388,14 @@ class GenericParser:
             "dynamic": re.compile(r'import\(["\']([^"\']+)["\']\)'),
         },
         Language.GO: {
-            "function": re.compile(r"func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(([^)]*)\)"),
+            # Plain function: func FuncName(...)
+            "function": re.compile(r"^func\s+(\w+)\s*\(", re.MULTILINE),
+            # Receiver method: func (r *Type) MethodName(...) — captures Type.MethodName
+            "method": re.compile(r"^func\s+\(\w+\s+\*?(\w+)\)\s+(\w+)\s*\(", re.MULTILINE),
+            # Struct type definition
+            "class": re.compile(r"^type\s+(\w+)\s+struct\s*\{", re.MULTILINE),
+            # Interface type definition
+            "interface": re.compile(r"^type\s+(\w+)\s+interface\s*\{", re.MULTILINE),
             "import": re.compile(r'"([^"]+)"'),
             "dynamic": re.compile(r'plugin\.Open\(["\']([^"\']+)["\']\)'),
         },
@@ -408,14 +434,49 @@ class GenericParser:
 
         for key, pat in pats.items():
             for m in pat.finditer(source):
-                name = m.group(1)
                 if key == "import" or key == "require":
+                    name = m.group(1)
                     if name not in imports:
                         imports.append(name)
                 elif key == "dynamic":
+                    name = m.group(1)
                     if name not in dynamic_imports:
                         dynamic_imports.append(name)
+                elif key == "method":
+                    # Go receiver method: group(1)=Type, group(2)=MethodName
+                    type_name = m.group(1)
+                    method_name = m.group(2)
+                    qual = f"{type_name}.{method_name}"
+                    sig = m.group(0)[:120]
+                    line = source[: m.start()].count("\n") + 1
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::{qual}",
+                        file_path=path,
+                        kind=NodeKind.METHOD,
+                        name=method_name,
+                        qualified_name=qual,
+                        line_start=line,
+                        language=lang,
+                        signature=sig,
+                        metadata={"receiver_type": type_name},
+                    ))
+                elif key == "interface":
+                    name = m.group(1)
+                    sig = m.group(0)[:120]
+                    line = source[: m.start()].count("\n") + 1
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::{name}",
+                        file_path=path,
+                        kind=NodeKind.CLASS,
+                        name=name,
+                        qualified_name=name,
+                        line_start=line,
+                        language=lang,
+                        signature=sig,
+                        metadata={"is_interface": True},
+                    ))
                 else:
+                    name = m.group(1)
                     kind = NodeKind.CLASS if key == "class" else NodeKind.FUNCTION
                     sig = m.group(0)[:120]
                     line = source[: m.start()].count("\n") + 1
@@ -451,6 +512,245 @@ class GenericParser:
 
 
 # ---------------------------------------------------------------------------
+# BashParser — shell script parser (.sh, .bash, .zsh)
+# ---------------------------------------------------------------------------
+
+
+class BashParser:
+    """Regex-based parser for Bash/Shell scripts.
+
+    Extracts: function definitions, sourced files (. / source), variable
+    assignments, and dynamic eval/exec patterns.
+
+    Fixes code-review-graph gap: shell scripts were completely unindexed,
+    meaning infra/deploy scripts were invisible to context selection.
+
+    Args:
+        None
+    """
+
+    _PATTERNS = {
+        # function name() { or function name {
+        "function": re.compile(r"^(?:function\s+)?(\w+)\s*\(\s*\)\s*\{", re.MULTILINE),
+        # source ./file or . ./file
+        "source": re.compile(r"^(?:source|\.)\s+([\w./\-]+)", re.MULTILINE),
+        # export VAR= or VAR=
+        "variable": re.compile(r"^(?:export\s+)?([A-Z_][A-Z0-9_]{2,})\s*=", re.MULTILINE),
+        # eval or $(command) dynamic exec
+        "dynamic": re.compile(r"\beval\s+[\"'`]([^\"'`]+)[\"'`]", re.MULTILINE),
+    }
+
+    def parse_file(self, path: str, source: str) -> FileNode:
+        """Parse a shell script.
+
+        Args:
+            path: File path.
+            source: Shell script source text.
+
+        Returns:
+            FileNode with extracted symbols.
+        """
+        symbols: list[GraphNode] = []
+        imports: list[str] = []
+        dynamic_imports: list[str] = []
+
+        module_id = f"{path}::__module__"
+        symbols.append(GraphNode(
+            node_id=module_id,
+            file_path=path,
+            kind=NodeKind.MODULE,
+            name=Path(path).stem,
+            qualified_name=Path(path).stem,
+            language=Language.BASH,
+        ))
+
+        for key, pat in self._PATTERNS.items():
+            for m in pat.finditer(source):
+                name = m.group(1)
+                line = source[: m.start()].count("\n") + 1
+                if key == "source":
+                    if name not in imports:
+                        imports.append(name)
+                elif key == "dynamic":
+                    if name not in dynamic_imports:
+                        dynamic_imports.append(name[:80])
+                elif key == "variable":
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::{name}",
+                        file_path=path,
+                        kind=NodeKind.VARIABLE,
+                        name=name,
+                        qualified_name=name,
+                        line_start=line,
+                        language=Language.BASH,
+                    ))
+                else:
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::{name}",
+                        file_path=path,
+                        kind=NodeKind.FUNCTION,
+                        name=name,
+                        qualified_name=name,
+                        line_start=line,
+                        language=Language.BASH,
+                        signature=f"function {name}()",
+                    ))
+
+        sha = hashlib.sha256(source.encode(errors="replace")).hexdigest()
+        return FileNode(
+            path=path,
+            language=Language.BASH,
+            size_bytes=len(source.encode(errors="replace")),
+            line_count=len(source.splitlines()),
+            sha256=sha,
+            symbols=symbols,
+            imports=imports,
+            dynamic_imports=dynamic_imports,
+            token_estimate=estimate_tokens(source),
+        )
+
+    def extract_signatures(self, source: str) -> str:
+        """Return function definitions only."""
+        lines = []
+        for m in self._PATTERNS["function"].finditer(source):
+            lines.append(f"function {m.group(1)}()")
+        return "\n".join(lines) if lines else source[:200]
+
+
+# ---------------------------------------------------------------------------
+# HCLParser — Terraform / OpenTofu parser (.tf, .tfvars, .hcl)
+# ---------------------------------------------------------------------------
+
+
+class HCLParser:
+    """Regex-based parser for HCL (HashiCorp Configuration Language).
+
+    Extracts: resource blocks, data blocks, module calls, variable
+    declarations, output blocks, and locals.
+
+    Fixes code-review-graph gap: Terraform/HCL files were not indexed,
+    meaning infra code changes were invisible to context selection.
+    (Requested in code-review-graph issue #199.)
+
+    Args:
+        None
+    """
+
+    _PATTERNS = {
+        # resource "aws_s3_bucket" "my_bucket" {
+        "resource": re.compile(
+            r'^resource\s+"([^"]+)"\s+"([^"]+)"\s*\{', re.MULTILINE
+        ),
+        # data "aws_ami" "ubuntu" {
+        "data": re.compile(
+            r'^data\s+"([^"]+)"\s+"([^"]+)"\s*\{', re.MULTILINE
+        ),
+        # module "vpc" {
+        "module": re.compile(r'^module\s+"([^"]+)"\s*\{', re.MULTILINE),
+        # variable "instance_type" {
+        "variable": re.compile(r'^variable\s+"([^"]+)"\s*\{', re.MULTILINE),
+        # output "bucket_arn" {
+        "output": re.compile(r'^output\s+"([^"]+)"\s*\{', re.MULTILINE),
+        # source = "..." inside module blocks (treated as import)
+        "source": re.compile(r'^\s*source\s*=\s*"([^"]+)"', re.MULTILINE),
+    }
+
+    def parse_file(self, path: str, source: str) -> FileNode:
+        """Parse a Terraform/HCL file.
+
+        Args:
+            path: File path.
+            source: HCL source text.
+
+        Returns:
+            FileNode with extracted symbols.
+        """
+        symbols: list[GraphNode] = []
+        imports: list[str] = []
+
+        module_id = f"{path}::__module__"
+        symbols.append(GraphNode(
+            node_id=module_id,
+            file_path=path,
+            kind=NodeKind.MODULE,
+            name=Path(path).stem,
+            qualified_name=Path(path).stem,
+            language=Language.HCL,
+        ))
+
+        for key, pat in self._PATTERNS.items():
+            for m in pat.finditer(source):
+                line = source[: m.start()].count("\n") + 1
+                if key == "source":
+                    src = m.group(1)
+                    if src not in imports:
+                        imports.append(src)
+                elif key in ("resource", "data"):
+                    # name = "type.label"
+                    resource_type = m.group(1)
+                    label = m.group(2)
+                    qual = f"{resource_type}.{label}"
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::{qual}",
+                        file_path=path,
+                        kind=NodeKind.CLASS,
+                        name=label,
+                        qualified_name=qual,
+                        line_start=line,
+                        language=Language.HCL,
+                        signature=m.group(0)[:120],
+                        metadata={"hcl_block": key, "resource_type": resource_type},
+                    ))
+                elif key == "variable":
+                    name = m.group(1)
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::var.{name}",
+                        file_path=path,
+                        kind=NodeKind.VARIABLE,
+                        name=name,
+                        qualified_name=f"var.{name}",
+                        line_start=line,
+                        language=Language.HCL,
+                        metadata={"hcl_block": "variable"},
+                    ))
+                else:
+                    name = m.group(1)
+                    kind = NodeKind.FUNCTION if key == "output" else NodeKind.MODULE
+                    symbols.append(GraphNode(
+                        node_id=f"{path}::{key}.{name}",
+                        file_path=path,
+                        kind=kind,
+                        name=name,
+                        qualified_name=f"{key}.{name}",
+                        line_start=line,
+                        language=Language.HCL,
+                        signature=m.group(0)[:120],
+                        metadata={"hcl_block": key},
+                    ))
+
+        sha = hashlib.sha256(source.encode(errors="replace")).hexdigest()
+        return FileNode(
+            path=path,
+            language=Language.HCL,
+            size_bytes=len(source.encode(errors="replace")),
+            line_count=len(source.splitlines()),
+            sha256=sha,
+            symbols=symbols,
+            imports=imports,
+            dynamic_imports=[],
+            token_estimate=estimate_tokens(source),
+        )
+
+    def extract_signatures(self, source: str) -> str:
+        """Return resource/variable block headers only."""
+        lines = []
+        for key in ("resource", "data", "module", "variable", "output"):
+            for m in self._PATTERNS[key].finditer(source):
+                lines.append(m.group(0).rstrip("{").strip())
+        return "\n".join(lines) if lines else source[:200]
+
+
+# ---------------------------------------------------------------------------
 # Parser registry
 # ---------------------------------------------------------------------------
 
@@ -466,6 +766,9 @@ _PARSER_REGISTRY: dict[Language, LanguageParser] = {
     Language.C: GenericParser(),
     Language.RUBY: GenericParser(),
     Language.PHP: GenericParser(),
+    Language.BASH: BashParser(),
+    Language.HCL: HCLParser(),
+    Language.HELM: GenericParser(),  # Helm = YAML+Go template; generic parser covers basics
 }
 
 
@@ -1164,6 +1467,8 @@ class ContextBuilder:
         self._selector = ContextSelector(self._config)
         self._index_stats = IndexStats()
         self._lock = threading.RLock()
+        # Incremental indexing: path → sha256 of last indexed version
+        self._sha_cache: dict[str, str] = {}
 
     def __repr__(self) -> str:
         return f"ContextBuilder(budget={self._config.token_budget:,}, {self._graph})"
@@ -1196,6 +1501,64 @@ class ContextBuilder:
         Returns:
             IndexStats with counts of files, symbols, edges.
         """
+        return self._index_files_impl(source_map, incremental=False)
+
+    def index_files_incremental(self, source_map: dict[str, str]) -> IndexStats:
+        """Incrementally index files, skipping unchanged files via SHA-256 check.
+
+        Only files whose content hash differs from the last indexed version are
+        re-parsed. This matches the sub-2-second update behaviour of
+        code-review-graph for large repos.
+
+        Args:
+            source_map: Dict mapping file path → source text (full repo snapshot).
+
+        Returns:
+            IndexStats with counts; ``files_skipped`` includes unchanged files.
+        """
+        return self._index_files_impl(source_map, incremental=True)
+
+    def index_roots(
+        self,
+        root_source_maps: list[dict[str, str]],
+        *,
+        incremental: bool = False,
+    ) -> list[IndexStats]:
+        """Index multiple repository roots into a single shared graph.
+
+        Enables monorepo support: each root is a separate source map
+        (e.g. different packages or services), but all share the same
+        DependencyGraph so cross-package imports resolve correctly.
+
+        Args:
+            root_source_maps: List of source maps, one per monorepo root.
+            incremental: If True, skip unchanged files (SHA-256 check).
+
+        Returns:
+            List of IndexStats, one per root.
+        """
+        results: list[IndexStats] = []
+        for sm in root_source_maps:
+            stats = self._index_files_impl(sm, incremental=incremental, build_edges=False)
+            results.append(stats)
+
+        # Build edges once across all roots combined
+        self._graph.build_import_edges()
+        self._graph.build_inheritance_edges()
+        self._graph.build_decorator_edges()
+
+        logger.info(
+            "graphsift: monorepo index complete",
+            extra={"roots": len(root_source_maps), "total_files": sum(s.files_indexed for s in results)},
+        )
+        return results
+
+    def _index_files_impl(
+        self,
+        source_map: dict[str, str],
+        incremental: bool,
+        build_edges: bool = True,
+    ) -> IndexStats:
         import time  # noqa: PLC0415
 
         t0 = time.monotonic()
@@ -1208,11 +1571,24 @@ class ContextBuilder:
             if self._should_skip(path):
                 files_skipped += 1
                 continue
+
+            # Incremental: skip if SHA matches cached value
+            if incremental:
+                new_sha = hashlib.sha256(source.encode(errors="replace")).hexdigest()
+                with self._lock:
+                    cached_sha = self._sha_cache.get(path)
+                if cached_sha == new_sha:
+                    files_skipped += 1
+                    continue
+
             try:
                 fn = self.index_file(path, source)
                 files_indexed += 1
                 symbols += len(fn.symbols)
                 lang_counts[fn.language.value] += 1
+                if incremental:
+                    with self._lock:
+                        self._sha_cache[path] = fn.sha256
             except (ParseError, Exception) as exc:
                 logger.warning(
                     "graphsift: skipping file",
@@ -1220,11 +1596,12 @@ class ContextBuilder:
                 )
                 files_skipped += 1
 
-        # Build all edge types
-        import_edges = self._graph.build_import_edges()
-        inherit_edges = self._graph.build_inheritance_edges()
-        dec_edges = self._graph.build_decorator_edges()
-        total_edges = import_edges + inherit_edges + dec_edges
+        total_edges = 0
+        if build_edges:
+            import_edges = self._graph.build_import_edges()
+            inherit_edges = self._graph.build_inheritance_edges()
+            dec_edges = self._graph.build_decorator_edges()
+            total_edges = import_edges + inherit_edges + dec_edges
 
         duration = (time.monotonic() - t0) * 1000
         stats = IndexStats(
@@ -1245,6 +1622,7 @@ class ContextBuilder:
                 "symbols": symbols,
                 "edges": total_edges,
                 "ms": round(duration, 2),
+                "incremental": incremental,
             },
         )
         return stats
