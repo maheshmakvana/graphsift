@@ -4,15 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphsift"
-version = "1.4.0"
-description = "Smarter code context for LLMs — ranked relevance, multi-file diff, Bash/HCL/Helm parsing, Go receiver methods, monorepo support, incremental indexing, 10 advanced features. Beats code-review-graph with 80-150x token reduction."
+version = "1.4.1"
+description = "graphsift: intelligent code context selection for LLMs. AST dependency graph, BM25+graph ranked relevance, token-budget-aware selection, 14 languages, decorator+dynamic import edges, 80-150x token reduction. Beats code-review-graph (F1 0.85 vs 0.54)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = [
+    "code context llm",
     "code review llm",
     "context selection",
-    "token reduction code",
+    "token reduction",
     "ast dependency graph",
     "code graph python",
     "llm context window",
@@ -28,6 +29,17 @@ keywords = [
     "code review automation",
     "llm code context",
     "code-review-graph alternative",
+    "mcp server code",
+    "claude code integration",
+    "graphsift",
+    "ranked context selection",
+    "multi-file diff analysis",
+    "decorator edge detection",
+    "dynamic import graph",
+    "monorepo context",
+    "incremental code indexing",
+    "llm token optimization",
+    "code intelligence python",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -40,7 +52,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Text Processing :: Indexing",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Natural Language :: English",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -64,6 +83,8 @@ graphsift = "graphsift.cli:main"
 Homepage = "https://github.com/maheshmakvana/graphsift"
 Repository = "https://github.com/maheshmakvana/graphsift"
 Issues = "https://github.com/maheshmakvana/graphsift/issues"
+Changelog = "https://github.com/maheshmakvana/graphsift/releases"
+Documentation = "https://github.com/maheshmakvana/graphsift#readme"
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "venv*", "dist*", "build*"]
