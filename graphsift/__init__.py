@@ -94,8 +94,16 @@ from .advanced import (
     stream_context,
 )
 from .adapters.storage import GraphStore
+from .adapters.postprocess import (
+    CommunityDetector,
+    FlowDetector,
+    Postprocessor,
+    RefactorEngine,
+    RiskScorer,
+    WikiGenerator,
+)
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 __all__ = [
     # Core
     "ContextBuilder",
@@ -152,6 +160,13 @@ __all__ = [
     "SchemaEvolution",
     # Storage
     "GraphStore",
+    # Post-processing
+    "Postprocessor",
+    "FlowDetector",
+    "CommunityDetector",
+    "RiskScorer",
+    "WikiGenerator",
+    "RefactorEngine",
     # MCP / CLI
     "run_server",
 ]

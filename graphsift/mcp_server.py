@@ -429,6 +429,556 @@ def _tool_clear_graph(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Post-processing tools
+# ---------------------------------------------------------------------------
+
+def _tool_run_postprocess(params: dict) -> dict:
+    """Run flow detection, community detection, FTS rebuild, and risk scoring on the graph."""
+    from graphsift.adapters.postprocess import Postprocessor
+
+    root = params.get("root_path", os.getcwd())
+    do_flows = params.get("flows", True)
+    do_communities = params.get("communities", True)
+    do_fts = params.get("fts", True)
+    do_risk = params.get("risk", True)
+
+    builder, source_map = _get_builder(root)
+    if not source_map:
+        return {"error": "Graph not built yet. Call build_graph first."}
+
+    graph = getattr(builder, "_graph", None)
+    if graph is None:
+        return {"error": "No graph available. Call build_graph first."}
+
+    store = _get_store(root)
+    pp = Postprocessor()
+    result = pp.run(graph, store, source_map, flows=do_flows, communities=do_communities, risk=do_risk, fts=do_fts)
+    return {"status": "done", **result}
+
+
+def _tool_detect_changes(params: dict) -> dict:
+    """Detect changed files and return risk-scored impact analysis."""
+    from graphsift.adapters.postprocess import RiskScorer
+
+    root = params.get("root_path", os.getcwd())
+    changed_files = params.get("changed_files", [])
+    max_depth = int(params.get("max_depth", 2))
+    include_source = params.get("include_source", False)
+    detail_level = params.get("detail_level", "standard")
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph or not source_map:
+        return {"error": "Graph not built yet. Call build_graph first."}
+
+    store = _get_store(root)
+
+    # Get blast radius
+    scores = graph.ranked_neighbors(seed_paths=changed_files, include_dynamic=True)
+    affected = sorted(scores.items(), key=lambda x: x[1][0], reverse=True)[:50]
+
+    # Risk from store
+    risk_rows = store.load_risk_index(min_score=0.0)
+    risk_by_path = {r["file_path"]: r["risk_score"] for r in risk_rows}
+
+    result_files = []
+    for fp, (score, depth, reasons) in affected:
+        entry: dict[str, Any] = {
+            "file": fp,
+            "score": round(score, 3),
+            "depth": depth,
+            "reasons": reasons,
+            "risk_score": round(risk_by_path.get(fp, 0.0), 3),
+        }
+        if include_source and detail_level == "standard":
+            entry["source_preview"] = (source_map.get(fp, "")[:500] + "...") if source_map.get(fp) else ""
+        result_files.append(entry)
+
+    # Summary risk score = max risk among changed files
+    max_risk = max((risk_by_path.get(f, 0.0) for f in changed_files), default=0.0)
+
+    return {
+        "changed_files": changed_files,
+        "affected_count": len(affected),
+        "max_risk_score": round(max_risk, 3),
+        "affected_files": result_files,
+    }
+
+
+def _tool_query_graph(params: dict) -> dict:
+    """Run predefined graph queries: callers_of, callees_of, imports_of, importers_of, tests_for, file_summary."""
+    from graphsift.models import EdgeKind, NodeKind
+
+    root = params.get("root_path", os.getcwd())
+    pattern = params.get("pattern", "")
+    target = params.get("target", "")
+    limit = int(params.get("limit", 20))
+    detail_level = params.get("detail_level", "standard")
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph:
+        return {"error": "Graph not built yet. Call build_graph first."}
+
+    with graph._lock:
+        nodes = dict(graph._nodes)
+        adj_out = {k: list(v) for k, v in graph._adj_out.items()}
+        adj_in = {k: list(v) for k, v in graph._adj_in.items()}
+        file_nodes = dict(graph._file_nodes)
+
+    target_lower = target.lower()
+
+    def _match_node(n: Any) -> bool:
+        return (
+            target_lower in n.name.lower()
+            or target_lower in n.qualified_name.lower()
+            or target_lower in n.file_path.lower()
+        )
+
+    matched = [n for n in nodes.values() if _match_node(n)][:5]
+
+    results = []
+    for seed in matched:
+        nid = seed.node_id
+        if pattern == "callers_of":
+            hits = [nodes[e.source_id] for e in adj_in.get(nid, []) if e.source_id in nodes]
+        elif pattern == "callees_of":
+            hits = [nodes[e.target_id] for e in adj_out.get(nid, []) if e.target_id in nodes]
+        elif pattern == "imports_of":
+            hits = [nodes[e.target_id] for e in adj_out.get(nid, [])
+                    if e.kind.value == "imports" and e.target_id in nodes]
+        elif pattern == "importers_of":
+            hits = [nodes[e.source_id] for e in adj_in.get(nid, [])
+                    if e.kind.value == "imports" and e.source_id in nodes]
+        elif pattern == "tests_for":
+            hits = [nodes[e.source_id] for e in adj_in.get(nid, [])
+                    if "test" in nodes.get(e.source_id, type("", (), {"file_path": ""})()).file_path.lower()
+                    and e.source_id in nodes]
+        elif pattern == "file_summary":
+            fn = file_nodes.get(seed.file_path)
+            return {
+                "pattern": pattern,
+                "target": target,
+                "file": seed.file_path,
+                "language": fn.language.value if fn else "unknown",
+                "symbols": len(fn.symbols) if fn else 0,
+                "token_estimate": fn.token_estimate if fn else 0,
+            }
+        elif pattern == "children_of":
+            hits = [nodes[e.target_id] for e in adj_out.get(nid, []) if e.target_id in nodes]
+        elif pattern == "inheritors_of":
+            hits = [nodes[e.source_id] for e in adj_in.get(nid, [])
+                    if e.kind.value == "inherits" and e.source_id in nodes]
+        else:
+            return {"error": f"Unknown pattern: {pattern}. Valid: callers_of, callees_of, imports_of, importers_of, tests_for, children_of, inheritors_of, file_summary"}
+
+        for h in hits[:limit]:
+            entry: dict[str, Any] = {
+                "name": h.name,
+                "qualified_name": h.qualified_name,
+                "kind": h.kind.value,
+                "file": h.file_path,
+                "line": h.line_start,
+            }
+            results.append(entry)
+
+    return {
+        "pattern": pattern,
+        "target": target,
+        "results": results,
+        "total": len(results),
+    }
+
+
+def _tool_list_flows(params: dict) -> dict:
+    """List execution flows sorted by criticality."""
+    root = params.get("root_path", os.getcwd())
+    limit = int(params.get("limit", 50))
+    sort_by = params.get("sort_by", "criticality")
+    detail_level = params.get("detail_level", "standard")
+
+    store = _get_store(root)
+    with store._lock:
+        try:
+            rows = store._conn.execute(
+                "SELECT * FROM flow_snapshots ORDER BY id DESC LIMIT ?", (limit * 2,)
+            ).fetchall()
+        except Exception:
+            rows = []
+
+    flows = []
+    for row in rows:
+        meta = json.loads(row["metadata"] or "{}")
+        entry: dict[str, Any] = {
+            "id": row["id"],
+            "flow_name": row["flow_name"],
+            "entry_point": row["entry_point"],
+            "node_count": meta.get("node_count", 0),
+            "file_count": meta.get("file_count", 0),
+            "criticality": meta.get("criticality", 0.0),
+        }
+        flows.append(entry)
+
+    # Sort
+    key_map = {"criticality": "criticality", "node_count": "node_count", "file_count": "file_count", "name": "flow_name"}
+    sort_key = key_map.get(sort_by, "criticality")
+    flows.sort(key=lambda x: x.get(sort_key, 0), reverse=(sort_key != "flow_name"))
+
+    return {"flows": flows[:limit], "total": len(flows)}
+
+
+def _tool_get_flow(params: dict) -> dict:
+    """Get detailed information about a single execution flow."""
+    root = params.get("root_path", os.getcwd())
+    flow_id = params.get("flow_id")
+    flow_name = params.get("flow_name", "")
+    include_source = params.get("include_source", False)
+
+    store = _get_store(root)
+    _, source_map = _get_builder(root)
+
+    with store._lock:
+        try:
+            if flow_id is not None:
+                row = store._conn.execute(
+                    "SELECT * FROM flow_snapshots WHERE id=?", (flow_id,)
+                ).fetchone()
+            else:
+                row = store._conn.execute(
+                    "SELECT * FROM flow_snapshots WHERE flow_name LIKE ? LIMIT 1",
+                    (f"%{flow_name}%",),
+                ).fetchone()
+        except Exception:
+            row = None
+
+    if not row:
+        return {"error": "Flow not found."}
+
+    nodes_json = json.loads(row["nodes_json"] or "[]")
+    meta = json.loads(row["metadata"] or "{}")
+
+    result: dict[str, Any] = {
+        "id": row["id"],
+        "flow_name": row["flow_name"],
+        "entry_point": row["entry_point"],
+        "node_count": meta.get("node_count", len(nodes_json)),
+        "criticality": meta.get("criticality", 0.0),
+        "nodes": nodes_json[:50],
+    }
+
+    if include_source and source_map:
+        seen_files: set[str] = set()
+        snippets = []
+        for nid in nodes_json[:10]:
+            fp = nid.split("::")[0] if "::" in nid else ""
+            if fp and fp not in seen_files and fp in source_map:
+                seen_files.add(fp)
+                snippets.append({"file": fp, "source": source_map[fp][:300]})
+        result["source_snippets"] = snippets
+
+    return result
+
+
+def _tool_get_affected_flows(params: dict) -> dict:
+    """Find execution flows affected by changed files."""
+    root = params.get("root_path", os.getcwd())
+    changed_files = params.get("changed_files", [])
+
+    store = _get_store(root)
+
+    with store._lock:
+        try:
+            rows = store._conn.execute("SELECT * FROM flow_snapshots").fetchall()
+        except Exception:
+            rows = []
+
+    changed_set = set(changed_files)
+    affected = []
+    for row in rows:
+        nodes_in_flow = json.loads(row["nodes_json"] or "[]")
+        flow_files = {nid.split("::")[0] for nid in nodes_in_flow if "::" in nid}
+        if flow_files & changed_set:
+            meta = json.loads(row["metadata"] or "{}")
+            affected.append({
+                "id": row["id"],
+                "flow_name": row["flow_name"],
+                "entry_point": row["entry_point"],
+                "criticality": meta.get("criticality", 0.0),
+                "overlapping_files": list(flow_files & changed_set),
+            })
+
+    affected.sort(key=lambda x: -x["criticality"])
+    return {"changed_files": changed_files, "affected_flows": affected, "total": len(affected)}
+
+
+def _tool_list_communities(params: dict) -> dict:
+    """List detected code communities."""
+    root = params.get("root_path", os.getcwd())
+    sort_by = params.get("sort_by", "size")
+    min_size = int(params.get("min_size", 0))
+    limit = int(params.get("limit", 50))
+    detail_level = params.get("detail_level", "standard")
+
+    store = _get_store(root)
+    communities = store.load_communities()
+
+    if min_size > 0:
+        communities = [c for c in communities if c["node_count"] >= min_size]
+
+    if sort_by == "name":
+        communities.sort(key=lambda x: x["label"])
+    else:
+        communities.sort(key=lambda x: -x["node_count"])
+
+    return {"communities": communities[:limit], "total": len(communities)}
+
+
+def _tool_get_community(params: dict) -> dict:
+    """Get detailed information about a single code community."""
+    root = params.get("root_path", os.getcwd())
+    community_name = params.get("community_name", "")
+    community_id = params.get("community_id")
+    include_members = params.get("include_members", False)
+
+    store = _get_store(root)
+    communities = store.load_communities()
+
+    if community_id is not None:
+        found = next((c for c in communities if c["community_id"] == community_id), None)
+    else:
+        name_lower = community_name.lower()
+        found = next((c for c in communities if name_lower in c["label"].lower()), None)
+
+    if not found:
+        return {"error": "Community not found."}
+
+    result: dict[str, Any] = {
+        "community_id": found["community_id"],
+        "label": found["label"],
+        "node_count": found["node_count"],
+    }
+    if include_members:
+        result["members"] = found.get("metadata", {}).get("members", [])
+
+    return result
+
+
+def _tool_get_architecture_overview(params: dict) -> dict:
+    """Generate architecture overview based on community structure."""
+    root = params.get("root_path", os.getcwd())
+
+    store = _get_store(root)
+    db_stats = store.stats()
+    communities = store.load_communities()
+    risk_index = store.load_risk_index(min_score=0.5)
+
+    high_risk_files = [r["file_path"] for r in risk_index[:10]]
+
+    overview = {
+        "total_nodes": db_stats.get("nodes", 0),
+        "total_edges": db_stats.get("edges", 0),
+        "total_files": db_stats.get("files", 0),
+        "total_communities": len(communities),
+        "schema_version": db_stats.get("schema_version", 0),
+        "communities": [
+            {"id": c["community_id"], "label": c["label"], "size": c["node_count"]}
+            for c in communities[:20]
+        ],
+        "high_risk_files": high_risk_files,
+        "db_path": db_stats.get("db_path", ""),
+    }
+    return overview
+
+
+def _tool_refactor(params: dict) -> dict:
+    """Rename preview or dead-code detection across the graph."""
+    from graphsift.adapters.postprocess import RefactorEngine
+
+    root = params.get("root_path", os.getcwd())
+    mode = params.get("mode", "rename")
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph:
+        return {"error": "Graph not built yet. Call build_graph first."}
+
+    engine = RefactorEngine()
+
+    if mode == "rename":
+        old_name = params.get("old_name", "")
+        new_name = params.get("new_name", "")
+        if not old_name or not new_name:
+            return {"error": "old_name and new_name required for rename mode."}
+        return engine.rename_preview(graph, old_name, new_name)
+
+    elif mode == "dead_code":
+        kind = params.get("kind")
+        file_pattern = params.get("file_pattern")
+        limit = int(params.get("limit", 50))
+        dead = engine.find_dead_code(graph, kind=kind, file_pattern=file_pattern, limit=limit)
+        return {"mode": "dead_code", "results": dead, "total": len(dead)}
+
+    elif mode == "suggest":
+        dead = engine.find_dead_code(graph, limit=10)
+        return {
+            "mode": "suggest",
+            "suggestions": [
+                f"Consider removing unused {d['kind']} '{d['name']}' in {d['file_path']}:{d['line_start']}"
+                for d in dead[:10]
+            ],
+        }
+
+    return {"error": f"Unknown mode: {mode}. Valid: rename, dead_code, suggest"}
+
+
+def _tool_apply_refactor(params: dict) -> dict:
+    """Apply a previously previewed rename to source files."""
+    from graphsift.adapters.postprocess import RefactorEngine
+
+    root = params.get("root_path", os.getcwd())
+    refactor_id = params.get("refactor_id", "")
+    if not refactor_id:
+        return {"error": "refactor_id is required."}
+
+    engine = RefactorEngine()
+    return engine.apply_rename(refactor_id, root)
+
+
+def _tool_generate_wiki(params: dict) -> dict:
+    """Generate markdown wiki pages from community structure into .graphsift/wiki/."""
+    from graphsift.adapters.postprocess import WikiGenerator
+
+    root = params.get("root_path", os.getcwd())
+    force = params.get("force", False)
+
+    store = _get_store(root)
+    communities = store.load_communities()
+    risk_index = store.load_risk_index()
+
+    if not communities:
+        return {"error": "No communities found. Run run_postprocess first."}
+
+    wiki_dir = str(Path(root) / ".graphsift" / "wiki")
+    gen = WikiGenerator(wiki_dir)
+    counts = gen.generate(communities, risk_index, force=force)
+    return {"wiki_dir": wiki_dir, **counts}
+
+
+def _tool_get_wiki_page(params: dict) -> dict:
+    """Retrieve a specific wiki page by community name."""
+    from graphsift.adapters.postprocess import WikiGenerator
+
+    root = params.get("root_path", os.getcwd())
+    community_name = params.get("community_name", "")
+
+    wiki_dir = str(Path(root) / ".graphsift" / "wiki")
+    gen = WikiGenerator(wiki_dir)
+    content = gen.get_page(community_name)
+
+    if content is None:
+        return {"error": f"Wiki page not found for '{community_name}'. Run generate_wiki first."}
+    return {"community_name": community_name, "content": content}
+
+
+def _tool_semantic_search_nodes(params: dict) -> dict:
+    """Search for code symbols by name, keyword, or file path."""
+    root = params.get("root_path", os.getcwd())
+    query = params.get("query", "")
+    kind = params.get("kind")
+    limit = int(params.get("limit", 20))
+
+    store = _get_store(root)
+
+    # Try FTS5 first, fall back to LIKE
+    nodes = store.search_nodes(query, limit=limit * 2)
+
+    if kind:
+        kind_lower = kind.lower()
+        nodes = [n for n in nodes if n.kind.value == kind_lower]
+
+    results = [
+        {
+            "name": n.name,
+            "qualified_name": n.qualified_name,
+            "kind": n.kind.value,
+            "file": n.file_path,
+            "line": n.line_start,
+            "language": n.language.value,
+            "community_id": n.community_id,
+        }
+        for n in nodes[:limit]
+    ]
+
+    return {"query": query, "results": results, "total": len(results)}
+
+
+def _tool_list_repos(params: dict) -> dict:
+    """List all registered repositories in the graphsift registry."""
+    registry_path = Path.home() / ".graphsift" / "registry.json"
+    if not registry_path.exists():
+        return {"status": "ok", "summary": "0 registered repository(ies)", "repos": []}
+
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        registry = {}
+
+    repos = [
+        {"root": root, "name": info.get("name", Path(root).name), "db_path": info.get("db_path", "")}
+        for root, info in registry.items()
+    ]
+    return {
+        "status": "ok",
+        "summary": f"{len(repos)} registered repository(ies)",
+        "repos": repos,
+    }
+
+
+def _tool_cross_repo_search(params: dict) -> dict:
+    """Search for code entities across all registered repositories."""
+    query = params.get("query", "")
+    kind = params.get("kind")
+    limit = int(params.get("limit", 20))
+
+    registry_path = Path.home() / ".graphsift" / "registry.json"
+    if not registry_path.exists():
+        return {"error": "No repos registered. Run: graphsift register <path>", "results": []}
+
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"error": "Could not read registry.", "results": []}
+
+    from graphsift.adapters.storage import GraphStore
+    all_results = []
+
+    for root, info in registry.items():
+        db_path = info.get("db_path")
+        if not db_path or not Path(db_path).exists():
+            continue
+        try:
+            store = GraphStore(db_path)
+            nodes = store.search_nodes(query, limit=limit)
+            if kind:
+                nodes = [n for n in nodes if n.kind.value == kind.lower()]
+            for n in nodes[:limit]:
+                all_results.append({
+                    "repo": info.get("name", Path(root).name),
+                    "root": root,
+                    "name": n.name,
+                    "qualified_name": n.qualified_name,
+                    "kind": n.kind.value,
+                    "file": n.file_path,
+                    "line": n.line_start,
+                })
+        except Exception as exc:
+            logger.warning("cross_repo_search: failed for %s: %s", root, exc)
+
+    all_results.sort(key=lambda x: x["name"])
+    return {"query": query, "results": all_results[:limit * len(registry)], "total": len(all_results)}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -560,11 +1110,203 @@ _TOOLS = {
     "clear_graph": {
         "fn": _tool_clear_graph,
         "description": "Clear the in-memory graph for root_path, forcing a full rebuild on next call.",
+        "inputSchema": {"type": "object", "properties": {"root_path": {"type": "string"}}},
+    },
+    "run_postprocess": {
+        "fn": _tool_run_postprocess,
+        "description": "Run flow detection, community detection, FTS rebuild, and risk scoring on the built graph. Call after build_graph.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "root_path": {"type": "string"},
+                "flows": {"type": "boolean", "description": "Run flow detection (default true)"},
+                "communities": {"type": "boolean", "description": "Run community detection (default true)"},
+                "fts": {"type": "boolean", "description": "Rebuild FTS index (default true)"},
+                "risk": {"type": "boolean", "description": "Compute risk scores (default true)"},
             },
+        },
+    },
+    "detect_changes": {
+        "fn": _tool_detect_changes,
+        "description": "Detect changed files and return risk-scored impact analysis with blast radius.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "changed_files": {"type": "array", "items": {"type": "string"}},
+                "max_depth": {"type": "integer", "description": "BFS depth (default 2)"},
+                "include_source": {"type": "boolean"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+        },
+    },
+    "query_graph": {
+        "fn": _tool_query_graph,
+        "description": "Run predefined graph queries: callers_of, callees_of, imports_of, importers_of, tests_for, children_of, inheritors_of, file_summary.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "pattern": {"type": "string", "description": "Query pattern: callers_of | callees_of | imports_of | importers_of | tests_for | children_of | inheritors_of | file_summary"},
+                "target": {"type": "string", "description": "Symbol name, qualified name, or file path to query"},
+                "limit": {"type": "integer"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+            "required": ["pattern", "target"],
+        },
+    },
+    "list_flows": {
+        "fn": _tool_list_flows,
+        "description": "List detected execution flows sorted by criticality. Run run_postprocess first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "sort_by": {"type": "string", "enum": ["criticality", "node_count", "file_count", "name"]},
+                "limit": {"type": "integer"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+        },
+    },
+    "get_flow": {
+        "fn": _tool_get_flow,
+        "description": "Get detailed information about a single execution flow including call path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "flow_id": {"type": "integer"},
+                "flow_name": {"type": "string", "description": "Partial name match (used if flow_id omitted)"},
+                "include_source": {"type": "boolean"},
+            },
+        },
+    },
+    "get_affected_flows": {
+        "fn": _tool_get_affected_flows,
+        "description": "Find execution flows that pass through changed files.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "changed_files": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    "list_communities": {
+        "fn": _tool_list_communities,
+        "description": "List detected code communities sorted by size. Run run_postprocess first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "sort_by": {"type": "string", "enum": ["size", "name"]},
+                "min_size": {"type": "integer"},
+                "limit": {"type": "integer"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+        },
+    },
+    "get_community": {
+        "fn": _tool_get_community,
+        "description": "Get details about a single code community including members.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "community_name": {"type": "string"},
+                "community_id": {"type": "integer"},
+                "include_members": {"type": "boolean"},
+            },
+        },
+    },
+    "get_architecture_overview": {
+        "fn": _tool_get_architecture_overview,
+        "description": "Generate architecture overview: communities, risk files, total nodes/edges/files.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"root_path": {"type": "string"}},
+        },
+    },
+    "refactor": {
+        "fn": _tool_refactor,
+        "description": "Rename preview, dead-code detection, or suggestions. mode: rename | dead_code | suggest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "mode": {"type": "string", "enum": ["rename", "dead_code", "suggest"]},
+                "old_name": {"type": "string", "description": "For rename mode"},
+                "new_name": {"type": "string", "description": "For rename mode"},
+                "kind": {"type": "string", "description": "For dead_code: function | class | method"},
+                "file_pattern": {"type": "string"},
+            },
+        },
+    },
+    "apply_refactor": {
+        "fn": _tool_apply_refactor,
+        "description": "Apply a previously previewed rename to source files. All edits validated to be within repo root.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "refactor_id": {"type": "string", "description": "ID from prior refactor(mode=rename) call"},
+            },
+            "required": ["refactor_id"],
+        },
+    },
+    "generate_wiki": {
+        "fn": _tool_generate_wiki,
+        "description": "Generate markdown wiki pages from community structure into .graphsift/wiki/.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "force": {"type": "boolean", "description": "Regenerate all pages even if unchanged"},
+            },
+        },
+    },
+    "get_wiki_page": {
+        "fn": _tool_get_wiki_page,
+        "description": "Get a specific wiki page by community name. Run generate_wiki first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "community_name": {"type": "string", "description": "Community name (partial match)"},
+            },
+            "required": ["community_name"],
+        },
+    },
+    "semantic_search_nodes": {
+        "fn": _tool_semantic_search_nodes,
+        "description": "Search for code symbols (functions, classes, modules) by name or keyword. Uses FTS5 when available.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "query": {"type": "string"},
+                "kind": {"type": "string", "description": "Filter by kind: function | class | method | module"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    "list_repos": {
+        "fn": _tool_list_repos,
+        "description": "List all repositories registered in the graphsift registry (~/.graphsift/registry.json).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "cross_repo_search": {
+        "fn": _tool_cross_repo_search,
+        "description": "Search for code entities across all registered repositories.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "kind": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
         },
     },
 }
@@ -585,7 +1327,7 @@ def _handle_initialize(req_id: Any, params: dict) -> None:
     _ok(req_id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "graphsift", "version": "1.3.0"},
+        "serverInfo": {"name": "graphsift", "version": "1.4.0"},
     })
 
 

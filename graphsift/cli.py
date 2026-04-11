@@ -575,6 +575,332 @@ def cmd_list_repos(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# postprocess command
+# ---------------------------------------------------------------------------
+
+def cmd_postprocess(args: argparse.Namespace) -> int:
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO, format="%(message)s", stream=sys.stdout)
+
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.adapters.postprocess import Postprocessor
+    from graphsift.adapters.storage import GraphStore
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = Path(args.project_root).resolve()
+    db_path = _db_path_for_root(str(root))
+
+    print(f"\nGraphsift: running post-processing for {root}\n")
+
+    manifest_path = root / ".graphsift" / "manifest.json"
+    if not manifest_path.exists():
+        print("[graphsift] No graph built yet. Run: graphsift build")
+        return 1
+
+    # Re-index for in-memory graph
+    print("  Loading source map ...")
+    source_map = load_source_map(str(root))
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files(source_map)
+    graph = getattr(builder, "_graph", None)
+    if graph is None:
+        print("[graphsift] Failed to build graph.")
+        return 1
+
+    store = GraphStore(db_path)
+    pp = Postprocessor()
+
+    result = pp.run(
+        graph, store, source_map,
+        flows=not args.no_flows,
+        communities=not args.no_communities,
+        risk=not args.no_risk,
+        fts=not args.no_fts,
+    )
+
+    print()
+    print("  Post-processing results:")
+    print(f"    flows detected     : {result['flows_detected']}")
+    print(f"    communities found  : {result['communities_detected']}")
+    print(f"    files risk-scored  : {result['files_scored']}")
+    print(f"    fts entries        : {result['fts_indexed']}")
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# watch command
+# ---------------------------------------------------------------------------
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    import time
+    from graphsift.adapters.filesystem import load_changed_files
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = Path(args.project_root).resolve()
+    manifest_path = root / ".graphsift" / "manifest.json"
+    print(f"[graphsift] Watching {root} for changes (Ctrl+C to stop) ...")
+
+    last_mtimes: dict[str, float] = {}
+
+    def _scan_mtimes() -> dict[str, float]:
+        mtimes: dict[str, float] = {}
+        for ext in [".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java"]:
+            for p in root.rglob(f"*{ext}"):
+                skip = any(d in p.parts for d in ["venv", ".venv", "node_modules", ".git", "__pycache__", "dist", "build"])
+                if not skip:
+                    try:
+                        mtimes[str(p)] = p.stat().st_mtime
+                    except OSError:
+                        pass
+        return mtimes
+
+    last_mtimes = _scan_mtimes()
+
+    try:
+        while True:
+            time.sleep(2)
+            current = _scan_mtimes()
+            changed = [p for p, mtime in current.items()
+                       if p not in last_mtimes or last_mtimes[p] != mtime]
+            removed = [p for p in last_mtimes if p not in current]
+
+            if changed or removed:
+                print(f"[graphsift] {len(changed)} changed, {len(removed)} removed — updating graph ...")
+                if changed:
+                    new_sources = load_changed_files(changed)
+                    builder = ContextBuilder(ContextConfig())
+                    for path, source in new_sources.items():
+                        try:
+                            builder.index_file(path, source)
+                        except Exception:
+                            pass
+                    print(f"[graphsift] Updated {len(changed)} files.")
+                last_mtimes = current
+    except KeyboardInterrupt:
+        print("\n[graphsift] Watch stopped.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# detect-changes command
+# ---------------------------------------------------------------------------
+
+def cmd_detect_changes(args: argparse.Namespace) -> int:
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.adapters.postprocess import RiskScorer
+    from graphsift.adapters.storage import GraphStore
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = Path(args.project_root).resolve()
+    changed_files = [str(Path(f).resolve()) for f in args.files] if args.files else []
+
+    if not changed_files:
+        print("[graphsift] No files specified. Use: graphsift detect-changes file1.py file2.py")
+        return 1
+
+    source_map = load_source_map(str(root))
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files(source_map)
+    graph = getattr(builder, "_graph", None)
+
+    if not graph:
+        print("[graphsift] No graph built.")
+        return 1
+
+    store = GraphStore(_db_path_for_root(str(root)))
+    risk_rows = store.load_risk_index(min_score=0.0)
+    risk_by_path = {r["file_path"]: r["risk_score"] for r in risk_rows}
+
+    scores = graph.ranked_neighbors(seed_paths=changed_files, include_dynamic=True)
+    affected = sorted(scores.items(), key=lambda x: x[1][0], reverse=True)[:30]
+
+    max_risk = max((risk_by_path.get(f, 0.0) for f in changed_files), default=0.0)
+
+    print(f"\n  Changed files  : {len(changed_files)}")
+    print(f"  Affected files : {len(affected)}")
+    print(f"  Max risk score : {max_risk:.2f}")
+    print()
+    print(f"  {'File':<60} {'Score':>6}  {'Risk':>5}  Reasons")
+    print("  " + "-" * 80)
+    for fp, (score, depth, reasons) in affected[:20]:
+        rsk = risk_by_path.get(fp, 0.0)
+        reason_str = ", ".join(reasons[:2])
+        short_fp = fp[-55:] if len(fp) > 55 else fp
+        print(f"  {short_fp:<60} {score:>6.3f}  {rsk:>5.2f}  {reason_str}")
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# visualize command
+# ---------------------------------------------------------------------------
+
+def cmd_visualize(args: argparse.Namespace) -> int:
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = Path(args.project_root).resolve()
+    output_path = root / ".graphsift" / "graph.html"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"[graphsift] Building visualization for {root} ...")
+    source_map = load_source_map(str(root))
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files(source_map)
+    graph = getattr(builder, "_graph", None)
+
+    if not graph:
+        print("[graphsift] No graph built.")
+        return 1
+
+    with graph._lock:
+        file_nodes = list(graph._file_nodes.values())
+        edges = list(graph._edges)
+
+    # Build minimal D3-ready JSON
+    nodes_js = [
+        {"id": fn.path, "label": Path(fn.path).name, "lang": fn.language.value, "tokens": fn.token_estimate}
+        for fn in file_nodes[:300]
+    ]
+    node_ids = {n["id"] for n in nodes_js}
+    links_js = [
+        {"source": e.source_id.split("::")[0], "target": e.target_id.split("::")[0], "kind": e.kind.value}
+        for e in edges
+        if e.source_id.split("::")[0] in node_ids and e.target_id.split("::")[0] in node_ids
+    ][:1000]
+
+    html = _render_graph_html(nodes_js, links_js, str(root))
+    output_path.write_text(html, encoding="utf-8")
+
+    print(f"[graphsift] Graph visualization -> {output_path}")
+    if args.serve:
+        import http.server
+        import webbrowser
+        port = 8765
+        os.chdir(str(output_path.parent))
+        print(f"[graphsift] Serving at http://localhost:{port}/graph.html  (Ctrl+C to stop)")
+        webbrowser.open(f"http://localhost:{port}/graph.html")
+        http.server.HTTPServer(("", port), http.server.SimpleHTTPRequestHandler).serve_forever()
+    return 0
+
+
+def _render_graph_html(nodes: list, links: list, title: str) -> str:
+    nodes_json = json.dumps(nodes)
+    links_json = json.dumps(links)
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>graphsift: {title}</title>
+<style>
+body {{ margin:0; background:#1a1a2e; font-family:monospace; color:#eee; }}
+svg {{ width:100vw; height:100vh; }}
+.node circle {{ stroke:#fff; stroke-width:1.5px; cursor:pointer; }}
+.link {{ stroke:#555; stroke-opacity:0.5; }}
+.label {{ font-size:10px; fill:#ccc; pointer-events:none; }}
+#info {{ position:fixed; top:10px; right:10px; background:#16213e; padding:12px; border-radius:6px; max-width:300px; font-size:12px; }}
+</style></head>
+<body>
+<div id="info"><b>graphsift</b><br>{title}<br>{len(nodes)} files &nbsp; {len(links)} edges</div>
+<svg id="graph"></svg>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const nodes = {nodes_json};
+const links = {links_json};
+const w = window.innerWidth, h = window.innerHeight;
+const svg = d3.select('#graph').attr('width',w).attr('height',h);
+const g = svg.append('g');
+svg.call(d3.zoom().on('zoom', e => g.attr('transform', e.transform)));
+const colors = d3.scaleOrdinal(d3.schemeTableau10);
+const sim = d3.forceSimulation(nodes)
+  .force('link', d3.forceLink(links).id(d=>d.id).distance(80))
+  .force('charge', d3.forceManyBody().strength(-120))
+  .force('center', d3.forceCenter(w/2, h/2));
+const link = g.append('g').selectAll('line').data(links).join('line').attr('class','link');
+const node = g.append('g').selectAll('g').data(nodes).join('g')
+  .call(d3.drag().on('start',(e,d)=>{{if(!e.active)sim.alphaTarget(.3).restart();d.fx=d.x;d.fy=d.y}})
+    .on('drag',(e,d)=>{{d.fx=e.x;d.fy=e.y}})
+    .on('end',(e,d)=>{{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null}}));
+node.append('circle').attr('r',6).attr('fill',d=>colors(d.lang));
+node.append('text').attr('class','label').attr('dx',8).attr('dy',4).text(d=>d.label);
+node.append('title').text(d=>d.id+'\\n'+d.lang+' | '+d.tokens+' tokens');
+sim.on('tick',()=>{{
+  link.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+  node.attr('transform',d=>`translate(${{d.x}},${{d.y}})`);
+}});
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# wiki command
+# ---------------------------------------------------------------------------
+
+def cmd_wiki(args: argparse.Namespace) -> int:
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.adapters.postprocess import CommunityDetector, RiskScorer, WikiGenerator
+    from graphsift.adapters.storage import GraphStore
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = Path(args.project_root).resolve()
+    db_path = _db_path_for_root(str(root))
+    store = GraphStore(db_path)
+
+    communities = store.load_communities()
+    risk_index = store.load_risk_index()
+
+    if not communities:
+        print("[graphsift] No communities found. Run: graphsift postprocess")
+        return 1
+
+    wiki_dir = root / ".graphsift" / "wiki"
+    gen = WikiGenerator(str(wiki_dir))
+    counts = gen.generate(communities, risk_index, force=args.force)
+
+    print(f"[graphsift] Wiki generated -> {wiki_dir}")
+    print(f"  generated: {counts['pages_generated']}")
+    print(f"  updated  : {counts['pages_updated']}")
+    print(f"  unchanged: {counts['pages_unchanged']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# unregister command
+# ---------------------------------------------------------------------------
+
+def cmd_unregister(args: argparse.Namespace) -> int:
+    registry = _load_registry()
+    target = args.path_or_name
+
+    # Try exact path match first, then name match
+    key_to_remove = None
+    for key, info in registry.items():
+        if key == target or str(Path(target).resolve()) == key or info.get("name") == target:
+            key_to_remove = key
+            break
+
+    if key_to_remove is None:
+        print(f"[graphsift] Not found in registry: {target}")
+        return 1
+
+    del registry[key_to_remove]
+    _save_registry(registry)
+    print(f"[graphsift] Unregistered: {key_to_remove}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# repos command (alias for list-repos with nicer output)
+# ---------------------------------------------------------------------------
+
+def cmd_repos(args: argparse.Namespace) -> int:
+    return cmd_list_repos(args)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -606,9 +932,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_update = sub.add_parser("update", help="Incrementally update graph (changed files only)")
     p_update.add_argument("--project-root", default=_cwd())
 
+    # postprocess
+    p_pp = sub.add_parser("postprocess", help="Run flow/community detection, risk scoring, FTS rebuild")
+    p_pp.add_argument("--project-root", default=_cwd())
+    p_pp.add_argument("--no-flows", action="store_true", help="Skip flow detection")
+    p_pp.add_argument("--no-communities", action="store_true", help="Skip community detection")
+    p_pp.add_argument("--no-risk", action="store_true", help="Skip risk scoring")
+    p_pp.add_argument("--no-fts", action="store_true", help="Skip FTS rebuild")
+
     # status
     p_status = sub.add_parser("status", help="Show installation and graph status")
     p_status.add_argument("--project-root", default=_cwd())
+
+    # watch
+    p_watch = sub.add_parser("watch", help="Watch for file changes and auto-update graph")
+    p_watch.add_argument("--project-root", default=_cwd())
+
+    # detect-changes
+    p_dc = sub.add_parser("detect-changes", help="Show risk-scored impact analysis for changed files")
+    p_dc.add_argument("--project-root", default=_cwd())
+    p_dc.add_argument("files", nargs="*", metavar="FILE", help="Changed files to analyze")
+
+    # visualize
+    p_viz = sub.add_parser("visualize", help="Generate interactive HTML dependency graph")
+    p_viz.add_argument("--project-root", default=_cwd())
+    p_viz.add_argument("--serve", action="store_true", help="Serve on localhost:8765 after generating")
+
+    # wiki
+    p_wiki = sub.add_parser("wiki", help="Generate markdown wiki from community structure")
+    p_wiki.add_argument("--project-root", default=_cwd())
+    p_wiki.add_argument("--force", action="store_true", help="Regenerate all pages")
 
     # uninstall
     p_uninstall = sub.add_parser("uninstall", help="Remove graphsift from Claude Code config")
@@ -619,8 +972,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_register.add_argument("--project-root", default=_cwd(), help="Repo root to register (default: cwd)")
     p_register.add_argument("--name", default="", help="Optional display name for this repo")
 
-    # list-repos
+    # unregister
+    p_unreg = sub.add_parser("unregister", help="Remove a repo from the graphsift registry")
+    p_unreg.add_argument("path_or_name", help="Repo path or name to remove")
+
+    # list-repos / repos
     sub.add_parser("list-repos", help="List all registered repos")
+    sub.add_parser("repos", help="List all registered repos (alias for list-repos)")
 
     return parser
 
@@ -634,10 +992,17 @@ def main() -> None:
         "serve": cmd_serve,
         "build": cmd_build,
         "update": cmd_update,
+        "postprocess": cmd_postprocess,
         "status": cmd_status,
+        "watch": cmd_watch,
+        "detect-changes": cmd_detect_changes,
+        "visualize": cmd_visualize,
+        "wiki": cmd_wiki,
         "uninstall": cmd_uninstall,
         "register": cmd_register,
+        "unregister": cmd_unregister,
         "list-repos": cmd_list_repos,
+        "repos": cmd_repos,
     }
 
     fn = commands.get(args.command)
