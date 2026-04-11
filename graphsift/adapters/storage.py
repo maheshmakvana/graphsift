@@ -9,6 +9,7 @@ Migration history:
   v4  — community_id column on nodes + communities table
   v5  — nodes_fts FTS5 full-text search virtual table
   v6  — summary tables: community_summaries, flow_snapshots, risk_index
+  v7  — graph_meta key/value store (embed_version, token mode settings)
 
 Usage (caller-supplied path)::
 
@@ -42,7 +43,7 @@ from ..models import (
 
 logger = logging.getLogger(__name__)
 
-_CURRENT_VERSION = 6
+_CURRENT_VERSION = 7
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,18 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 reasons       TEXT DEFAULT '[]',
                 computed_at   TEXT DEFAULT (datetime('now')),
                 metadata      TEXT DEFAULT '{}'
+            )
+            """,
+        ],
+    ),
+    (
+        7,
+        "created graph_meta key/value store for embed_version and token-mode settings",
+        [
+            """
+            CREATE TABLE IF NOT EXISTS graph_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
             )
             """,
         ],

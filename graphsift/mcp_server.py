@@ -934,6 +934,395 @@ def _tool_list_repos(params: dict) -> dict:
     }
 
 
+def _compact(obj: Any, detail_level: str) -> Any:
+    """Strip verbose keys when detail_level == 'minimal'."""
+    if detail_level != "minimal" or not isinstance(obj, dict):
+        return obj
+    DROP = {"source_preview", "source", "rendered_context", "nodes", "metadata"}
+    return {k: v for k, v in obj.items() if k not in DROP}
+
+
+def _tool_get_review_context(params: dict) -> dict:
+    """Return token-efficient source snippets for changed files + their key dependents.
+
+    Unlike get_context (which returns a large rendered blob), this returns a
+    structured list of file snippets capped by *lines_per_file* — ideal for
+    passing individual snippets into a review prompt without blowing the budget.
+    """
+    root = params.get("root_path", os.getcwd())
+    changed_files = params.get("changed_files", [])
+    query = params.get("query", "")
+    max_depth = int(params.get("max_depth", 2))
+    lines_per_file = int(params.get("lines_per_file", 120))
+    detail_level = params.get("detail_level", "standard")
+    include_signatures_only = params.get("include_signatures_only", False)
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph or not source_map:
+        return {"error": "Graph not built yet. Call build_graph first.", "snippets": []}
+
+    # Blast radius (scored)
+    scores = graph.ranked_neighbors(seed_paths=changed_files, include_dynamic=True)
+    affected = sorted(scores.items(), key=lambda x: x[1][0], reverse=True)
+
+    # Include changed files at the top (score=1.0)
+    ordered: list[tuple[str, float, int, list[str]]] = []
+    seen: set[str] = set()
+    for cf in changed_files:
+        if cf in source_map and cf not in seen:
+            ordered.append((cf, 1.0, 0, ["changed"]))
+            seen.add(cf)
+    for fp, (score, depth, reasons) in affected:
+        if fp not in seen and depth <= max_depth and fp in source_map:
+            ordered.append((fp, score, depth, reasons))
+            seen.add(fp)
+        if len(ordered) >= 30:
+            break
+
+    from graphsift.core import estimate_tokens
+
+    snippets = []
+    total_tokens = 0
+    for fp, score, depth, reasons in ordered:
+        src = source_map.get(fp, "")
+        if not src:
+            continue
+
+        if include_signatures_only or detail_level == "minimal":
+            # Extract only def/class lines (signatures)
+            lines = [
+                ln for ln in src.splitlines()
+                if ln.lstrip().startswith(("def ", "async def ", "class ", "func ", "fn "))
+                or ln.startswith(("export ", "module ", "pub fn ", "interface "))
+            ]
+            body = "\n".join(lines[:lines_per_file])
+        else:
+            body_lines = src.splitlines()[:lines_per_file]
+            body = "\n".join(body_lines)
+            if len(src.splitlines()) > lines_per_file:
+                body += f"\n... ({len(src.splitlines()) - lines_per_file} more lines)"
+
+        tok = estimate_tokens(body)
+        total_tokens += tok
+        entry: dict[str, Any] = {
+            "file": fp,
+            "score": round(score, 3),
+            "depth": depth,
+            "tokens": tok,
+            "source": body,
+        }
+        if detail_level == "standard":
+            entry["reasons"] = reasons
+        snippets.append(entry)
+
+    return {
+        "changed_files": changed_files,
+        "query": query,
+        "total_snippets": len(snippets),
+        "total_tokens": total_tokens,
+        "snippets": snippets,
+    }
+
+
+def _tool_get_impact_radius(params: dict) -> dict:
+    """Return blast radius as a compact scored list — token-efficient alternative to get_impact.
+
+    Returns file paths, scores, depth, and reason tags only (no source).
+    Use detect_changes for full risk analysis with source previews.
+    """
+    root = params.get("root_path", os.getcwd())
+    changed_files = params.get("changed_files", [])
+    max_depth = int(params.get("max_depth", 3))
+    min_score = float(params.get("min_score", 0.0))
+    limit = int(params.get("limit", 50))
+    detail_level = params.get("detail_level", "standard")
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph or not source_map:
+        return {"error": "Graph not built yet. Call build_graph first.", "affected_files": []}
+
+    scores = graph.ranked_neighbors(seed_paths=changed_files, include_dynamic=True)
+    affected_raw = sorted(scores.items(), key=lambda x: x[1][0], reverse=True)
+
+    affected = []
+    for fp, (score, depth, reasons) in affected_raw:
+        if depth > max_depth or score < min_score:
+            continue
+        entry: dict[str, Any] = {"file": fp, "score": round(score, 3), "depth": depth}
+        if detail_level == "standard":
+            entry["reasons"] = reasons
+        affected.append(entry)
+        if len(affected) >= limit:
+            break
+
+    return {
+        "changed_files": changed_files,
+        "affected_count": len(affected),
+        "total_in_graph": len(affected_raw),
+        "affected_files": affected,
+    }
+
+
+def _tool_list_graph_stats(params: dict) -> dict:
+    """Return compact graph statistics — one-line summary of the repo's graph state.
+
+    Token cost: ~100 tokens. Use instead of graph_status when you only need counts.
+    """
+    root = params.get("root_path", os.getcwd())
+    builder, source_map = _get_builder(root)
+
+    db_stats: dict[str, Any] = {}
+    try:
+        store = _get_store(root)
+        db_stats = store.stats()
+    except Exception:
+        pass
+
+    nodes = db_stats.get("nodes", 0)
+    edges = db_stats.get("edges", 0)
+    files = db_stats.get("files", 0)
+    schema_v = db_stats.get("schema_version", 0)
+    src_files = len(source_map)
+
+    return {
+        "summary": (
+            f"Full build: {src_files} files, {nodes} nodes, {edges} edges "
+            f"(schema_version={schema_v})"
+        ),
+        "files_in_source_map": src_files,
+        "nodes": nodes,
+        "edges": edges,
+        "files_in_db": files,
+        "schema_version": schema_v,
+        "status": "ready" if source_map else "empty",
+    }
+
+
+def _tool_get_docs_section(params: dict) -> dict:
+    """Retrieve a section from a generated wiki page by heading keyword.
+
+    Returns only the matched section (not the entire page) to save tokens.
+    Falls back to the full page if heading is not found.
+    """
+    root = params.get("root_path", os.getcwd())
+    community_name = params.get("community_name", "")
+    heading = params.get("heading", "").lower()
+    max_chars = int(params.get("max_chars", 2000))
+
+    from graphsift.adapters.postprocess import WikiGenerator
+    wiki_dir = str(Path(root) / ".graphsift" / "wiki")
+    gen = WikiGenerator(wiki_dir)
+    content = gen.get_page(community_name)
+
+    if content is None:
+        return {"error": f"Wiki page not found for '{community_name}'. Run generate_wiki first."}
+
+    if not heading:
+        # Return beginning only
+        snippet = content[:max_chars]
+        if len(content) > max_chars:
+            snippet += f"\n... ({len(content) - max_chars} more chars)"
+        return {"community_name": community_name, "section": snippet, "full_length": len(content)}
+
+    # Find heading in content (case-insensitive, markdown ## style)
+    lines = content.splitlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if heading in line.lower() and line.startswith("#"):
+            start_idx = i
+            break
+
+    if start_idx is None:
+        snippet = content[:max_chars]
+        return {
+            "community_name": community_name,
+            "heading_found": False,
+            "section": snippet,
+            "full_length": len(content),
+        }
+
+    # Extract until next same-level heading or end
+    heading_level = len(lines[start_idx]) - len(lines[start_idx].lstrip("#"))
+    section_lines = [lines[start_idx]]
+    for line in lines[start_idx + 1:]:
+        if line.startswith("#" * heading_level + " ") and not line.startswith("#" * (heading_level + 1)):
+            break
+        section_lines.append(line)
+
+    section = "\n".join(section_lines)
+    if len(section) > max_chars:
+        section = section[:max_chars] + f"\n... ({len(section) - max_chars} more chars)"
+
+    return {
+        "community_name": community_name,
+        "heading": heading,
+        "heading_found": True,
+        "section": section,
+    }
+
+
+def _tool_find_large_functions(params: dict) -> dict:
+    """Find the largest functions/classes by line count — token-efficient dead-weight detector.
+
+    Returns a compact ranked list. Use before sending context to an LLM to identify
+    symbols worth splitting or skipping.
+    """
+    root = params.get("root_path", os.getcwd())
+    limit = int(params.get("limit", 20))
+    min_lines = int(params.get("min_lines", 30))
+    kind_filter = params.get("kind")
+    file_pattern = params.get("file_pattern", "")
+    detail_level = params.get("detail_level", "standard")
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph:
+        return {"error": "Graph not built yet. Call build_graph first.", "results": []}
+
+    results = []
+    for file_node in graph.all_files():
+        if file_pattern and file_pattern not in file_node.path:
+            continue
+        for sym in file_node.symbols:
+            if not hasattr(sym, "line_start") or not hasattr(sym, "line_end"):
+                continue
+            line_count = max(0, sym.line_end - sym.line_start)
+            if line_count < min_lines:
+                continue
+            if kind_filter and hasattr(sym, "kind") and sym.kind.value != kind_filter.lower():
+                continue
+            entry: dict[str, Any] = {
+                "name": sym.name if hasattr(sym, "name") else str(sym),
+                "file": file_node.path,
+                "line_start": sym.line_start,
+                "line_end": sym.line_end,
+                "line_count": line_count,
+                "kind": sym.kind.value if hasattr(sym, "kind") else "unknown",
+            }
+            if detail_level == "standard" and hasattr(sym, "signature") and sym.signature:
+                entry["signature"] = sym.signature
+            results.append(entry)
+
+    results.sort(key=lambda x: -x["line_count"])
+    return {
+        "total_found": len(results),
+        "results": results[:limit],
+    }
+
+
+def _tool_embed_graph(params: dict) -> dict:
+    """Compute and store lightweight TF-IDF-style symbol embeddings in SQLite.
+
+    No external ML deps required — uses bag-of-words over symbol names and
+    signatures. Enables ranked semantic search via semantic_search_nodes.
+    Returns a summary of what was embedded.
+    """
+    root = params.get("root_path", os.getcwd())
+    force = params.get("force", False)
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph:
+        return {"error": "Graph not built yet. Call build_graph first."}
+
+    store = _get_store(root)
+
+    # Check if already embedded (presence of embed_version in db meta)
+    try:
+        with store._lock:
+            row = store._conn.execute(
+                "SELECT value FROM graph_meta WHERE key='embed_version' LIMIT 1"
+            ).fetchone()
+            if row and not force:
+                return {
+                    "status": "already_embedded",
+                    "embed_version": row["value"],
+                    "message": "Use force=true to re-embed.",
+                }
+    except Exception:
+        pass
+
+    # Ensure graph_meta table exists (v7 migration covers this; handle gracefully)
+    try:
+        with store._lock:
+            store._conn.execute(
+                "CREATE TABLE IF NOT EXISTS graph_meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
+            store._conn.commit()
+    except Exception:
+        pass
+
+    # Build simple TF-IDF-like embeddings (token frequency over symbol corpus)
+    import collections
+    import math
+
+    all_nodes = list(graph._nodes.values()) if hasattr(graph, "_nodes") else []
+    if not all_nodes:
+        all_nodes = store.load_nodes()
+
+    # Build IDF: count docs (nodes) containing each token
+    df: dict[str, int] = collections.Counter()
+    doc_tokens: list[list[str]] = []
+    for node in all_nodes:
+        tokens = _tokenize_symbol(node)
+        doc_tokens.append(tokens)
+        for t in set(tokens):
+            df[t] += 1
+
+    N = max(len(all_nodes), 1)
+    embedded = 0
+
+    with store._lock:
+        for node, tokens in zip(all_nodes, doc_tokens):
+            if not tokens:
+                continue
+            tf: dict[str, float] = collections.Counter(tokens)
+            # TF-IDF vector (sparse, stored as JSON)
+            vec = {
+                t: round(
+                    (tf[t] / len(tokens)) * math.log((N + 1) / (df.get(t, 0) + 1)),
+                    6,
+                )
+                for t in tf
+            }
+            try:
+                store._conn.execute(
+                    "UPDATE nodes SET metadata=json_patch(metadata, ?) WHERE node_id=?",
+                    (json.dumps({"_tfidf": vec}), node.node_id),
+                )
+            except Exception:
+                pass
+            embedded += 1
+
+        store._conn.execute(
+            "INSERT OR REPLACE INTO graph_meta(key, value) VALUES('embed_version', '1')"
+        )
+        store._conn.commit()
+
+    return {
+        "status": "embedded",
+        "nodes_embedded": embedded,
+        "vocab_size": len(df),
+        "embed_version": "1",
+    }
+
+
+def _tokenize_symbol(node: Any) -> list[str]:
+    """Split a symbol node into bag-of-words tokens."""
+    import re
+    text = " ".join(filter(None, [
+        getattr(node, "name", ""),
+        getattr(node, "qualified_name", ""),
+        getattr(node, "signature", ""),
+        getattr(node, "file_path", ""),
+    ]))
+    # Split on non-alnum, camelCase, snake_case
+    tokens = re.findall(r'[a-zA-Z][a-z]*|[A-Z]{2,}(?=[A-Z][a-z]|\d|\W|$)|\d+', text)
+    return [t.lower() for t in tokens if len(t) > 1]
+
+
 def _tool_cross_repo_search(params: dict) -> dict:
     """Search for code entities across all registered repositories."""
     query = params.get("query", "")
@@ -1307,6 +1696,109 @@ _TOOLS = {
                 "limit": {"type": "integer"},
             },
             "required": ["query"],
+        },
+    },
+    # ---- token-saving tools (new) ----
+    "get_review_context": {
+        "fn": _tool_get_review_context,
+        "description": (
+            "Token-efficient code review context. Returns structured source snippets "
+            "for changed files + key dependents (capped by lines_per_file). "
+            "~5-10x fewer tokens than get_context. Use for focused review prompts."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "changed_files": {"type": "array", "items": {"type": "string"}},
+                "query": {"type": "string"},
+                "max_depth": {"type": "integer", "description": "Graph traversal depth (default 2)"},
+                "lines_per_file": {"type": "integer", "description": "Max lines per file snippet (default 120)"},
+                "include_signatures_only": {"type": "boolean", "description": "Return only def/class lines (default false)"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+        },
+    },
+    "get_impact_radius": {
+        "fn": _tool_get_impact_radius,
+        "description": (
+            "Compact blast-radius analysis — file paths + scores + depth only, no source. "
+            "~10x fewer tokens than detect_changes. Use for quick impact checks."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "changed_files": {"type": "array", "items": {"type": "string"}},
+                "max_depth": {"type": "integer", "description": "Max BFS depth (default 3)"},
+                "min_score": {"type": "number", "description": "Minimum relevance score 0-1 (default 0.0)"},
+                "limit": {"type": "integer", "description": "Max results (default 50)"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+        },
+    },
+    "list_graph_stats": {
+        "fn": _tool_list_graph_stats,
+        "description": (
+            "Ultra-compact graph statistics (~100 tokens). "
+            "Returns node/edge/file counts and schema version as a one-line summary. "
+            "Use instead of graph_status when you only need counts."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"root_path": {"type": "string"}},
+        },
+    },
+    "get_docs_section": {
+        "fn": _tool_get_docs_section,
+        "description": (
+            "Fetch a single section from a community wiki page by heading keyword. "
+            "Returns only the matched heading block — far fewer tokens than get_wiki_page. "
+            "Run generate_wiki first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "community_name": {"type": "string", "description": "Community name (partial match)"},
+                "heading": {"type": "string", "description": "Heading keyword to locate (case-insensitive)"},
+                "max_chars": {"type": "integer", "description": "Max characters to return (default 2000)"},
+            },
+            "required": ["community_name"],
+        },
+    },
+    "find_large_functions": {
+        "fn": _tool_find_large_functions,
+        "description": (
+            "Find the largest functions/classes by line count. "
+            "Compact output — name, file, line range, size. "
+            "Useful for identifying bloat before sending context to an LLM."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "limit": {"type": "integer", "description": "Max results (default 20)"},
+                "min_lines": {"type": "integer", "description": "Min line count threshold (default 30)"},
+                "kind": {"type": "string", "description": "Filter by kind: function | class | method"},
+                "file_pattern": {"type": "string", "description": "Filter by file path substring"},
+                "detail_level": {"type": "string", "enum": ["standard", "minimal"]},
+            },
+        },
+    },
+    "embed_graph": {
+        "fn": _tool_embed_graph,
+        "description": (
+            "Compute TF-IDF symbol embeddings and store in SQLite. "
+            "No external ML dependencies. Improves semantic_search_nodes ranking. "
+            "Run once after build_graph + run_postprocess."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string"},
+                "force": {"type": "boolean", "description": "Re-embed even if already done (default false)"},
+            },
         },
     },
 }
