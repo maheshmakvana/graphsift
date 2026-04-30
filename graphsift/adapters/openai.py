@@ -1,8 +1,6 @@
-"""Public adapter exports for graphsift."""
+"""OpenAI, Codex, and OpenAI-compatible adapters for graphsift."""
 
-from .claude import ClaudeCodeReviewAdapter, ClaudeContextAdapter
-from .gemini import GeminiCodeReviewAdapter, GeminiContextAdapter
-from .openai import (
+from .llm import (
     CodexCodeReviewAdapter,
     CodexContextAdapter,
     OpenAICodeReviewAdapter,
@@ -12,14 +10,10 @@ from .openai import (
 )
 
 __all__ = [
-    "ClaudeCodeReviewAdapter",
-    "ClaudeContextAdapter",
     "OpenAICodeReviewAdapter",
     "OpenAIContextAdapter",
     "CodexCodeReviewAdapter",
     "CodexContextAdapter",
     "OpenAICompatibleCodeReviewAdapter",
     "OpenAICompatibleContextAdapter",
-    "GeminiCodeReviewAdapter",
-    "GeminiContextAdapter",
 ]

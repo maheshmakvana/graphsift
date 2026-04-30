@@ -94,6 +94,16 @@ from .advanced import (
     stream_context,
 )
 from .adapters.storage import GraphStore
+from .adapters.claude import ClaudeCodeReviewAdapter, ClaudeContextAdapter
+from .adapters.gemini import GeminiCodeReviewAdapter, GeminiContextAdapter
+from .adapters.openai import (
+    CodexCodeReviewAdapter,
+    CodexContextAdapter,
+    OpenAICodeReviewAdapter,
+    OpenAICompatibleCodeReviewAdapter,
+    OpenAICompatibleContextAdapter,
+    OpenAIContextAdapter,
+)
 from .adapters.postprocess import (
     CommunityDetector,
     FlowDetector,
@@ -160,6 +170,17 @@ __all__ = [
     "SchemaEvolution",
     # Storage
     "GraphStore",
+    # LLM adapters
+    "ClaudeCodeReviewAdapter",
+    "ClaudeContextAdapter",
+    "OpenAICodeReviewAdapter",
+    "OpenAIContextAdapter",
+    "CodexCodeReviewAdapter",
+    "CodexContextAdapter",
+    "OpenAICompatibleCodeReviewAdapter",
+    "OpenAICompatibleContextAdapter",
+    "GeminiCodeReviewAdapter",
+    "GeminiContextAdapter",
     # Post-processing
     "Postprocessor",
     "FlowDetector",

@@ -1,6 +1,6 @@
 # graphsift — Save 80–150× AI Tokens on Every Code Review
 
-**graphsift** is an open-source Python library that slashes the Claude, GPT-4, and Gemini token costs of AI-assisted code review. It builds an AST-based dependency graph of your codebase, ranks every file by relevance to a code change using BM25 + graph-distance scoring, and delivers a token-budget-aware context window — so your LLM sees only what matters, not a 500k-token dump of the entire repo.
+**graphsift** is an open-source Python library that slashes the Claude, Codex/GPT, and Gemini token costs of AI-assisted code review. It builds an AST-based dependency graph of your codebase, ranks every file by relevance to a code change using BM25 + graph-distance scoring, and delivers a token-budget-aware context window — so your LLM sees only what matters, not a 500k-token dump of the entire repo.
 
 [![PyPI version](https://img.shields.io/pypi/v/graphsift.svg)](https://pypi.org/project/graphsift/)
 [![Python](https://img.shields.io/pypi/pyversions/graphsift.svg)](https://pypi.org/project/graphsift/)
@@ -115,7 +115,7 @@ graphsift solves both by treating context selection as a **ranking problem**, no
 - **SQLite persistence** — `GraphStore` with 6-version migration history
 - **Full MCP server** — compatible with Claude desktop, Claude Code, any MCP client
 - **CLI** — `graphsift install / serve / build / status / register`
-- **Drop-in Claude / OpenAI adapters** — see examples below
+- **Drop-in Claude / Codex / OpenAI / Gemini adapters** — see examples below
 - **10 advanced features** — cache, pipeline, validator, async batch, rate limiter, streaming, diff engine, circuit breaker, retry, schema evolution
 
 ---
@@ -176,6 +176,41 @@ response, meta = adapter.review(
 )
 print(f"Tokens saved: {meta['reduction_ratio']:.0%}")
 # Tokens saved: 93%
+```
+
+### Drop-in Codex / OpenAI adapter
+
+```python
+from openai import OpenAI
+from graphsift.adapters.openai import CodexCodeReviewAdapter
+
+client = OpenAI()
+adapter = CodexCodeReviewAdapter(client, builder)
+
+response, meta = adapter.review(
+    changed_files=["src/auth.py"],
+    source_map=source_map,
+    model="gpt-5-codex",
+    query="Find correctness or security issues in this change.",
+)
+print(f"Tokens saved: {meta['reduction_ratio']:.0%}")
+```
+
+### Drop-in Gemini adapter
+
+```python
+from google import genai
+from graphsift.adapters.gemini import GeminiCodeReviewAdapter
+
+client = genai.Client()
+adapter = GeminiCodeReviewAdapter(client, builder)
+
+response, meta = adapter.review(
+    changed_files=["src/auth.py"],
+    source_map=source_map,
+    model="gemini-2.5-pro",
+    query="Review this auth change for regressions.",
+)
 ```
 
 ### Incremental indexing (monorepo)
@@ -483,7 +518,10 @@ graphsift/
 ├── advanced.py          # 10 advanced feature categories
 ├── adapters/
 │   ├── storage.py       # SQLite GraphStore (6-version migrations)
-│   ├── claude.py        # Claude API + MCP adapter
+│   ├── claude.py        # Claude adapter wrapper
+│   ├── openai.py        # OpenAI / Codex / compatible adapters
+│   ├── gemini.py        # Gemini adapters
+│   ├── llm.py           # shared multi-provider adapter logic
 │   ├── filesystem.py    # path I/O helpers
 │   └── postprocess.py   # community + flow detection
 ├── cli.py               # CLI entrypoint
