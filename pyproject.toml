@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphsift"
-version = "1.5.2"
+dynamic = ["version"]
 description = "graphsift: intelligent code context selection for LLMs. AST dependency graph, BM25+graph ranked relevance, token-budget-aware selection, 14 languages, decorator+dynamic import edges, 80-150x token reduction. Beats code-review-graph (F1 0.85 vs 0.54)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = [
     "code context llm",
     "code review llm",
@@ -54,7 +55,6 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -95,6 +95,9 @@ Documentation = "https://github.com/maheshmakvana/graphsift#readme"
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "venv*", "dist*", "build*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "graphsift._version.__version__" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

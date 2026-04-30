@@ -36,6 +36,7 @@ Quick start::
     builder.index_files_incremental(updated_source_map)
 """
 
+from ._version import __version__
 from .core import (
     BashParser,
     ContextBuilder,
@@ -113,7 +114,6 @@ from .adapters.postprocess import (
     WikiGenerator,
 )
 
-__version__ = "1.5.0"
 __all__ = [
     # Core
     "ContextBuilder",
