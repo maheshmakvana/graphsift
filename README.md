@@ -1,6 +1,8 @@
-# graphsift — Save 80–150× AI Tokens on Every Code Review
+# graphsift — Save 80–150× AI Tokens on Code Review + 60–90% CLI Output Compression
 
 **graphsift** is an open-source Python library that slashes the Claude, Codex/GPT, and Gemini token costs of AI-assisted code review. It builds an AST-based dependency graph of your codebase, ranks every file by relevance to a code change using BM25 + graph-distance scoring, and delivers a token-budget-aware context window — so your LLM sees only what matters, not a 500k-token dump of the entire repo.
+
+**New in v1.6:** 19-tool CLI output compression engine (rtk-style), token savings analytics, and transparent bash command compression — now saving tokens on both code context *and* command output.
 
 [![PyPI version](https://img.shields.io/pypi/v/graphsift.svg)](https://pypi.org/project/graphsift/)
 [![Python](https://img.shields.io/pypi/pyversions/graphsift.svg)](https://pypi.org/project/graphsift/)
@@ -117,6 +119,85 @@ graphsift solves both by treating context selection as a **ranking problem**, no
 - **CLI** — `graphsift install / serve / build / status / register`
 - **Drop-in Claude / Codex / OpenAI / Gemini adapters** — see examples below
 - **10 advanced features** — cache, pipeline, validator, async batch, rate limiter, streaming, diff engine, circuit breaker, retry, schema evolution
+- **CLI output compression** — 19 per-tool compressors (pytest, cargo, go test, jest, eslint, git, npm, docker, kubectl, AWS, make, pip, logs, JSON, grep, cat) with auto-detection saving 60–90% tokens on command output
+- **Token savings analytics** — cumulative tracking, daily breakdown, cost estimates, discovery of missed optimization opportunities
+- **Transparent bash compression** — shell wrapper auto-compresses 19 command types inline; never manually pipe through compression
+- **Tee recovery** — original uncompressed output saved to disk for debugging while LLM sees only compressed
+
+---
+
+## CLI Output Compression — 60–90% Token Savings on Every Command
+
+**New in v1.6:** graphsift can now compress CLI command output before it reaches the LLM context window. Think pytest output with 200 lines of tracebacks reduced to 5 lines of meaningful failures. This is separate from (and complementary to) the code review context selection above.
+
+```bash
+# Compress pytest output: only assertion failures + summary
+pytest -v | graphsift compress
+
+# Auto-detect command type from output signature
+docker ps -a | graphsift compress
+
+# Ultra-compact mode: max 30 lines
+cargo build 2>&1 | graphsift compress --ultra
+
+# Save original output alongside compressed
+pytest -v | graphsift compress --tee ~/.graphsift/tee --tee-label pytest_run
+```
+
+### Supported compressors (19 types, auto-detected)
+
+| Compressor | Target output | Strategy |
+|---|---|---|
+| `pytest` | pytest runs | Keep assertions + summary, strip tracebacks |
+| `cargo` | Rust builds | Keep errors + warnings + Finished line |
+| `go_test` | Go tests | Keep FAIL lines + panics + summary |
+| `jest` | JavaScript tests | Keep FAIL/PASS + snapshot summary |
+| `eslint` | ESLint output | Per-file error/warning counts only |
+| `git_status` | `git status` | Branch + staged/unstaged/untracked counts |
+| `git_diff` | `git diff` | Per-file path + first 3 changed lines |
+| `git_log` | `git log` | Last 5 commits, hash + subject only |
+| `grep` | grep results | Group by match content, dedup |
+| `npm` | npm/yarn | Error headers + conflict summary + final counts |
+| `docker` | docker ps/images | ID + name/status, cap at 40 |
+| `kubectl` | kubectl get | Header + first 5 rows, compress whitespace |
+| `aws` | AWS CLI JSON | Compact large JSON, keep keys + primitives |
+| `make` | make output | Error + *** lines only |
+| `pip` | pip install | Final summary + errors only |
+| `log` | Application logs | Strip timestamps, keep ERROR/FATAL, dedup WARNING |
+| `cat` | File output | Truncate to 40 head + 20 tail |
+| `json_output` | Any JSON | Compact small, strip large to keys + primitives |
+| `generic` | Anything | Strip blanks, dedup, truncate at 200 lines |
+
+### Transparent bash compression
+
+Install shell wrapper to auto-compress command output without manual piping:
+
+```bash
+graphsift install --bash-wrapper
+# or add to .bashrc
+eval "$(graphsift bash-wrapper)"
+```
+
+Now `pytest`, `cargo`, `npm`, `docker`, `kubectl`, `aws`, `grep`, `cat`, `make`, `pip`, `jest`, `eslint`, `git status`, `git diff`, `git log`, `go test`, `npx jest`, `npx eslint`, and `yarn` are all transparently compressed.
+
+---
+
+## Token Savings Analytics
+
+Track cumulative savings across sessions:
+
+```bash
+# Show total token savings
+graphsift gain
+
+# Daily breakdown with cost estimates
+graphsift gain --history
+
+# Find commands that would benefit most from compression
+graphsift discover --repo .
+```
+
+The `token_gain` and `token_discover` MCP tools expose the same data to LLM agents for self-monitoring.
 
 ---
 
@@ -232,6 +313,9 @@ print(f"Re-indexed: {updated_stats.files_indexed} files (skipped {updated_stats.
 # Install graphsift MCP server into Claude Code (saves tokens on every tool call)
 graphsift install
 
+# Install with transparent bash compression wrapper
+graphsift install --bash-wrapper
+
 # Start MCP server (for custom MCP clients)
 graphsift serve --port 8000
 
@@ -243,6 +327,18 @@ graphsift status
 
 # Register a repo in multi-repo mode
 graphsift register --repo ./services/auth --name auth-service
+
+# Compress any command output to save 60-90% tokens
+pytest -v | graphsift compress
+
+# Show cumulative token savings
+graphsift gain
+
+# Discover missed optimization opportunities
+graphsift discover --repo .
+
+# Print bash wrapper for transparent compression
+graphsift bash-wrapper
 ```
 
 ---
@@ -262,6 +358,9 @@ MCP tools exposed:
 - `graphsift_build` — build ranked, token-budget-capped context for a diff
 - `graphsift_search` — semantic search across the graph
 - `graphsift_status` — show indexing stats and token savings metrics
+- `compress_output` — compress CLI output to save 60–90% tokens before LLM processing (19 command types, auto-detect)
+- `token_gain` — cumulative token savings analytics (calls, tokens, cost estimates, daily breakdown)
+- `token_discover` — find missed token-saving opportunities across command types
 
 ---
 
@@ -518,14 +617,17 @@ graphsift/
 ├── advanced.py          # 10 advanced feature categories
 ├── adapters/
 │   ├── storage.py       # SQLite GraphStore (6-version migrations)
-│   ├── claude.py        # Claude adapter wrapper
+│   ├── claude.py        # Claude/Anthropic adapter wrapper
 │   ├── openai.py        # OpenAI / Codex / compatible adapters
 │   ├── gemini.py        # Gemini adapters
 │   ├── llm.py           # shared multi-provider adapter logic
 │   ├── filesystem.py    # path I/O helpers
 │   └── postprocess.py   # community + flow detection
 ├── cli.py               # CLI entrypoint
-└── mcp_server.py        # MCP protocol server
+├── mcp_server.py        # MCP protocol server
+├── compress.py          # 19-tool CLI output compression (60-90% token reduction)
+├── analytics.py         # Token savings tracking & discovery
+└── hooks.py             # Bash wrapper & transparent compression hooks
 ```
 
 ---
