@@ -66,6 +66,14 @@ class OutputMode(str, Enum):
     SMART = "smart"            # Full for high-score, signatures for low-score
 
 
+class TierLevel(str, Enum):
+    """Tier level for context selection."""
+
+    HOT = "hot"        # Full source for highest-relevance files
+    WARM = "warm"      # Signatures/headers for medium-relevance files
+    COLD = "cold"      # Excluded from context
+
+
 # ---------------------------------------------------------------------------
 # Graph nodes and edges
 # ---------------------------------------------------------------------------
@@ -197,8 +205,30 @@ class ContextConfig(BaseModel):
         default=0.5,
         description="Score above this → FULL; below → SIGNATURES (in SMART mode).",
     )
+    hot_threshold: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Score above this → HOT (full source).",
+    )
+    warm_threshold: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Score above this → WARM (signatures). Below → COLD (excluded).",
+    )
     include_tests: bool = True
     include_dynamic: bool = True
+    diff_aware_trimming: bool = Field(
+        default=True,
+        description="Only include diff-relevant portions of files instead of full source.",
+    )
+    trimming_context_lines: int = Field(
+        default=10,
+        ge=0,
+        le=100,
+        description="Lines of surrounding context to include around changed regions when trimming.",
+    )
     compress_low_score: bool = Field(
         default=True,
         description="Use tokenpruner on low-score files to save budget.",
@@ -209,11 +239,33 @@ class ContextConfig(BaseModel):
         le=1.0,
         description="tokenpruner target ratio for compressed files.",
     )
+    cache_aware: bool = Field(
+        default=False,
+        description="Structure output with Anthropic/OpenAI cache_control breakpoints.",
+    )
+    cache_provider: str = Field(
+        default="anthropic",
+        description="Target LLM provider for cache markers: anthropic, openai, auto.",
+    )
+    session_id: str = Field(
+        default="",
+        description="Optional session identifier for cross-session memory reuse.",
+    )
+    cache_ttl_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="How many days a cached context entry remains valid.",
+    )
     exclude_patterns: list[str] = Field(
         default_factory=lambda: [
             "venv", ".venv", "node_modules", "dist", "build",
             "__pycache__", ".git", "*.egg-info",
         ]
+    )
+    dedup_enabled: bool = Field(
+        default=True,
+        description="Enable entropy-based deduplication of near-identical files to improve context diversity.",
     )
 
 
@@ -225,6 +277,10 @@ class ContextResult(BaseModel):
     diff_spec: DiffSpec
     selected_files: list[ScoredFile]
     rendered_context: str = Field(description="Ready-to-paste LLM context string")
+    cache_breakpoints: int = Field(
+        default=0,
+        description="Number of cache_control breakpoints in rendered output.",
+    )
     total_original_tokens: int
     total_rendered_tokens: int
     reduction_ratio: float
@@ -260,3 +316,94 @@ class IndexStats(BaseModel):
             f"symbols={self.symbols_extracted}, "
             f"edges={self.edges_created})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Cycle detection and dead code
+# ---------------------------------------------------------------------------
+
+
+class CycleInfo(BaseModel):
+    """Information about a dependency cycle."""
+
+    cycle_id: int
+    files: list[str] = Field(description="File paths in the cycle")
+    length: int = Field(description="Number of files in the cycle")
+    severity: str = Field(default="warning", description="warning | error | info")
+
+
+class CycleReport(BaseModel):
+    """Result of cycle detection analysis."""
+
+    cycles: list[CycleInfo]
+    total_cycles: int
+    max_cycle_length: int
+    files_in_cycles: int = 0
+
+
+class DeadCodeInfo(BaseModel):
+    """Information about a potentially dead code element."""
+
+    node_id: str
+    file_path: str
+    name: str
+    kind: str = Field(description="function | class | method | variable")
+    line_start: int = 0
+    line_end: int = 0
+    reason: str = Field(default="No callers found from entry points")
+
+
+class DeadCodeReport(BaseModel):
+    """Result of dead code detection."""
+
+    entries: list[DeadCodeInfo]
+    total_dead: int
+    confidence: str = Field(default="medium", description="high | medium | low")
+
+
+# ---------------------------------------------------------------------------
+# Fix suggestions
+# ---------------------------------------------------------------------------
+
+
+class FixSeverity(str, Enum):
+    """Severity level for auto-fix suggestions."""
+
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+
+
+class FixSuggestion(BaseModel):
+    """A single suggested fix for a code issue detected via graph analysis."""
+
+    suggestion_id: str = Field(description="Unique hash-based ID for deduplication")
+    file_path: str
+    line_start: int
+    line_end: int = 0
+    severity: FixSeverity
+    category: str = Field(
+        description="One of: import, type, structure, cycle, dead_code"
+    )
+    title: str = Field(description="One-line summary of the issue")
+    description: str = Field(description="Detailed explanation of the issue")
+    suggested_change: str = Field(
+        default="", description="Diff or code snippet showing the fix"
+    )
+    confidence: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="Confidence score 0-1"
+    )
+    auto_fixable: bool = Field(
+        default=False,
+        description="True if the fix can be applied automatically",
+    )
+
+
+class FixReport(BaseModel):
+    """Aggregated report from an auto-fix analysis run."""
+
+    suggestions: list[FixSuggestion]
+    total_issues: int
+    by_severity: dict[str, int]
+    by_category: dict[str, int]
+    summary: str

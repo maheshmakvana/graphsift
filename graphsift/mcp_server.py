@@ -41,6 +41,7 @@ def _err(req_id: Any, code: int, message: str) -> None:
 
 _store_lock = threading.RLock()
 _stores: dict[str, Any] = {}  # root_path -> GraphStore
+_roots_by_hash: dict[str, str] = {}  # repo_hash -> root_path (for MCP resource URI resolution)
 
 
 def _db_path_for(root: str) -> str:
@@ -49,6 +50,14 @@ def _db_path_for(root: str) -> str:
     home = Path.home() / ".graphsift" / key
     home.mkdir(parents=True, exist_ok=True)
     return str(home / "graph.db")
+
+
+def _session_id_for(root: str) -> str:
+    """Compute a stable session identifier from a repo root.
+
+    Used as the ``session_id`` for cross-session memory keying.
+    """
+    return hashlib.sha256(root.encode()).hexdigest()[:16]
 
 
 def _get_store(root: str) -> Any:
@@ -63,6 +72,8 @@ def _get_store(root: str) -> Any:
         if root not in _stores:
             db_path = _db_path_for(root)
             _stores[root] = GraphStore(db_path)
+            # Register reverse hash mapping for MCP resource URI resolution
+            _roots_by_hash[hashlib.sha1(root.encode()).hexdigest()[:12]] = root
         return _stores[root]
 
 
@@ -84,6 +95,8 @@ def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
         if root not in _builders:
             _builders[root] = ContextBuilder(ContextConfig())
             _source_maps[root] = {}
+            # Register reverse hash mapping for MCP resource URI resolution
+            _roots_by_hash[hashlib.sha1(root.encode()).hexdigest()[:12]] = root
         return _builders[root], _source_maps[root]
 
 
@@ -215,7 +228,12 @@ def _tool_update_graph(params: dict) -> dict:
 
 
 def _tool_get_context(params: dict) -> dict:
-    """Build ranked context for a code diff / query."""
+    """Build ranked context for a code diff / query.
+
+    Uses cross-session memory when the SQLite store is available:
+    cache key = hash of (sorted changed_files + query + commit_message).
+    Returns ``from_cache`` metadata when a cached result is reused.
+    """
     from graphsift.models import ContextConfig, DiffSpec
     from graphsift.core import ContextBuilder
 
@@ -236,9 +254,28 @@ def _tool_get_context(params: dict) -> dict:
             "token_savings_pct": 0,
         }
 
-    from graphsift.models import ContextConfig
-    builder_fresh = ContextBuilder(ContextConfig(token_budget=token_budget))
-    builder_fresh.index_files(source_map)
+    # Reuse existing graph to avoid redundant re-indexing
+    existing_graph = getattr(builder, "_graph", None)
+
+    # Enable cross-session memory via SQLite store
+    store = _get_store(root)
+    session_id = _session_id_for(root)
+    config = ContextConfig(
+        token_budget=token_budget,
+        session_id=session_id,
+    )
+
+    builder_fresh = ContextBuilder(
+        config=config,
+        graph=existing_graph,
+        store=store,
+    )
+    # Only index if graph is empty (first call before build_graph)
+    if existing_graph is None or existing_graph.stats().get("files", 0) == 0:
+        builder_fresh.index_files(source_map)
+
+    # Warm in-memory cache from SQLite for fast subsequent lookups
+    builder_fresh.warm_cache()
 
     diff = DiffSpec(
         changed_files=changed_files,
@@ -248,7 +285,7 @@ def _tool_get_context(params: dict) -> dict:
     )
     result = builder_fresh.build(diff, source_map)
 
-    return {
+    response: dict = {
         "rendered_context": result.rendered_context,
         "files_selected": result.files_selected,
         "files_scanned": result.files_scanned,
@@ -258,6 +295,13 @@ def _tool_get_context(params: dict) -> dict:
         "token_savings_pct": round((1 - result.reduction_ratio) * 100, 1),
     }
 
+    # Expose cache hit metadata to the caller
+    if result.metadata.get("from_cache"):
+        response["from_cache"] = True
+        response["cache_source"] = result.metadata.get("cache_source", "")
+
+    return response
+
 
 def _tool_get_impact(params: dict) -> dict:
     """Return the blast radius (affected files) for a set of changed files."""
@@ -266,7 +310,7 @@ def _tool_get_impact(params: dict) -> dict:
     max_depth = int(params.get("max_depth", 3))
 
     builder, source_map = _get_builder(root)
-    graph = builder.graph if hasattr(builder, "graph") else None
+    graph = getattr(builder, "_graph", None)
 
     if not graph or not source_map:
         return {"error": "Graph not built yet.", "affected_files": []}
@@ -275,11 +319,11 @@ def _tool_get_impact(params: dict) -> dict:
         seed_paths=changed_files,
         include_dynamic=True,
     )
-    affected = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    affected = sorted(scores.items(), key=lambda x: x[1][0], reverse=True)
     return {
         "changed_files": changed_files,
         "affected_files": [
-            {"path": p, "score": round(s, 3)} for p, s in affected[:50]
+            {"path": p, "score": round(s[0], 3), "depth": s[1], "reasons": s[2][:3]} for p, s in affected[:50]
         ],
         "total_affected": len(affected),
     }
@@ -321,7 +365,7 @@ def _tool_search_symbols(params: dict) -> dict:
     limit = int(params.get("limit", 20))
 
     builder, source_map = _get_builder(root)
-    graph = builder.graph if hasattr(builder, "graph") else None
+    graph = getattr(builder, "_graph", None)
 
     if not graph:
         return {"error": "Graph not built yet.", "symbols": []}
@@ -343,7 +387,7 @@ def _tool_list_files(params: dict) -> dict:
     """List all indexed files with their token estimates."""
     root = params.get("root_path", os.getcwd())
     builder, source_map = _get_builder(root)
-    graph = builder.graph if hasattr(builder, "graph") else None
+    graph = getattr(builder, "_graph", None)
 
     if not graph:
         return {"error": "Graph not built yet.", "files": []}
@@ -791,7 +835,7 @@ def _tool_get_architecture_overview(params: dict) -> dict:
 
 
 def _tool_refactor(params: dict) -> dict:
-    """Rename preview or dead-code detection across the graph."""
+    """Rename preview, dead-code detection, or fix suggestions across the graph."""
     from graphsift.adapters.postprocess import RefactorEngine
 
     root = params.get("root_path", os.getcwd())
@@ -801,6 +845,20 @@ def _tool_refactor(params: dict) -> dict:
     graph = getattr(builder, "_graph", None)
     if not graph:
         return {"error": "Graph not built yet. Call build_graph first."}
+
+    if mode == "suggest":
+        from graphsift.auto_fix import FixSuggester  # noqa: PLC0415
+
+        suggester = FixSuggester(graph, source_map=source_map)
+        report = suggester.analyze()
+        return {
+            "mode": "suggest",
+            "suggestions": [s.model_dump() for s in report.suggestions],
+            "total_issues": report.total_issues,
+            "by_severity": report.by_severity,
+            "by_category": report.by_category,
+            "summary": report.summary,
+        }
 
     engine = RefactorEngine()
 
@@ -818,17 +876,62 @@ def _tool_refactor(params: dict) -> dict:
         dead = engine.find_dead_code(graph, kind=kind, file_pattern=file_pattern, limit=limit)
         return {"mode": "dead_code", "results": dead, "total": len(dead)}
 
-    elif mode == "suggest":
-        dead = engine.find_dead_code(graph, limit=10)
-        return {
-            "mode": "suggest",
-            "suggestions": [
-                f"Consider removing unused {d['kind']} '{d['name']}' in {d['file_path']}:{d['line_start']}"
-                for d in dead[:10]
-            ],
-        }
-
     return {"error": f"Unknown mode: {mode}. Valid: rename, dead_code, suggest"}
+
+
+def _tool_detect_cycles(params: dict) -> dict:
+    """Detect circular dependencies (import/call cycles) in the codebase."""
+    root = params.get("root", os.getcwd())
+    builder, source_map = _get_builder(root)
+
+    if not builder._graph or not builder._graph._nodes:
+        return {"error": "Graph not built. Run build_graph first."}
+
+    cycles = builder._graph.detect_cycles()
+
+    # Build response
+    cycle_infos = []
+    for i, cycle in enumerate(cycles):
+        cycle_infos.append({
+            "cycle_id": i + 1,
+            "files": cycle,
+            "length": len(cycle),
+            "severity": "error" if len(cycle) <= 3 else "warning",
+        })
+
+    all_cycle_files = set()
+    for c in cycles:
+        all_cycle_files.update(c)
+
+    return {
+        "cycles": cycle_infos,
+        "total_cycles": len(cycles),
+        "max_cycle_length": max((len(c) for c in cycles), default=0),
+        "files_in_cycles": len(all_cycle_files),
+        "root": root,
+    }
+
+
+def _tool_detect_dead_code(params: dict) -> dict:
+    """Detect potentially unreachable/dead code via reachability analysis."""
+    root = params.get("root", os.getcwd())
+    kind = params.get("kind")  # None for all, or "function", "class", "method"
+    entry_points = params.get("entry_points")  # Optional list of entry-point file paths
+
+    builder, source_map = _get_builder(root)
+
+    if not builder._graph or not builder._graph._nodes:
+        return {"error": "Graph not built. Run build_graph first."}
+
+    dead = builder._graph.find_dead_code(entry_points=entry_points, kind=kind)
+
+    return {
+        "entries": dead,
+        "total_dead": len(dead),
+        "confidence": "high" if entry_points else "medium",
+        "root": root,
+        "note": "Auto-detected entry points may miss some. Provide explicit entry_points for high confidence." if not entry_points else "",
+    }
 
 
 def _tool_apply_refactor(params: dict) -> dict:
@@ -881,7 +984,14 @@ def _tool_get_wiki_page(params: dict) -> dict:
 
 
 def _tool_semantic_search_nodes(params: dict) -> dict:
-    """Search for code symbols by name, keyword, or file path."""
+    """Search for code symbols by name, keyword, or file path.
+
+    Uses hybrid BM25 + TF-IDF vector search when embeddings are available
+    (run ``embed_graph`` first).  Falls back to FTS5 / LIKE when no TF-IDF
+    vectors are found.
+    """
+    from graphsift.hybrid_search import HybridSearcher
+
     root = params.get("root_path", os.getcwd())
     query = params.get("query", "")
     kind = params.get("kind")
@@ -889,27 +999,68 @@ def _tool_semantic_search_nodes(params: dict) -> dict:
 
     store = _get_store(root)
 
-    # Try FTS5 first, fall back to LIKE
-    nodes = store.search_nodes(query, limit=limit * 2)
+    # Quick probe: do any nodes have TF-IDF vectors?
+    has_embeddings = _check_embed_version(store)
 
-    if kind:
-        kind_lower = kind.lower()
-        nodes = [n for n in nodes if n.kind.value == kind_lower]
+    if has_embeddings:
+        # Load all nodes and use hybrid search.
+        all_nodes = store.load_nodes()
+        searcher = HybridSearcher(alpha=0.3)
+        scored = searcher.search(query, all_nodes, top_k=limit * 2)
 
-    results = [
-        {
-            "name": n.name,
-            "qualified_name": n.qualified_name,
-            "kind": n.kind.value,
-            "file": n.file_path,
-            "line": n.line_start,
-            "language": n.language.value,
-            "community_id": n.community_id,
-        }
-        for n in nodes[:limit]
-    ]
+        if kind:
+            kind_lower = kind.lower()
+            scored = [(n, s) for n, s in scored if n.kind.value == kind_lower]
+
+        results = [
+            {
+                "name": n.name,
+                "qualified_name": n.qualified_name,
+                "kind": n.kind.value,
+                "file": n.file_path,
+                "line": n.line_start,
+                "language": n.language.value,
+                "community_id": n.community_id,
+                "score": round(s, 4),
+            }
+            for n, s in scored[:limit]
+        ]
+    else:
+        # Fall back to FTS5 / LIKE (original behaviour).
+        nodes = store.search_nodes(query, limit=limit * 2)
+
+        if kind:
+            kind_lower = kind.lower()
+            nodes = [n for n in nodes if n.kind.value == kind_lower]
+
+        results = [
+            {
+                "name": n.name,
+                "qualified_name": n.qualified_name,
+                "kind": n.kind.value,
+                "file": n.file_path,
+                "line": n.line_start,
+                "language": n.language.value,
+                "community_id": n.community_id,
+            }
+            for n in nodes[:limit]
+        ]
 
     return {"query": query, "results": results, "total": len(results)}
+
+
+def _check_embed_version(store: Any) -> bool:
+    """Return True if the store has TF-IDF embeddings (embed_version == '1')."""
+    try:
+        from graphsift.adapters.storage import GraphStore
+
+        with store._lock:
+            row = store._conn.execute(
+                "SELECT value FROM graph_meta WHERE key='embed_version' LIMIT 1"
+            ).fetchone()
+            return row is not None and row["value"] == "1"
+    except Exception:
+        return False
 
 
 def _tool_list_repos(params: dict) -> dict:
@@ -1368,6 +1519,54 @@ def _tool_cross_repo_search(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Session memory tools
+# ---------------------------------------------------------------------------
+
+
+def _tool_save_review_feedback(params: dict) -> dict:
+    """Save user feedback on context quality (1-5 rating).
+
+    Feedback accumulates over time to improve ranking weights.
+    """
+    root = params.get("root_path", os.getcwd())
+    context_id = params.get("context_id")
+    rating = params.get("rating")
+    notes = params.get("notes", "")
+
+    if context_id is None or rating is None:
+        return {"error": "context_id and rating are required."}
+
+    try:
+        rating = int(rating)
+    except (TypeError, ValueError):
+        return {"error": "rating must be an integer 1-5."}
+
+    if rating < 1 or rating > 5:
+        return {"error": "rating must be between 1 and 5."}
+
+    store = _get_store(root)
+    try:
+        store.save_review_feedback(context_id, rating, notes)
+        return {"status": "saved", "context_id": context_id, "rating": rating}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _tool_get_context_quality(params: dict) -> dict:
+    """Return aggregate quality stats from review feedback.
+
+    Returns count, average rating, distribution, and recent feedback.
+    """
+    root = params.get("root_path", os.getcwd())
+    store = _get_store(root)
+    try:
+        stats = store.get_context_quality_stats()
+        return {"status": "ok", **stats}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Compress / Analytics tools
 # ---------------------------------------------------------------------------
 
@@ -1416,6 +1615,48 @@ def _tool_token_discover(params: dict) -> dict:
 
     root = params.get("root_path", os.getcwd())
     return analytics_discover(project_root=root)
+
+
+def _tool_suggest_fixes(params: dict) -> dict:
+    """Run auto-fix analysis and return prioritized fix suggestions.
+
+    Analyzes the dependency graph for:
+      - Unused imports
+      - Missing type annotations
+      - Long functions, long parameter lists, large classes
+      - Dependency cycles
+      - Dead code
+
+    All findings are read-only suggestions — no files are modified.
+    """
+    from graphsift.auto_fix import FixSuggester  # noqa: PLC0415
+
+    root = params.get("root_path", os.getcwd())
+    changed_files = params.get("changed_files")
+    min_confidence = float(params.get("min_confidence", 0.0))
+
+    builder, source_map = _get_builder(root)
+    graph = getattr(builder, "_graph", None)
+    if not graph or not source_map:
+        return {"error": "Graph not built yet. Call build_graph first."}
+
+    suggester = FixSuggester(graph, source_map=source_map)
+    report = suggester.analyze(changed_files=changed_files)
+
+    # Filter by min_confidence
+    filtered = [
+        s for s in report.suggestions
+        if s.confidence >= min_confidence
+    ]
+
+    return {
+        "suggestions": [s.model_dump() for s in filtered],
+        "total_issues": len(filtered),
+        "total_all": report.total_issues,
+        "by_severity": report.by_severity,
+        "by_category": report.by_category,
+        "summary": report.summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1895,6 +2136,75 @@ _TOOLS = {
             },
         },
     },
+    "detect_cycles": {
+        "fn": _tool_detect_cycles,
+        "description": "Detect circular dependencies (import/call cycles) in the codebase using Tarjan's SCC algorithm.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Repository root path."},
+            },
+        },
+    },
+    "detect_dead_code": {
+        "fn": _tool_detect_dead_code,
+        "description": "Find potentially unreachable code via BFS reachability from entry points.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Repository root path."},
+                "kind": {"type": "string", "enum": ["function", "class", "method"], "description": "Filter by node kind."},
+                "entry_points": {"type": "array", "items": {"type": "string"}, "description": "List of entry-point file paths."},
+            },
+        },
+    },
+    "save_review_feedback": {
+        "fn": _tool_save_review_feedback,
+        "description": (
+            "Save a 1-5 rating on context selection quality. "
+            "Feedback accumulates across sessions to improve ranking weights."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root directory (default: cwd)"},
+                "context_id": {"type": "integer", "description": "ID from session_memory (returned in get_context metadata)"},
+                "rating": {"type": "integer", "description": "Quality rating 1-5 (5=best)"},
+                "notes": {"type": "string", "description": "Optional free-text notes"},
+            },
+            "required": ["context_id", "rating"],
+        },
+    },
+    "get_context_quality": {
+        "fn": _tool_get_context_quality,
+        "description": (
+            "Return aggregate context quality stats from all review feedback. "
+            "Includes total count, average rating, rating distribution, and recent feedback."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root directory (default: cwd)"},
+            },
+        },
+    },
+    "suggest_fixes": {
+        "fn": _tool_suggest_fixes,
+        "description": (
+            "Run auto-fix analysis on the dependency graph and return prioritized fix suggestions. "
+            "Detects unused imports, missing type annotations, overly long functions/param lists, "
+            "dependency cycles, and dead code. Read-only — never modifies files. "
+            "Results include confidence scores and auto-fixable flags."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root directory (default: cwd)"},
+                "changed_files": {"type": "array", "items": {"type": "string"}, "description": "Only analyze these files (optional)"},
+                "min_confidence": {"type": "number", "description": "Minimum confidence 0-1 (default 0.0)"},
+            },
+        },
+    },
 }
 
 
@@ -1912,7 +2222,7 @@ def _handle_initialize(req_id: Any, params: dict) -> None:
 
     _ok(req_id, {
         "protocolVersion": "2024-11-05",
-        "capabilities": {"tools": {}},
+        "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
         "serverInfo": {"name": "graphsift", "version": "1.4.0"},
     })
 
@@ -1949,10 +2259,522 @@ def _handle_tools_call(req_id: Any, params: dict) -> None:
         })
 
 
+# ---------------------------------------------------------------------------
+# Resource readers — each returns a dict with "content" and "mimeType"
+# ---------------------------------------------------------------------------
+
+
+def _read_resource_architecture(root: str) -> dict:
+    """Read architecture overview resource."""
+    store = _get_store(root)
+    db_stats = store.stats()
+    communities = store.load_communities()
+    risk_index = store.load_risk_index(min_score=0.5)
+
+    high_risk_files = [r["file_path"] for r in risk_index[:10]]
+
+    overview = {
+        "total_nodes": db_stats.get("nodes", 0),
+        "total_edges": db_stats.get("edges", 0),
+        "total_files": db_stats.get("files", 0),
+        "total_communities": len(communities),
+        "schema_version": db_stats.get("schema_version", 0),
+        "communities": [
+            {"id": c["community_id"], "label": c["label"], "size": c["node_count"]}
+            for c in communities[:20]
+        ],
+        "high_risk_files": high_risk_files,
+    }
+    return {"content": json.dumps(overview, ensure_ascii=False, indent=2), "mimeType": "application/json"}
+
+
+def _read_resource_graph_stats(root: str) -> dict:
+    """Read graph statistics resource."""
+    store = _get_store(root)
+    db_stats = store.stats()
+    return {"content": json.dumps(db_stats, ensure_ascii=False, indent=2), "mimeType": "application/json"}
+
+
+def _read_resource_community(root: str, community_name: str) -> dict | None:
+    """Read a single community resource by name (partial match)."""
+    store = _get_store(root)
+    communities = store.load_communities()
+    name_lower = community_name.lower()
+    found = next((c for c in communities if name_lower in c["label"].lower()), None)
+    if not found:
+        return None
+    result = {
+        "community_id": found["community_id"],
+        "label": found["label"],
+        "node_count": found["node_count"],
+        "members": found.get("metadata", {}).get("members", []),
+    }
+    return {"content": json.dumps(result, ensure_ascii=False, indent=2), "mimeType": "application/json"}
+
+
+def _read_resource_wiki(root: str, community_name: str) -> dict | None:
+    """Read a wiki page resource by community name (partial match)."""
+    from graphsift.adapters.postprocess import WikiGenerator
+
+    wiki_dir = str(Path(root) / ".graphsift" / "wiki")
+    gen = WikiGenerator(wiki_dir)
+    content = gen.get_page(community_name)
+    if content is None:
+        return None
+    return {"content": content, "mimeType": "text/markdown"}
+
+
+def _read_resource_flows(root: str) -> dict:
+    """Read execution flows resource."""
+    store = _get_store(root)
+    with store._lock:
+        try:
+            rows = store._conn.execute(
+                "SELECT * FROM flow_snapshots ORDER BY id DESC LIMIT 100"
+            ).fetchall()
+        except Exception:
+            rows = []
+
+    flows = []
+    for row in rows:
+        meta = json.loads(row["metadata"] or "{}")
+        flows.append({
+            "id": row["id"],
+            "flow_name": row["flow_name"],
+            "entry_point": row["entry_point"],
+            "node_count": meta.get("node_count", 0),
+            "file_count": meta.get("file_count", 0),
+            "criticality": meta.get("criticality", 0.0),
+        })
+    return {
+        "content": json.dumps({"flows": flows, "total": len(flows)}, ensure_ascii=False, indent=2),
+        "mimeType": "application/json",
+    }
+
+
+def _read_resource_risk(root: str) -> dict:
+    """Read risk-scored files resource."""
+    store = _get_store(root)
+    risk_index = store.load_risk_index(min_score=0.0)
+    return {
+        "content": json.dumps({"risk_index": risk_index, "total": len(risk_index)}, ensure_ascii=False, indent=2),
+        "mimeType": "application/json",
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP Resource list — enumerate available resources per-root
+# ---------------------------------------------------------------------------
+
+_RESOURCE_URI_PREFIX = "graphsift://"
+
+
+def _list_resources_for_root(root: str) -> list[dict]:
+    """List all available resources for a given repo root."""
+    repo_hash = hashlib.sha1(root.encode()).hexdigest()[:12]
+    store = _get_store(root)
+    resources: list[dict] = []
+
+    # Architecture overview
+    resources.append({
+        "uri": f"graphsift://{repo_hash}/architecture",
+        "name": f"Architecture Overview — {os.path.basename(root)}",
+        "description": "High-level architecture overview: nodes, edges, communities, and high-risk files.",
+        "mimeType": "application/json",
+    })
+
+    # Graph stats
+    resources.append({
+        "uri": f"graphsift://{repo_hash}/graph/stats",
+        "name": f"Graph Statistics — {os.path.basename(root)}",
+        "description": "Raw graph database statistics: node/edge/file counts and schema version.",
+        "mimeType": "application/json",
+    })
+
+    # Communities
+    communities = store.load_communities()
+    for c in communities[:50]:
+        resources.append({
+            "uri": f"graphsift://{repo_hash}/community/{c['label']}",
+            "name": f"Community: {c['label']}",
+            "description": f"Community with {c['node_count']} nodes.",
+            "mimeType": "application/json",
+        })
+
+    # Wiki pages
+    wiki_dir = Path(root) / ".graphsift" / "wiki"
+    if wiki_dir.is_dir():
+        for wiki_file in sorted(wiki_dir.glob("*.md")):
+            page_name = wiki_file.stem
+            resources.append({
+                "uri": f"graphsift://{repo_hash}/wiki/{page_name}",
+                "name": f"Wiki: {page_name}",
+                "description": f"Wiki page for community '{page_name}'.",
+                "mimeType": "text/markdown",
+            })
+
+    # Execution flows
+    resources.append({
+        "uri": f"graphsift://{repo_hash}/flows",
+        "name": f"Execution Flows — {os.path.basename(root)}",
+        "description": "All detected execution flows sorted by criticality.",
+        "mimeType": "application/json",
+    })
+
+    # Risk index
+    resources.append({
+        "uri": f"graphsift://{repo_hash}/risk",
+        "name": f"Risk Index — {os.path.basename(root)}",
+        "description": "Risk-scored files across the codebase.",
+        "mimeType": "application/json",
+    })
+
+    return resources
+
+
+# ---------------------------------------------------------------------------
+# MCP resource handlers
+# ---------------------------------------------------------------------------
+
+
+_RESOURCE_READERS: dict[str, callable] = {
+    "architecture": _read_resource_architecture,
+    "graph/stats": _read_resource_graph_stats,
+    "risk": _read_resource_risk,
+    "flows": _read_resource_flows,
+}
+
+
+def _resolve_resource_uri(uri: str) -> tuple[str, str, dict | None] | tuple[None, None, str]:
+    """Parse a resource URI into (root, path_parts, error_or_none).
+
+    Returns:
+        (root, resource_path, None) on success.
+        (None, None, error_message) on failure.
+    """
+    if not uri.startswith(_RESOURCE_URI_PREFIX):
+        return None, None, f"Invalid URI scheme: expected '{_RESOURCE_URI_PREFIX}...'"
+
+    path_part = uri[len(_RESOURCE_URI_PREFIX):]
+    parts = path_part.split("/", 1)
+    if len(parts) < 1 or not parts[0]:
+        return None, None, "Missing repo hash in URI"
+
+    repo_hash = parts[0]
+    root = _roots_by_hash.get(repo_hash)
+    if root is None:
+        return None, None, f"Unknown repo hash: {repo_hash}"
+
+    resource_path = parts[1] if len(parts) > 1 else ""
+    if not resource_path:
+        return None, None, "Missing resource path in URI"
+
+    return root, resource_path, None
+
+
+def _handle_resources_list(req_id: Any, params: dict) -> None:
+    """Handle resources/list — enumerate available resources."""
+    resources = []
+
+    known_roots = set(_stores.keys()) | set(_builders.keys())
+    if not known_roots:
+        known_roots = {os.getcwd()}
+
+    for root in known_roots:
+        try:
+            resources.extend(_list_resources_for_root(root))
+        except Exception as exc:
+            logger.warning("graphsift: failed to list resources for %s: %s", root, exc)
+
+    _ok(req_id, {"resources": resources})
+
+
+def _handle_resources_read(req_id: Any, params: dict) -> None:
+    """Handle resources/read — read a resource by URI."""
+    uri = params.get("uri", "")
+    if not uri:
+        _err(req_id, -32602, "Missing 'uri' parameter")
+        return
+
+    root, resource_path, error = _resolve_resource_uri(uri)
+    if error:
+        _err(req_id, -32602, error)
+        return
+
+    try:
+        if resource_path.startswith("community/"):
+            community_name = resource_path[len("community/"):]
+            result = _read_resource_community(root, community_name)
+        elif resource_path.startswith("wiki/"):
+            community_name = resource_path[len("wiki/"):]
+            result = _read_resource_wiki(root, community_name)
+        else:
+            reader = _RESOURCE_READERS.get(resource_path)
+            if reader is None:
+                _err(req_id, -32602, f"Unknown resource: {resource_path}")
+                return
+            result = reader(root)
+
+        if result is None:
+            _err(req_id, -32602, f"Resource not found: {uri}")
+            return
+
+        _ok(req_id, {
+            "contents": [{
+                "uri": uri,
+                "mimeType": result["mimeType"],
+                "text": result["content"],
+            }],
+        })
+    except Exception as exc:
+        logger.exception("resource read failed: %s", uri)
+        _err(req_id, -32602, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompts
+# ---------------------------------------------------------------------------
+
+_PROMPTS: dict[str, dict[str, Any]] = {
+    "review_code": {
+        "name": "review_code",
+        "description": "Review code changes for a set of modified files using graphsift's dependency graph.",
+        "arguments": [
+            {
+                "name": "root_path",
+                "description": "Repository root directory",
+                "required": False,
+            },
+            {
+                "name": "changed_files",
+                "description": "List of file paths that were changed",
+                "required": True,
+            },
+            {
+                "name": "diff_text",
+                "description": "Raw unified diff text for the changes (optional)",
+                "required": False,
+            },
+        ],
+    },
+    "analyze_impact": {
+        "name": "analyze_impact",
+        "description": "Analyze the blast radius and impact of changes across the codebase.",
+        "arguments": [
+            {
+                "name": "root_path",
+                "description": "Repository root directory",
+                "required": False,
+            },
+            {
+                "name": "changed_files",
+                "description": "List of file paths that were changed",
+                "required": True,
+            },
+            {
+                "name": "max_depth",
+                "description": "Maximum traversal depth for impact analysis (default 3)",
+                "required": False,
+            },
+        ],
+    },
+    "find_issues": {
+        "name": "find_issues",
+        "description": "Search for potential code issues, dead code, cycles, and refactoring opportunities.",
+        "arguments": [
+            {
+                "name": "root_path",
+                "description": "Repository root directory",
+                "required": False,
+            },
+            {
+                "name": "focus",
+                "description": "Issue focus: cycles, dead_code, large_functions, all (default all)",
+                "required": False,
+            },
+        ],
+    },
+    "explain_architecture": {
+        "name": "explain_architecture",
+        "description": "Explain the high-level architecture of this codebase using graphsift's community detection.",
+        "arguments": [
+            {
+                "name": "root_path",
+                "description": "Repository root directory",
+                "required": False,
+            },
+            {
+                "name": "community_name",
+                "description": "Focus on a specific community/module (optional)",
+                "required": False,
+            },
+        ],
+    },
+}
+
+
+def _build_review_code_prompt(args: dict) -> list[dict]:
+    """Build a review_code prompt message."""
+    root = args.get("root_path", os.getcwd())
+    changed_files = args.get("changed_files", [])
+    diff_text = args.get("diff_text", "")
+
+    text = (
+        "You are reviewing code changes. Please analyze the following changes "
+        "and provide a thorough code review.\n\n"
+        f"Repository root: {root}\n"
+        f"Files changed: {json.dumps(changed_files, indent=2)}\n"
+    )
+    if diff_text:
+        text += f"\nDiff:\n```diff\n{diff_text}\n```\n"
+
+    return [
+        {
+            "role": "user",
+            "content": {
+                "type": "text",
+                "text": text,
+            },
+        },
+    ]
+
+
+def _build_analyze_impact_prompt(args: dict) -> list[dict]:
+    """Build an analyze_impact prompt message."""
+    root = args.get("root_path", os.getcwd())
+    changed_files = args.get("changed_files", [])
+    max_depth = args.get("max_depth", 3)
+
+    return [
+        {
+            "role": "user",
+            "content": {
+                "type": "text",
+                "text": (
+                    "Analyze the impact and blast radius of the following changes.\n\n"
+                    f"Repository root: {root}\n"
+                    f"Changed files: {json.dumps(changed_files, indent=2)}\n"
+                    f"Max traversal depth: {max_depth}\n\n"
+                    "Consider:\n"
+                    "1. Which other files/modules depend on the changed files?\n"
+                    "2. What is the risk level of each change?\n"
+                    "3. Are there any circular dependencies or architectural concerns?\n"
+                    "4. What testing areas should be prioritized?\n"
+                ),
+            },
+        },
+    ]
+
+
+def _build_find_issues_prompt(args: dict) -> list[dict]:
+    """Build a find_issues prompt message."""
+    root = args.get("root_path", os.getcwd())
+    focus = args.get("focus", "all")
+
+    return [
+        {
+            "role": "user",
+            "content": {
+                "type": "text",
+                "text": (
+                    "Search for potential code issues in this codebase.\n\n"
+                    f"Repository root: {root}\n"
+                    f"Focus area: {focus}\n\n"
+                    "Look for:\n"
+                    "- Circular dependencies (import/call cycles)\n"
+                    "- Dead code (unused functions, classes, or methods)\n"
+                    "- Large functions or classes that may need refactoring\n"
+                    "- High-risk files that are complex and widely depended upon\n"
+                    "- Missing error handling or type annotations\n"
+                ),
+            },
+        },
+    ]
+
+
+def _build_explain_architecture_prompt(args: dict) -> list[dict]:
+    """Build an explain_architecture prompt message."""
+    root = args.get("root_path", os.getcwd())
+    community_name = args.get("community_name", "")
+
+    text = (
+        "Explain the high-level architecture of this codebase.\n\n"
+        f"Repository root: {root}\n"
+    )
+    if community_name:
+        text += f"Focus on the community/module: {community_name}\n\n"
+    text += (
+        "Cover:\n"
+        "1. The main modules/communities and their responsibilities\n"
+        "2. How data flows between modules\n"
+        "3. Key entry points and their dependencies\n"
+        "4. Architectural patterns used\n"
+        "5. Areas of potential improvement or technical debt\n"
+    )
+
+    return [
+        {
+            "role": "user",
+            "content": {
+                "type": "text",
+                "text": text,
+            },
+        },
+    ]
+
+
+def _handle_prompts_list(req_id: Any, params: dict) -> None:
+    """Handle prompts/list — return available prompts."""
+    prompts = []
+    for name, spec in _PROMPTS.items():
+        prompts.append({
+            "name": spec["name"],
+            "description": spec["description"],
+            "arguments": spec.get("arguments", []),
+        })
+    _ok(req_id, {"prompts": prompts})
+
+
+def _handle_prompts_get(req_id: Any, params: dict) -> None:
+    """Handle prompts/get — return a specific prompt with rendered messages."""
+    name = params.get("name", "")
+    arguments = params.get("arguments", {})
+
+    if name not in _PROMPTS:
+        _err(req_id, -32602, f"Unknown prompt: {name}")
+        return
+
+    _PROMPT_BUILDERS = {
+        "review_code": _build_review_code_prompt,
+        "analyze_impact": _build_analyze_impact_prompt,
+        "find_issues": _build_find_issues_prompt,
+        "explain_architecture": _build_explain_architecture_prompt,
+    }
+
+    builder = _PROMPT_BUILDERS.get(name)
+    if builder is None:
+        _err(req_id, -32602, f"No builder for prompt: {name}")
+        return
+
+    try:
+        messages = builder(arguments)
+        _ok(req_id, {
+            "description": _PROMPTS[name]["description"],
+            "messages": messages,
+        })
+    except Exception as exc:
+        logger.exception("prompt %s build failed", name)
+        _err(req_id, -32602, str(exc))
+
+
 _HANDLERS = {
     "initialize": _handle_initialize,
     "tools/list": _handle_tools_list,
     "tools/call": _handle_tools_call,
+    "resources/list": _handle_resources_list,
+    "resources/read": _handle_resources_read,
+    "prompts/list": _handle_prompts_list,
+    "prompts/get": _handle_prompts_get,
 }
 
 

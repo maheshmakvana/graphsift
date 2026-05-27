@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import logging
 import math
 import re
+import sys
 import threading
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from graphsift.adapters.storage import GraphStore
 
 from .exceptions import (
     BudgetExceededError,
@@ -40,6 +45,7 @@ from .models import (
     NodeKind,
     OutputMode,
     ScoredFile,
+    TierLevel,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +109,24 @@ def detect_language(path: str) -> Language:
 def estimate_tokens(text: str) -> int:
     """Fast token estimate (4 chars per token heuristic)."""
     return max(1, len(text) // 4)
+
+
+def _build_diff_hash(diff_spec: DiffSpec) -> str:
+    """Deterministic SHA-256 hash of diff spec for cache keying.
+
+    Key = sorted(changed_files) + query + commit_message.
+    This ensures the same code change + question always hits the same cache.
+    """
+    raw = json.dumps(
+        {
+            "changed_files": sorted(diff_spec.changed_files),
+            "query": diff_spec.query,
+            "commit_message": diff_spec.commit_message,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +799,20 @@ _PARSER_REGISTRY: dict[Language, LanguageParser] = {
 def get_parser(language: Language) -> LanguageParser:
     """Get the parser for a language.
 
+    By default this returns the regex-based ``GenericParser`` (or
+    ``PythonParser`` / ``BashParser`` / ``HCLParser`` for those languages).
+    For AST-accurate parsing across 11 languages, register the optional
+    ``TreeSitterParser``::
+
+        from graphsift.parsers import TreeSitterParser, register_tree_sitter_parsers
+
+        # Option A: register for all available grammars
+        register_tree_sitter_parsers()
+
+        # Option B: single-language opt-in
+        from graphsift import register_parser
+        register_parser(Language.PYTHON, TreeSitterParser())
+
     Args:
         language: Target language.
 
@@ -1107,6 +1145,170 @@ class DependencyGraph:
                     results.append(path)
         return results[:3]  # cap false-positive explosion
 
+    def detect_cycles(self) -> list[list[str]]:
+        """Find all dependency cycles using Tarjan's strongly-connected components.
+
+        Returns a list of cycles, each a list of file paths in the cycle.
+        Only returns cycles of length >= 2 (self-loops excluded).
+        """
+        # Build adjacency list: file_path -> set of dependent file_paths
+        adj: dict[str, set[str]] = defaultdict(set)
+        all_files: set[str] = set()
+
+        for edge in self._edges:
+            src_file = self._resolve_file(edge.source_id)
+            tgt_file = self._resolve_file(edge.target_id)
+            if src_file and tgt_file and src_file != tgt_file:
+                adj[src_file].add(tgt_file)
+                all_files.add(src_file)
+                all_files.add(tgt_file)
+
+        # Also add files with no edges
+        for node in self._nodes.values():
+            all_files.add(node.file_path)
+
+        # Tarjan's SCC
+        index_counter = [0]
+        indices: dict[str, int] = {}
+        lowlink: dict[str, int] = {}
+        on_stack: dict[str, bool] = defaultdict(bool)
+        stack: list[str] = []
+        cycles: list[list[str]] = []
+
+        def strongconnect(v: str) -> None:
+            indices[v] = index_counter[0]
+            lowlink[v] = index_counter[0]
+            index_counter[0] += 1
+            stack.append(v)
+            on_stack[v] = True
+
+            for w in adj.get(v, set()):
+                if w not in indices:
+                    strongconnect(w)
+                    lowlink[v] = min(lowlink[v], lowlink[w])
+                elif on_stack.get(w, False):
+                    lowlink[v] = min(lowlink[v], indices[w])
+
+            if lowlink[v] == indices[v]:
+                scc: list[str] = []
+                while True:
+                    w = stack.pop()
+                    on_stack[w] = False
+                    scc.append(w)
+                    if w == v:
+                        break
+                if len(scc) >= 2:
+                    cycles.append(scc)
+
+        for f in list(all_files):
+            if f not in indices:
+                strongconnect(f)
+
+        return cycles
+
+    def _resolve_file(self, node_id: str) -> str | None:
+        """Resolve a node_id back to its file_path."""
+        for node in self._nodes.values():
+            if node.node_id == node_id:
+                return node.file_path
+        # node_id might already be a file path
+        return node_id if "/" in node_id or "\\" in node_id else None
+
+    def find_dead_code(
+        self,
+        entry_points: list[str] | None = None,
+        kind: str | None = None,
+    ) -> list[dict]:
+        """Find potentially dead code via BFS reachability from entry points.
+
+        Args:
+            entry_points: Known entry-point files (main, app factory, CLI entry).
+                          If None, auto-detects files with __main__ or main() patterns.
+            kind: Filter to 'function', 'class', 'method', or None for all.
+
+        Returns:
+            List of dicts with node_id, file_path, name, kind, line_start, line_end, reason.
+        """
+        if entry_points is None:
+            entry_points = self._detect_entry_points()
+
+        # Build reachable set via BFS across edges
+        reachable: set[str] = set()
+        queue: deque[str] = deque()
+
+        # Seed with entry-point files
+        entry_files: set[str] = set()
+        for ep in entry_points:
+            for node in self._nodes.values():
+                if node.file_path == ep or ep in node.file_path:
+                    entry_files.add(node.file_path)
+                    if node.node_id not in reachable:
+                        reachable.add(node.node_id)
+                        queue.append(node.node_id)
+
+        # BFS traversal
+        # Build adjacency: source_node_id -> [target_node_ids]
+        forward: dict[str, list[str]] = defaultdict(list)
+        for edge in self._edges:
+            forward[edge.source_id].append(edge.target_id)
+
+        while queue:
+            current = queue.popleft()
+            for target in forward.get(current, []):
+                if target not in reachable:
+                    reachable.add(target)
+                    queue.append(target)
+
+        # Collect unreachable nodes
+        dead: list[dict] = []
+        for node in self._nodes.values():
+            if node.node_id not in reachable:
+                if node.file_path in entry_files:
+                    continue  # entry points are reachable by definition
+                if kind and node.kind.value != kind:
+                    continue
+                dead.append({
+                    "node_id": node.node_id,
+                    "file_path": node.file_path,
+                    "name": node.name,
+                    "kind": node.kind.value,
+                    "line_start": node.line_start,
+                    "line_end": node.line_end,
+                    "reason": "No reachable path from any entry point",
+                })
+
+        return dead
+
+    def _detect_entry_points(self) -> list[str]:
+        """Auto-detect entry-point files in the graph."""
+        entry_files: list[str] = []
+        seen: set[str] = set()
+        for node in self._nodes.values():
+            if node.file_path in seen:
+                continue
+            # Heuristic: files with main() function or __main__ pattern
+            if node.name == "main" and node.kind in (NodeKind.FUNCTION, NodeKind.METHOD):
+                entry_files.append(node.file_path)
+                seen.add(node.file_path)
+            # Check for __main__ in the file path or module patterns
+            if node.file_path.endswith("__main__.py") or node.file_path.endswith("main.go"):
+                if node.file_path not in seen:
+                    entry_files.append(node.file_path)
+                    seen.add(node.file_path)
+
+        if not entry_files:
+            # Fallback: files with the most incoming edges (likely hubs)
+            incoming: dict[str, int] = defaultdict(int)
+            for edge in self._edges:
+                tgt_file = self._resolve_file(edge.target_id)
+                if tgt_file:
+                    incoming[tgt_file] += 1
+            if incoming:
+                top = sorted(incoming.items(), key=lambda x: x[1], reverse=True)[:3]
+                entry_files = [f for f, _ in top]
+
+        return entry_files
+
 
 # ---------------------------------------------------------------------------
 # RelevanceRanker — multi-signal scoring
@@ -1200,9 +1402,19 @@ class RelevanceRanker:
 
             combined = min(1.0, max(0.0, combined))
 
-            # Determine output mode
+            # Determine output mode with 3-tier HOT/WARM/COLD routing
             if config.output_mode == OutputMode.SMART:
-                mode = OutputMode.FULL if combined >= config.smart_threshold else OutputMode.SIGNATURES
+                hot_threshold = getattr(config, 'hot_threshold', 0.8)
+                warm_threshold = getattr(config, 'warm_threshold', 0.25)
+                if combined >= hot_threshold:
+                    mode = OutputMode.FULL
+                    reasons.append(f"HOT(tier={combined:.2f})")
+                elif combined >= warm_threshold:
+                    mode = OutputMode.SIGNATURES
+                    reasons.append(f"WARM(tier={combined:.2f})")
+                else:
+                    mode = OutputMode.SIGNATURES
+                    reasons.append(f"COLD(tier={combined:.2f})")
             else:
                 mode = config.output_mode
 
@@ -1299,9 +1511,14 @@ class ContextSelector:
         config: ContextConfig controlling budget and modes.
     """
 
-    def __init__(self, config: ContextConfig | None = None) -> None:
+    def __init__(self, config: ContextConfig | None = None, dedup_window: int = 64) -> None:
         self._config = config or ContextConfig()
         self._pruner = self._load_pruner()
+        self._last_breakpoints = 0
+        self._dedup_window = dedup_window
+        # Diff-aware trimming state
+        self._current_diff_spec: DiffSpec | None = None
+        self._trim_stats: dict[str, dict] = {}
 
     def __repr__(self) -> str:
         return f"ContextSelector(budget={self._config.token_budget:,})"
@@ -1317,6 +1534,365 @@ class ContextSelector:
         except ImportError:
             logger.debug("tokenpruner not available — compression disabled")
             return None
+
+    # ------------------------------------------------------------------
+    # Entropy-based deduplication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simhash(source: str, window: int = 64) -> str:
+        """Compute a SimHash-style fingerprint for similarity comparison.
+
+        For each sliding window of ``window`` characters, compute an MD5
+        hash and treat it as a 64-bit integer. The median of all window
+        hashes is returned as the fingerprint. The median gives position-
+        insensitive similarity detection — two near-identical files will
+        have similar fingerprints regardless of where differences occur.
+
+        Args:
+            source: Source text to fingerprint.
+            window: Sliding-window width in characters.
+
+        Returns:
+            16-character hex string (64-bit fingerprint).
+        """
+        if not source:
+            return "0" * 16
+        if len(source) < window:
+            return hashlib.md5(source.encode()).hexdigest()[:16]
+
+        hashes: list[int] = []
+        for i in range(len(source) - window + 1):
+            chunk = source[i:i + window]
+            h = hashlib.md5(chunk.encode()).hexdigest()
+            hashes.append(int(h[:16], 16))  # first 64 bits
+
+        hashes.sort()
+        median = hashes[len(hashes) // 2]
+        return format(median, "016x")
+
+    @staticmethod
+    def _hamming_distance(fp1: str, fp2: str) -> int:
+        """Compute the bit-level Hamming distance between two hex fingerprints.
+
+        Args:
+            fp1: First fingerprint (16-char hex string).
+            fp2: Second fingerprint (16-char hex string).
+
+        Returns:
+            Number of differing bits.
+        """
+        v1 = int(fp1, 16)
+        v2 = int(fp2, 16)
+        xor = v1 ^ v2
+        return xor.bit_count()
+
+    def _is_duplicate(self, source: str, seen_fingerprints: set[str]) -> bool:
+        """Check if *source* is a near-duplicate of already-seen content.
+
+        Computes a SimHash fingerprint and compares it against all
+        previously seen fingerprints. If the Hamming distance to *any*
+        seen fingerprint is less than 3 bits (out of 64), the source
+        is considered a duplicate (>85% similar).
+
+        The fingerprint is **only** added to *seen_fingerprints* when
+        this method returns ``False`` (i.e. the content is novel).
+
+        Args:
+            source: Source text to check.
+            seen_fingerprints: Set of already-seen hex fingerprints.
+
+        Returns:
+            ``True`` if the source is a near-duplicate.
+        """
+        fingerprint = self._simhash(source, self._dedup_window)
+        for seen in seen_fingerprints:
+            if self._hamming_distance(fingerprint, seen) < 3:
+                return True
+        seen_fingerprints.add(fingerprint)
+        return False
+
+    # ------------------------------------------------------------------
+    # Diff-aware context trimming
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_diff_hunks(
+        diff_text: str,
+    ) -> dict[str, list[tuple[tuple[int, int], set[int], set[int]]]]:
+        """Parse unified diff format into per-file changed line ranges.
+
+        Parses ``@@ -a,b +c,d @@`` hunk headers and ``+++ b/path`` file
+        markers to produce a mapping of file_path → list of
+        ``((hunk_start, hunk_end), {new_lines}, {old_lines})``.
+
+        *new_lines* are ``+`` addition line numbers in the *new* file.
+        *old_lines* are ``-`` removal line numbers in the *old* file.
+
+        Args:
+            diff_text: Raw unified diff text (git diff format).
+
+        Returns:
+            Dict mapping file path to list of
+            ``((hunk_start, hunk_end), new_additions, old_removals)``.
+            All line numbers are 1-based.
+        """
+        if not diff_text:
+            return {}
+
+        result: dict[str, list[tuple[tuple[int, int], set[int], set[int]]]] = {}
+        current_file: str | None = None
+
+        lines = diff_text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("+++ "):
+                raw = line[4:]
+                if raw.startswith(("b/", "a/")):
+                    raw = raw[2:]
+                current_file = raw
+                if current_file not in result:
+                    result[current_file] = []
+                i += 1
+                continue
+            if line.startswith("--- "):
+                i += 1
+                continue
+            if line.startswith("@@") and current_file is not None:
+                m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+                if m:
+                    old_start = int(m.group(1))
+                    new_start = int(m.group(3))
+                    new_count = int(m.group(4) or 1)
+                    hunk_end = new_start + new_count - 1
+                    new_changed: set[int] = set()
+                    old_changed: set[int] = set()
+                    new_cursor = new_start
+                    old_cursor = old_start
+                    i += 1
+                    while i < len(lines):
+                        body = lines[i]
+                        if body.startswith("@@") or body.startswith("+++") or body.startswith("---"):
+                            break
+                        prefix = body[0] if body else " "
+                        if prefix == "\\":
+                            i += 1
+                            continue
+                        if prefix == "+":
+                            new_changed.add(new_cursor)
+                            new_cursor += 1
+                        elif prefix == "-":
+                            old_changed.add(old_cursor)
+                            old_cursor += 1
+                        else:
+                            new_cursor += 1
+                            old_cursor += 1
+                        i += 1
+                    result[current_file].append(((new_start, hunk_end), new_changed, old_changed))
+                    continue
+            i += 1
+
+        return result
+
+    def _trim_to_diff_context(
+        self,
+        source: str,
+        diff_spec: DiffSpec,
+        file_node: FileNode,
+        parser: LanguageParser,
+    ) -> str:
+        """Extract only the lines/symbols from *source* relevant to the diff.
+
+        Strategy:
+        1. Parse diff hunk headers to find changed line ranges per file.
+        2. For each changed range, identify overlapping symbols using
+           *only* the core changed lines (``+`` additions), not the hunk
+           context lines, to avoid pulling in neighboring symbols.
+        3. Include the full text of those symbols and the file preamble
+           (imports, docstrings, comments).
+        4. Add clamped context lines between preamble and first relevant
+           symbol, and between relevant symbols — never extending into
+           the body of a non-relevant symbol.
+        5. If >50% of file lines are covered by hunks, include the whole
+           file.
+        6. If no diff hunks exist for this file, emit signatures only
+           (for dependent files) or the full source (for new/changed
+           files with no diff representation).
+
+        Args:
+            source: Full source text of the file.
+            diff_spec: The diff specification containing diff_text and
+                       changed_files.
+            file_node: Parsed FileNode with symbol boundaries.
+            parser: LanguageParser for signature extraction fallback.
+
+        Returns:
+            Trimmed source text with only diff-relevant sections.
+        """
+        source_lines = source.splitlines()
+        total_lines = len(source_lines)
+        if not source_lines:
+            return source
+
+        # Parse hunks: each entry is ((hunk_start, hunk_end), new_additions, old_removals)
+        raw_hunks = self._parse_diff_hunks(diff_spec.diff_text)
+        file_hunk_data: list[tuple[tuple[int, int], set[int], set[int]]] = raw_hunks.get(file_node.path, [])
+
+        # Fallback: try suffix match for path differences
+        if not file_hunk_data:
+            for hunk_path, hunk_data in raw_hunks.items():
+                if file_node.path.endswith(hunk_path) or hunk_path.endswith(file_node.path):
+                    file_hunk_data = hunk_data
+                    break
+
+        # No hunks for this file — determine appropriate fallback
+        if not file_hunk_data:
+            if file_node.path in diff_spec.changed_files:
+                return source  # Changed but undiffable (new/binary) — full source
+            return parser.extract_signatures(source)  # Dependent — signatures only
+
+        # Extract full hunk ranges (for >50% check) and changed lines
+        file_hunks: list[tuple[int, int]] = []
+        new_changed_lines: set[int] = set()
+        old_changed_lines: set[int] = set()
+        for (h_start, h_end), new_lines, old_lines in file_hunk_data:
+            file_hunks.append((h_start, h_end))
+            new_changed_lines.update(new_lines)
+            old_changed_lines.update(old_lines)
+
+        # If no new changed lines (e.g. no ``+`` additions), fall back
+        # to full hunk ranges
+        if not new_changed_lines:
+            for h_start, h_end in file_hunks:
+                for i in range(max(1, h_start), min(total_lines, h_end) + 1):
+                    new_changed_lines.add(i)
+
+        # Also keep the full hunk range lines for the >50% check and
+        # as a fallback for changed-line inclusion
+        all_hunk_lines: set[int] = set()
+        for h_start, h_end in file_hunks:
+            for i in range(max(1, h_start), min(total_lines, h_end) + 1):
+                all_hunk_lines.add(i)
+
+        # If >50% of file lines are covered by hunks, include the whole file
+        pct_changed = len(all_hunk_lines) / max(total_lines, 1)
+        if pct_changed > 0.5:
+            return source
+
+        ctx = self._config.trimming_context_lines
+
+        # ---- Find symbols that overlap with changed lines ----
+        # Matching priority:
+        #   1. new_lines (``+`` additions) — precise, new-file positions
+        #   2. Full hunk range — ONLY when no symbols matched via new_lines
+        #
+        # When a symbol lacks line_end (GenericParser sets only line_start),
+        # estimate the end from the next symbol or EOF.
+        relevant_qualnames: set[str] = set()
+        syms = [s for s in file_node.symbols if s.kind != NodeKind.MODULE and s.line_start > 0]
+        for i, sym in enumerate(syms):
+            _s = sym.line_start
+            _e = sym.line_end if sym.line_end > 0 else (
+                syms[i + 1].line_start - 1 if i + 1 < len(syms) else total_lines
+            )
+            for cl in new_changed_lines:
+                if _s <= cl <= _e:
+                    relevant_qualnames.add(sym.qualified_name)
+                    break
+
+        # Fallback to full hunk range only if new_lines matched nothing
+        if not relevant_qualnames:
+            for i, sym in enumerate(syms):
+                _s = sym.line_start
+                _e = sym.line_end if sym.line_end > 0 else (
+                    syms[i + 1].line_start - 1 if i + 1 < len(syms) else total_lines
+                )
+                for hl in all_hunk_lines:
+                    if _s <= hl <= _e:
+                        relevant_qualnames.add(sym.qualified_name)
+                        break
+
+        # ---- Build the set of lines to include ----
+        lines: set[int] = set()
+
+        # 1. Preamble: leading comments, docstrings, and imports
+        _preamble_starts = (
+            "#", "//", "/*", "*", '"""', "'''",
+            "import ", "from ", "use ", "package ", "require(",
+            "#include",
+        )
+        preamble_end: int = 0
+        for i, line_text in enumerate(source_lines, 1):
+            stripped = line_text.strip()
+            if not stripped:
+                lines.add(i)
+                preamble_end = i
+                continue
+            if stripped.startswith(_preamble_starts):
+                lines.add(i)
+                preamble_end = i
+                continue
+            break  # end of preamble
+
+        # 2. Build map of non-relevant symbol bodies (line ranges to avoid
+        #    for context padding)
+        non_relevant_ranges: list[tuple[int, int]] = []
+        for sym in file_node.symbols:
+            if sym.kind == NodeKind.MODULE:
+                continue
+            if sym.qualified_name not in relevant_qualnames and sym.line_start > 0 and sym.line_end > 0:
+                non_relevant_ranges.append((sym.line_start, sym.line_end))
+
+        def _clamped_context(anchor_start: int, anchor_end: int, expand: int) -> list[int]:
+            """Return context lines around *anchor*, clamped to avoid
+            entering non-relevant symbol bodies or exceeding file bounds."""
+            result: list[int] = []
+            limit = max(preamble_end + 1, anchor_start - expand)
+            for candidate in range(anchor_start - 1, limit - 1, -1):
+                blocked = any(rs <= candidate <= re for rs, re in non_relevant_ranges)
+                if blocked:
+                    break
+                result.append(candidate)
+            limit = min(total_lines, anchor_end + expand)
+            for candidate in range(anchor_end + 1, limit + 1):
+                blocked = any(rs <= candidate <= re for rs, re in non_relevant_ranges)
+                if blocked:
+                    break
+                result.append(candidate)
+            return result
+
+        # 3. Include relevant symbols: their full body + clamped context
+        for i, sym in enumerate(syms):
+            if sym.qualified_name not in relevant_qualnames:
+                continue
+            _s = sym.line_start
+            _e = sym.line_end if sym.line_end > 0 else (
+                syms[i + 1].line_start - 1 if i + 1 < len(syms) else total_lines
+            )
+            for j in range(max(1, _s), min(total_lines, _e) + 1):
+                lines.add(j)
+            for j in _clamped_context(_s, _e, ctx):
+                lines.add(j)
+
+        # 4. Ensure new-file changed lines are included (in case they
+        #    fall outside any parsed symbol — e.g. in an unparsed language)
+        for ln in new_changed_lines:
+            if 1 <= ln <= total_lines:
+                lines.add(ln)
+
+        # ---- Render sorted lines with gap markers ----
+        sorted_lines = sorted(lines)
+        result: list[str] = []
+        prev = 0
+        for ln in sorted_lines:
+            if prev and ln - prev > 1:
+                omitted = ln - prev - 1
+                result.append(f"# ... {omitted} lines omitted ...")
+            result.append(source_lines[ln - 1])
+            prev = ln
+
+        return "\n".join(result)
 
     def select_and_render(
         self,
@@ -1340,6 +1916,10 @@ class ContextSelector:
         used_tokens = 0
         total_original = 0
 
+        # Diff-aware trimming state
+        self._current_diff_spec = diff_spec
+        self._trim_stats = {}
+
         # Always include changed files first
         changed_set = set(diff_spec.changed_files)
         priority: list[ScoredFile] = []
@@ -1350,16 +1930,30 @@ class ContextSelector:
             else:
                 rest.append(sf)
 
+        # Entropy-based dedup: track fingerprints of selected files
+        seen_fingerprints: set[str] = set()
+        dedup_enabled = self._config.dedup_enabled
+
         for sf in priority + rest:
             source = source_map.get(sf.file_node.path, "")
             if not source:
                 continue
+
+            # Dedup: skip near-duplicate files (unless directly changed)
+            if dedup_enabled and sf.file_node.path not in changed_set:
+                if self._is_duplicate(source, seen_fingerprints):
+                    continue
 
             original_tokens = estimate_tokens(source)
             total_original += original_tokens
 
             rendered = self._render_file(sf, source)
             rendered_tokens = estimate_tokens(rendered)
+
+            # Skip COLD-tier files early (below warm_threshold) to save budget
+            warm_threshold = getattr(self._config, 'warm_threshold', 0.25)
+            if sf.score < warm_threshold:
+                continue
 
             if used_tokens + rendered_tokens > budget:
                 # Try signatures-only to fit within budget
@@ -1380,21 +1974,56 @@ class ContextSelector:
             if used_tokens >= budget:
                 break
 
-        context = self._build_header(diff_spec) + "\n\n".join(parts)
+        cache_aware = getattr(self._config, 'cache_aware', False)
+        breakpoints = 0
+        if cache_aware:
+            context, breakpoints = self._render_cache_aware(selected, parts, diff_spec)
+        else:
+            context = self._build_header(diff_spec) + "\n\n".join(parts)
+
+        # Store breakpoints in metadata for ContextResult
+        self._last_breakpoints = breakpoints
         return selected, context, total_original, used_tokens
 
     def _render_file(self, sf: ScoredFile, source: str) -> str:
         path = sf.file_node.path
         mode = sf.output_mode
 
+        # Determine tier for visual labeling
+        hot_threshold = getattr(self._config, 'hot_threshold', 0.8)
+        warm_threshold = getattr(self._config, 'warm_threshold', 0.25)
+        if sf.score >= hot_threshold:
+            tier_label = "HOT"
+        elif sf.score >= warm_threshold:
+            tier_label = "WARM"
+        else:
+            tier_label = "COLD"
+
         header = (
-            f"## {path}\n"
+            f"## {path} [{tier_label}]\n"
             f"<!-- score={sf.score:.3f} rank={sf.rank} depth={sf.depth} "
             f"reasons={','.join(sf.reasons[:2])} -->\n"
         )
 
+        # Apply diff-aware trimming before mode-specific rendering
+        # This runs after tier selection but before token budget counting
+        parser = _PARSER_REGISTRY.get(sf.file_node.language, GenericParser())
+        if self._config.diff_aware_trimming and self._current_diff_spec is not None:
+            trimmed = self._trim_to_diff_context(
+                source, self._current_diff_spec, sf.file_node, parser,
+            )
+            if trimmed != source:
+                orig_tok = estimate_tokens(source)
+                trim_tok = estimate_tokens(trimmed)
+                self._trim_stats[path] = {
+                    "original_file_tokens": orig_tok,
+                    "trimmed_file_tokens": trim_tok,
+                    "saved_tokens": orig_tok - trim_tok,
+                    "trim_ratio": round(1.0 - (trim_tok / max(orig_tok, 1)), 4),
+                }
+                source = trimmed
+
         if mode == OutputMode.SIGNATURES:
-            parser = _PARSER_REGISTRY.get(sf.file_node.language, GenericParser())
             body = parser.extract_signatures(source)
             return header + f"```{sf.file_node.language.value}\n{body}\n```"
 
@@ -1418,6 +2047,75 @@ class ContextSelector:
         lines.append(f"**Changed files:** {', '.join(diff_spec.changed_files)}\n")
         lines.append("---\n")
         return "\n".join(lines)
+
+    def _render_cache_aware(
+        self,
+        selected: list[ScoredFile],
+        rendered_parts: list[str],
+        diff_spec: DiffSpec,
+    ) -> tuple[str, int]:
+        """Structure output with prompt-cache breakpoints for Anthropic/OpenAI.
+
+        Layout designed for maximum cache reuse across reviews:
+          [CACHE ZONE 1] — Signatures of WARM files (cacheable across reviews)
+          [CACHE ZONE 2] — Full source of HOT files (cacheable per PR session)
+          [DYNAMIC ZONE] — Query, diff text (never cached)
+
+        Returns (rendered_context, num_breakpoints).
+        """
+        provider = getattr(self._config, 'cache_provider', 'anthropic')
+
+        hot_parts: list[str] = []
+        warm_parts: list[str] = []
+        cold_parts: list[str] = []
+
+        hot_threshold = getattr(self._config, 'hot_threshold', 0.8)
+        warm_threshold = getattr(self._config, 'warm_threshold', 0.25)
+
+        for i, sf in enumerate(selected):
+            part = rendered_parts[i] if i < len(rendered_parts) else ""
+            if sf.score >= hot_threshold:
+                hot_parts.append(part)
+            elif sf.score >= warm_threshold:
+                warm_parts.append(part)
+            else:
+                cold_parts.append(part)
+
+        sections: list[str] = []
+        breakpoints = 0
+
+        # Header
+        header = self._build_header(diff_spec)
+        sections.append(header)
+
+        # CACHE ZONE 1: Signatures skeleton (highly cacheable)
+        if warm_parts:
+            breakpoints += 1
+            if provider == "anthropic":
+                sections.append("<!-- cache_control: ephemeral -->")
+            sections.append("## Signed Reference Signatures (WARM tier)\n")
+            sections.extend(warm_parts)
+
+        # CACHE ZONE 2: Full source of HOT files
+        if hot_parts:
+            breakpoints += 1
+            if provider == "anthropic":
+                sections.append("<!-- cache_control: ephemeral -->")
+            sections.append("## Core Changed Files (HOT tier)\n")
+            sections.extend(hot_parts)
+
+        # DYNAMIC ZONE: Query-specific
+        if diff_spec.query:
+            sections.append(f"\n## Review Query\n{diff_spec.query}\n")
+        if diff_spec.diff_text:
+            sections.append(f"\n## Diff\n```diff\n{diff_spec.diff_text}\n```\n")
+
+        # COLD footnotes (minimal)
+        if cold_parts:
+            sections.append("\n## Additional Context (COLD tier)\n")
+            sections.extend(cold_parts)
+
+        return "\n\n".join(sections), breakpoints
 
 
 # ---------------------------------------------------------------------------
@@ -1458,6 +2156,7 @@ class ContextBuilder:
         self,
         config: ContextConfig | None = None,
         graph: DependencyGraph | None = None,
+        store: GraphStore | None = None,
     ) -> None:
         self._config = config or ContextConfig()
         self._graph = graph or DependencyGraph(
@@ -1467,8 +2166,13 @@ class ContextBuilder:
         self._selector = ContextSelector(self._config)
         self._index_stats = IndexStats()
         self._lock = threading.RLock()
+        self._store = store
         # Incremental indexing: path → sha256 of last indexed version
         self._sha_cache: dict[str, str] = {}
+        # Cross-session memory cache: diff_spec_hash → context_data
+        self._memory_cache: dict[str, dict] = {}
+        # Whether warm_cache() has been called
+        self._cache_warmed = False
 
     def __repr__(self) -> str:
         return f"ContextBuilder(budget={self._config.token_budget:,}, {self._graph})"
@@ -1627,12 +2331,64 @@ class ContextBuilder:
         )
         return stats
 
+    def warm_cache(self, limit: int = 10) -> int:
+        """Pre-load recent session contexts into an in-memory cache for instant response.
+
+        Call this once at session start before ``build()`` to avoid SQLite lookups
+        during the critical path. Only entries whose ``session_id`` matches
+        the configured ``session_id`` are loaded.
+
+        Args:
+            limit: Maximum number of recent entries to warm.
+
+        Returns:
+            Number of entries loaded into the in-memory cache.
+        """
+        if self._store is None or not self._config.session_id:
+            self._cache_warmed = True
+            return 0
+
+        session_id = self._config.session_id
+        try:
+            recent = self._store.list_recent_sessions(limit=limit)
+        except Exception as exc:
+            logger.debug("graphsift: warm_cache failed: %s", exc)
+            self._cache_warmed = True
+            return 0
+
+        loaded = 0
+        for entry in recent:
+            if entry["session_id"] != session_id:
+                continue
+            try:
+                data = self._store.load_session_context(
+                    session_id,
+                    entry["diff_spec_hash"],
+                    max_age_days=self._config.cache_ttl_days,
+                )
+                if data is not None:
+                    self._memory_cache[entry["diff_spec_hash"]] = data
+                    loaded += 1
+            except Exception:
+                continue
+
+        self._cache_warmed = True
+        logger.info(
+            "graphsift: warmed %d/%d session memory entries",
+            loaded, len(recent),
+        )
+        return loaded
+
     def build(
         self,
         diff_spec: DiffSpec,
         source_map: dict[str, str],
     ) -> ContextResult:
         """Build the ranked context for a diff.
+
+        If session memory is configured (store + session_id), checks for a
+        cached result first. Cache key = hash of (sorted changed_files + query
+        + commit_message). Hit returns instantly with ``from_cache`` metadata.
 
         Args:
             diff_spec: Which files changed and optional query.
@@ -1648,6 +2404,13 @@ class ContextBuilder:
         if not diff_spec.changed_files:
             raise ValidationError("DiffSpec must have at least one changed_file.")
 
+        # ── Check session memory cache ────────────────────────────────────
+        diff_hash = _build_diff_hash(diff_spec)
+        cached = self._check_cache(diff_spec, diff_hash)
+        if cached is not None:
+            return cached
+
+        # ── Full build ────────────────────────────────────────────────────
         try:
             graph_scores = self._graph.ranked_neighbors(
                 diff_spec.changed_files,
@@ -1665,16 +2428,144 @@ class ContextBuilder:
 
         reduction = 1.0 - (rendered_tokens / max(orig_tokens, 1))
 
-        return ContextResult(
+        result = ContextResult(
             diff_spec=diff_spec,
             selected_files=selected,
             rendered_context=context,
+            cache_breakpoints=getattr(self._selector, '_last_breakpoints', 0),
             total_original_tokens=orig_tokens,
             total_rendered_tokens=rendered_tokens,
             reduction_ratio=round(reduction, 4),
             files_scanned=len(all_files),
             files_selected=len(selected),
+            metadata={
+                "from_cache": False,
+                "trim_stats": getattr(self._selector, '_trim_stats', {}),
+            },
         )
+
+        # ── Persist to session memory ─────────────────────────────────────
+        self._save_to_memory(diff_hash, result)
+        return result
+
+    def _check_cache(
+        self,
+        diff_spec: DiffSpec,
+        diff_hash: str,
+    ) -> ContextResult | None:
+        """Check in-memory and persistent caches for a matching context.
+
+        Returns a ContextResult with ``from_cache`` metadata if found,
+        or None to trigger a full build.
+        """
+        # 1. In-memory cache (fastest — warmed via warm_cache())
+        if diff_hash in self._memory_cache:
+            data = self._memory_cache[diff_hash]
+            logger.info(
+                "graphsift: cache HIT (in-memory) for diff hash %s",
+                diff_hash[:12],
+            )
+            return self._cached_result(diff_spec, data, source="memory")
+
+        # 2. Persistent store (SQLite — cross-session)
+        if self._store is not None and self._config.session_id:
+            try:
+                data = self._store.load_session_context(
+                    self._config.session_id,
+                    diff_hash,
+                    max_age_days=self._config.cache_ttl_days,
+                )
+                if data is not None:
+                    # Promote to in-memory cache for faster subsequent access
+                    self._memory_cache[diff_hash] = data
+                    logger.info(
+                        "graphsift: cache HIT (sqlite) for diff hash %s",
+                        diff_hash[:12],
+                    )
+                    return self._cached_result(diff_spec, data, source="sqlite")
+            except Exception as exc:
+                logger.debug("graphsift: cache lookup failed: %s", exc)
+
+        return None
+
+    def _cached_result(
+        self,
+        diff_spec: DiffSpec,
+        data: dict,
+        source: str,
+    ) -> ContextResult:
+        """Reconstruct a ContextResult from cached data."""
+        selected_files_raw = data.get("selected_file_paths", [])
+        # Build lightweight ScoredFile stubs (file_node has path + minimal fields)
+        scored = []
+        for fp in selected_files_raw:
+            fn = self._graph.get_file(fp)
+            if fn is None:
+                continue
+            scored.append(
+                ScoredFile(
+                    file_node=fn,
+                    score=data.get("_cached_score", 0.0),
+                    rank=0,
+                    reasons=["from session memory"],
+                    output_mode=OutputMode.SMART,
+                )
+            )
+
+        return ContextResult(
+            diff_spec=diff_spec,
+            selected_files=scored,
+            rendered_context=data.get("rendered_context", ""),
+            cache_breakpoints=data.get("cache_breakpoints", 0),
+            total_original_tokens=data.get("total_original_tokens", 0),
+            total_rendered_tokens=data.get("total_rendered_tokens", 0),
+            reduction_ratio=data.get("reduction_ratio", 0.0),
+            files_scanned=data.get("files_scanned", 0),
+            files_selected=len(scored),
+            metadata={
+                "from_cache": True,
+                "cache_source": source,
+                "cached_at": data.get("_cached_at", ""),
+                "cached_session_id": self._config.session_id,
+                "diff_spec_hash": data.get("diff_spec_hash", ""),
+                "memory_id": data.get("_memory_id"),
+            },
+        )
+
+    def _save_to_memory(
+        self,
+        diff_hash: str,
+        result: ContextResult,
+    ) -> None:
+        """Save a build result to session memory (in-memory + SQLite)."""
+        if self._store is None or not self._config.session_id:
+            return
+
+        context_data = {
+            "diff_spec_hash": diff_hash,
+            "rendered_context": result.rendered_context,
+            "cache_breakpoints": result.cache_breakpoints,
+            "selected_file_paths": [sf.file_node.path for sf in result.selected_files],
+            "files_selected": result.files_selected,
+            "files_scanned": result.files_scanned,
+            "total_original_tokens": result.total_original_tokens,
+            "total_rendered_tokens": result.total_rendered_tokens,
+            "reduction_ratio": result.reduction_ratio,
+            "_cached_score": result.selected_files[0].score if result.selected_files else 0.0,
+        }
+
+        # Update in-memory cache
+        self._memory_cache[diff_hash] = context_data
+
+        # Persist to SQLite
+        try:
+            self._store.save_session_context(
+                self._config.session_id,
+                diff_hash,
+                context_data,
+            )
+        except Exception as exc:
+            logger.debug("graphsift: failed to save session memory: %s", exc)
 
     def graph_stats(self) -> dict[str, int]:
         """Return current graph statistics."""

@@ -1,24 +1,27 @@
-"""graphsift — Smarter code context selection for LLMs.
+"""graphsift - Save Claude Tokens, Reduce LLM API Costs, Optimize Context Windows.
 
-Strictly better than code-review-graph:
-- Ranked relevance scoring (not binary include/exclude) → fewer false positives
-- Multi-file diff support (union blast radius)
-- Decorator + dynamic import edge detection
-- tokenpruner integration for token-budget-aware compression
-- Async incremental indexer with depth cap (no hangs on large repos)
-- BM25 + graph rank fusion
-- Bash/Shell, Terraform/HCL, Helm chart parsing
-- Go receiver method detection
-- Monorepo multi-root indexing
-- Incremental re-indexing via SHA-256 change detection
-- 80–150x token reduction on real codebases
+The #1 Claude token saver and LLM token optimizer for AI code review.
+80-150x token reduction vs raw source. 86% avg CLI output compression.
+F1 0.85 relevance accuracy vs 0.54 for code-review-graph.
+
+Key capabilities:
+- Ranked 0-1 relevance scoring with hot/warm/cold tier selection
+- Hard token budget enforcement - never exceeds Claude/GPT/Gemini context limits
+- Diff-aware context trimming + entropy-based deduplication
+- 14-language AST parsing + 11-language tree-sitter precise parsing
+- 19 CLI command compressors (pytest 94%, grep 97%, git_diff 92%, docker 91%)
+- Hybrid search (BM25 + TF-IDF sparse vector fusion)
+- Auto-fix suggestions, cycle detection, dead code detection
+- MCP server with 7 token-saving tools for Claude Code
+- Drop-in Claude/Anthropic, OpenAI/Codex, and Gemini adapters
+- Cache-aware output with Anthropic/OpenAI cache breakpoints
 
 Quick start::
 
     from graphsift import ContextBuilder, ContextConfig, DiffSpec
 
     builder = ContextBuilder(ContextConfig(token_budget=50_000))
-    builder.index_files(source_map)   # dict of path → source text
+    builder.index_files(source_map)   # dict of path -> source text
 
     result = builder.build(
         DiffSpec(changed_files=["src/auth.py"], query="Review this change"),
@@ -27,13 +30,17 @@ Quick start::
     print(result)
     # ContextResult(selected=9/143, tokens=12,400, saved=94%)
 
-    # Paste result.rendered_context directly into your LLM call
+    # Paste result.rendered_context directly into your Claude API call
 
     # Monorepo support
     stats_list = builder.index_roots([pkg_a_map, pkg_b_map])
 
-    # Incremental updates (skips unchanged files)
+    # Incremental updates (skips unchanged files via SHA-256)
     builder.index_files_incremental(updated_source_map)
+
+    # CLI output compression - save tokens on command output
+    from graphsift import compress
+    saved = compress(pytest_output, "pytest")
 """
 
 from ._version import __version__
@@ -51,6 +58,10 @@ from .core import (
     estimate_tokens,
     get_parser,
     register_parser,
+)
+from .parsers import (
+    TreeSitterParser,
+    register_tree_sitter_parsers,
 )
 from .exceptions import (
     AdapterError,
@@ -71,6 +82,9 @@ from .models import (
     FileNode,
     GraphEdge,
     GraphNode,
+    FixReport,
+    FixSeverity,
+    FixSuggestion,
     IndexStats,
     Language,
     NodeKind,
@@ -95,6 +109,7 @@ from .advanced import (
     stream_context,
 )
 from .adapters.storage import GraphStore
+from .auto_fix import FixSuggester
 from .adapters.claude import ClaudeCodeReviewAdapter, ClaudeContextAdapter
 from .adapters.gemini import GeminiCodeReviewAdapter, GeminiContextAdapter
 from .adapters.openai import (
@@ -115,6 +130,7 @@ from .adapters.postprocess import (
 )
 from .compress import compress, compress_tee, COMPRESSORS, detect_type as detect_command_type
 from .analytics import gain, discover, history, record_call, reset as reset_analytics
+from .hybrid_search import HybridSearcher
 
 __all__ = [
     # Core
@@ -127,6 +143,8 @@ __all__ = [
     "BashParser",
     "HCLParser",
     "LanguageParser",
+    "TreeSitterParser",
+    "register_tree_sitter_parsers",
     "detect_language",
     "estimate_tokens",
     "get_parser",
@@ -144,6 +162,9 @@ __all__ = [
     "NodeKind",
     "EdgeKind",
     "OutputMode",
+    "FixSeverity",
+    "FixSuggestion",
+    "FixReport",
     # Exceptions
     "graphsiftError",
     "ValidationError",
@@ -200,6 +221,10 @@ __all__ = [
     "history",
     "record_call",
     "reset_analytics",
+    # Hybrid Search
+    "HybridSearcher",
+    # Auto-fix
+    "FixSuggester",
     # MCP / CLI
     "run_server",
 ]

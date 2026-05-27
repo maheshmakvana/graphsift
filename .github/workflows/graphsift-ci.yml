@@ -1,0 +1,70 @@
+name: graphsift CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install with test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        run: pytest --cov=graphsift --cov-report=xml -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install graphsift
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Smoke test — build graph
+        run: graphsift build --skip-postprocess
+        timeout-minutes: 5
+
+      - name: Detect circular dependencies (non-blocking warning)
+        continue-on-error: true
+        run: |
+          graphsift detect-cycles || echo "Cycle detection completed (non-blocking)."
+
+      - name: Verify CLI entry point
+        run: |
+          graphsift --help
+          echo "CLI entry point verified."

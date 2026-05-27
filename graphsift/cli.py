@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -1051,6 +1052,159 @@ def cmd_bash_wrapper(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# detect-cycles command
+# ---------------------------------------------------------------------------
+
+
+def cmd_detect_cycles(args: argparse.Namespace) -> int:
+    """Detect circular dependencies (import/call cycles) in the codebase using Tarjan's SCC."""
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = args.root or os.getcwd()
+    source_map = load_source_map(root)
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files(source_map)
+
+    graph = getattr(builder, "_graph", None)
+    if not graph or not graph._nodes:
+        print("Error: Graph is empty. Index your codebase first.", file=sys.stderr)
+        return 1
+
+    cycles = graph.detect_cycles()
+
+    if not cycles:
+        print("No circular dependencies found.")
+        return 0
+
+    print(f"Found {len(cycles)} circular dependencies:\n")
+    for i, cycle in enumerate(cycles):
+        severity = "ERROR" if len(cycle) <= 3 else "WARNING"
+        print(f"  [{severity}] Cycle {i + 1} ({len(cycle)} files):")
+        for f in cycle:
+            print(f"    -> {f}")
+        print()
+
+    total_files = len(set(f for c in cycles for f in c))
+    print(f"Total files in cycles: {total_files}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# detect-dead-code command
+# ---------------------------------------------------------------------------
+
+
+def cmd_suggest_fixes(args: argparse.Namespace) -> int:
+    """Run auto-fix analysis and return prioritized fix suggestions."""
+    import logging as _logging
+    _logging.basicConfig(level=_logging.WARNING, format="%(message)s", stream=sys.stderr)
+
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.auto_fix import FixSuggester
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = Path(args.project_root).resolve()
+    changed_files = args.changed_files or None
+
+    print(f"\nGraphsift: auto-fix suggestions for {root}\n")
+
+    # Build graph
+    source_map = load_source_map(str(root))
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files(source_map)
+    graph = getattr(builder, "_graph", None)
+
+    if not graph:
+        print("[graphsift] No graph built. Run: graphsift build")
+        return 1
+
+    suggester = FixSuggester(graph, source_map=source_map)
+    report = suggester.analyze(changed_files=changed_files)
+
+    if args.json:
+        print(report.model_dump_json(indent=2))
+        return 0
+
+    if not report.suggestions:
+        print("  No issues found. Your code looks clean!")
+        return 0
+
+    print(f"  {report.summary}")
+    print()
+
+    # Filter by min_confidence
+    filtered = [s for s in report.suggestions if s.confidence >= args.min_confidence]
+
+    # Group by severity
+    for severity in ("error", "warning", "info"):
+        group = [s for s in filtered if s.severity.value == severity]
+        if not group:
+            continue
+        label = severity.upper()
+        print(f"  [{label}]")
+        print()
+        for s in group:
+            loc = f"{s.file_path}:{s.line_start}"
+            auto_tag = "  [AUTO-FIXABLE]" if s.auto_fixable else ""
+            conf_tag = f"  [conf={s.confidence:.2f}]"
+            print(f"    {s.title}")
+            print(f"      File: {loc}{auto_tag}{conf_tag}")
+            if s.description:
+                print(f"      {s.description}")
+            if s.suggested_change:
+                print(f"      --> {s.suggested_change}")
+            print()
+        print()
+
+    print(f"  Total: {len(filtered)} suggestion(s) "
+          f"({report.by_severity.get('error', 0)} errors, "
+          f"{report.by_severity.get('warning', 0)} warnings, "
+          f"{report.by_severity.get('info', 0)} info)")
+    print()
+
+    return 0
+
+
+def cmd_detect_dead_code(args: argparse.Namespace) -> int:
+    """Detect potentially unreachable code via BFS reachability analysis."""
+    from graphsift.adapters.filesystem import load_source_map
+    from graphsift.core import ContextBuilder
+    from graphsift.models import ContextConfig
+
+    root = args.root or os.getcwd()
+    source_map = load_source_map(root)
+    builder = ContextBuilder(ContextConfig())
+    builder.index_files(source_map)
+
+    graph = getattr(builder, "_graph", None)
+    if not graph or not graph._nodes:
+        print("Error: Graph is empty. Index your codebase first.", file=sys.stderr)
+        return 1
+
+    entry_points = args.entry_points.split(",") if args.entry_points else None
+    dead = graph.find_dead_code(
+        entry_points=entry_points,
+        kind=args.kind or None,
+    )
+
+    if not dead:
+        print("No dead code detected.")
+        return 0
+
+    print(f"Found {len(dead)} potentially unreachable elements:\n")
+    for item in dead:
+        print(f"  [{item['kind']}] {item['name']}")
+        print(f"    File: {item['file_path']}:{item['line_start']}")
+        print(f"    Reason: {item['reason']}")
+        print()
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1159,6 +1313,37 @@ def _build_parser() -> argparse.ArgumentParser:
     # bash-wrapper
     sub.add_parser("bash-wrapper", help="Print bash wrapper script for transparent command compression")
 
+    # detect-cycles
+    p_cycles = sub.add_parser(
+        "detect-cycles",
+        help="Detect circular dependencies (import/call cycles)",
+    )
+    p_cycles.add_argument("--root", default=None, help="Repository root path")
+    p_cycles.set_defaults(func=cmd_detect_cycles)
+
+    # detect-dead-code
+    p_dead = sub.add_parser(
+        "detect-dead-code",
+        help="Find potentially unreachable/dead code",
+    )
+    p_dead.add_argument("--root", default=None, help="Repository root path")
+    p_dead.add_argument("--kind", choices=["function", "class", "method"], help="Filter by node kind")
+    p_dead.add_argument("--entry-points", help="Comma-separated entry-point file paths")
+    p_dead.set_defaults(func=cmd_detect_dead_code)
+
+    # suggest-fixes
+    p_suggest = sub.add_parser(
+        "suggest-fixes",
+        help="Run auto-fix analysis and return prioritized fix suggestions",
+    )
+    p_suggest.add_argument("--project-root", default=_cwd(), help="Repository root path (default: cwd)")
+    p_suggest.add_argument("--changed-files", nargs="*", metavar="FILE",
+                           help="Only show suggestions for these files")
+    p_suggest.add_argument("--json", action="store_true", help="Output as JSON")
+    p_suggest.add_argument("--min-confidence", type=float, default=0.0,
+                           help="Minimum confidence threshold 0-1 (default 0.0)")
+    p_suggest.set_defaults(func=cmd_suggest_fixes)
+
     return parser
 
 
@@ -1186,9 +1371,13 @@ def main() -> None:
         "compress": cmd_compress,
         "discover": cmd_discover,
         "bash-wrapper": cmd_bash_wrapper,
+        "detect-cycles": cmd_detect_cycles,
+        "detect-dead-code": cmd_detect_dead_code,
+        "suggest-fixes": cmd_suggest_fixes,
     }
 
-    fn = commands.get(args.command)
+    # Support func-based dispatch for new-style subcommands
+    fn = getattr(args, "func", None) or commands.get(args.command)
     if fn is None:
         parser.print_help()
         sys.exit(1)

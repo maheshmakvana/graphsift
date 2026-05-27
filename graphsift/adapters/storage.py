@@ -43,7 +43,7 @@ from ..models import (
 
 logger = logging.getLogger(__name__)
 
-_CURRENT_VERSION = 7
+_CURRENT_VERSION = 8
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,44 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             )
+            """,
+        ],
+    ),
+    (
+        8,
+        "created session_memory and context_feedback tables for cross-session persistence",
+        [
+            """
+            CREATE TABLE IF NOT EXISTS session_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                diff_spec_hash TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                files_selected INTEGER,
+                tokens_rendered INTEGER,
+                reduction_ratio REAL,
+                created_at TEXT DEFAULT (datetime('now')),
+                last_accessed_at TEXT DEFAULT (datetime('now')),
+                access_count INTEGER DEFAULT 1,
+                UNIQUE(session_id, diff_spec_hash)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_session_memory_session
+            ON session_memory(session_id, created_at)
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS context_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                context_id INTEGER REFERENCES session_memory(id),
+                rating INTEGER CHECK(rating >= 1 AND rating <= 5),
+                notes TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_context_feedback_context
+            ON context_feedback(context_id)
             """,
         ],
     ),
@@ -736,6 +774,223 @@ class GraphStore:
             return cur.lastrowid or 0
 
     # ------------------------------------------------------------------
+    # Session memory — cross-session context reuse
+    # ------------------------------------------------------------------
+
+    def save_session_context(
+        self,
+        session_id: str,
+        diff_spec_hash: str,
+        context_data: dict,
+    ) -> None:
+        """Save a context selection result for future reuse across sessions.
+
+        Args:
+            session_id: Session identifier (e.g. repo root hash).
+            diff_spec_hash: SHA-256 of (sorted changed_files + query + commit_message).
+            context_data: Dict with rendered_context, selected_file_paths, token stats.
+        """
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO session_memory
+                    (session_id, diff_spec_hash, context_json,
+                     files_selected, tokens_rendered, reduction_ratio)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, diff_spec_hash) DO UPDATE SET
+                    context_json=excluded.context_json,
+                    files_selected=excluded.files_selected,
+                    tokens_rendered=excluded.tokens_rendered,
+                    reduction_ratio=excluded.reduction_ratio,
+                    last_accessed_at=datetime('now'),
+                    access_count=access_count + 1
+                """,
+                (
+                    session_id,
+                    diff_spec_hash,
+                    json.dumps(context_data),
+                    context_data.get("files_selected"),
+                    context_data.get("total_rendered_tokens"),
+                    context_data.get("reduction_ratio"),
+                ),
+            )
+            self._conn.commit()
+
+    def load_session_context(
+        self,
+        session_id: str,
+        diff_spec_hash: str,
+        max_age_days: int = 7,
+    ) -> dict | None:
+        """Load a previously cached context selection.
+
+        Args:
+            session_id: Session identifier.
+            diff_spec_hash: SHA-256 of the diff specification.
+            max_age_days: Maximum age in days before the entry is considered expired.
+
+        Returns:
+            The stored context_data dict, or None if missing or expired.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT *,
+                       julianday('now') - julianday(created_at) AS age_days
+                FROM session_memory
+                WHERE session_id=? AND diff_spec_hash=?
+                """,
+                (session_id, diff_spec_hash),
+            ).fetchone()
+            if row is None:
+                return None
+            age = row["age_days"] if row["age_days"] is not None else 0.0
+            if age > max_age_days:
+                logger.info(
+                    "Session memory entry expired (age=%.1f days, max=%d days)",
+                    age, max_age_days,
+                )
+                return None
+            # Bump access count and last_accessed_at
+            self._conn.execute(
+                """
+                UPDATE session_memory
+                SET access_count = access_count + 1,
+                    last_accessed_at = datetime('now')
+                WHERE id = ?
+                """,
+                (row["id"],),
+            )
+            self._conn.commit()
+            data = json.loads(row["context_json"])
+            data["_cached_at"] = row["created_at"]
+            data["_access_count"] = row["access_count"] + 1
+            data["_memory_id"] = row["id"]
+            return data
+
+    def list_recent_sessions(self, limit: int = 10) -> list[dict]:
+        """List recent sessions with their metadata.
+
+        Args:
+            limit: Maximum number of entries to return.
+
+        Returns:
+            List of dicts with session metadata (no context_json body).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, session_id, diff_spec_hash,
+                       files_selected, tokens_rendered, reduction_ratio,
+                       created_at, last_accessed_at, access_count
+                FROM session_memory
+                ORDER BY last_accessed_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "session_id": r["session_id"],
+                "diff_spec_hash": r["diff_spec_hash"],
+                "files_selected": r["files_selected"],
+                "tokens_rendered": r["tokens_rendered"],
+                "reduction_ratio": r["reduction_ratio"],
+                "created_at": r["created_at"],
+                "last_accessed_at": r["last_accessed_at"],
+                "access_count": r["access_count"],
+            }
+            for r in rows
+        ]
+
+    def save_review_feedback(
+        self,
+        context_id: int,
+        rating: int,
+        notes: str = "",
+    ) -> None:
+        """Save user feedback on context quality (1-5 rating).
+
+        Args:
+            context_id: ID from the session_memory table.
+            rating: Quality rating (1-5, 5 = best).
+            notes: Optional free-text notes.
+        """
+        if rating < 1 or rating > 5:
+            raise ValueError("rating must be between 1 and 5")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO context_feedback (context_id, rating, notes)
+                VALUES (?, ?, ?)
+                """,
+                (context_id, rating, notes),
+            )
+            self._conn.commit()
+
+    def get_context_quality_stats(self) -> dict:
+        """Return aggregate stats on context quality from feedback.
+
+        Returns:
+            Dict with count, average_rating, rating_distribution, and
+            recent_feedback summary.
+        """
+        with self._lock:
+            # Overall stats
+            stats_row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count,
+                       ROUND(AVG(rating), 2) AS avg_rating,
+                       MIN(rating) AS min_rating,
+                       MAX(rating) AS max_rating
+                FROM context_feedback
+                """,
+            ).fetchone()
+            # Rating distribution
+            dist_rows = self._conn.execute(
+                """
+                SELECT rating, COUNT(*) AS cnt
+                FROM context_feedback
+                GROUP BY rating
+                ORDER BY rating
+                """,
+            ).fetchall()
+            # Recent feedback with context info
+            recent = self._conn.execute(
+                """
+                SELECT f.id, f.rating, f.notes, f.created_at,
+                       s.session_id, s.diff_spec_hash
+                FROM context_feedback f
+                LEFT JOIN session_memory s ON f.context_id = s.id
+                ORDER BY f.created_at DESC
+                LIMIT 20
+                """,
+            ).fetchall()
+
+        count = stats_row["count"] if stats_row else 0
+        return {
+            "total_feedback": count,
+            "average_rating": stats_row["avg_rating"] if stats_row else 0.0,
+            "min_rating": stats_row["min_rating"] if stats_row else 0,
+            "max_rating": stats_row["max_rating"] if stats_row else 0,
+            "rating_distribution": {
+                str(r["rating"]): r["cnt"] for r in dist_rows
+            },
+            "recent_feedback": [
+                {
+                    "id": r["id"],
+                    "rating": r["rating"],
+                    "notes": r["notes"],
+                    "created_at": r["created_at"],
+                    "session_id": r["session_id"],
+                    "diff_spec_hash": r["diff_spec_hash"],
+                }
+                for r in recent
+            ],
+        }
+
+    # ------------------------------------------------------------------
     # Stats / schema
     # ------------------------------------------------------------------
 
@@ -762,6 +1017,8 @@ class GraphStore:
                 "risk_index": _count("risk_index"),
                 "community_summaries": _count("community_summaries"),
                 "flow_snapshots": _count("flow_snapshots"),
+                "session_memory": _count("session_memory"),
+                "context_feedback": _count("context_feedback"),
                 "db_path": self._db_path,
             }
 

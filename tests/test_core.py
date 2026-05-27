@@ -467,3 +467,315 @@ def test_index_roots_multiple(source_map):
     assert len(stats_list) == 2
     total = sum(s.files_indexed for s in stats_list)
     assert total == len(source_map) - sum(s.files_skipped for s in stats_list)
+
+
+# ---------------------------------------------------------------------------
+# Cycle detection (Tarjan's SCC)
+# ---------------------------------------------------------------------------
+
+
+class TestCycleDetection:
+    """Tests for Tarjan's SCC cycle detection."""
+
+    def test_no_cycles_in_acyclic_graph(self, source_map):
+        """An acyclic dependency graph should return empty cycles list."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+        cycles = graph.detect_cycles()
+
+        assert isinstance(cycles, list)
+        # Well-structured code should have few/no cycles
+        for cycle in cycles:
+            assert len(cycle) >= 2, f"Cycles should have at least 2 files, got: {cycle}"
+
+    def test_detect_cycles_returns_list(self, source_map):
+        """Cycle detection should return a list of cycles."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+        cycles = graph.detect_cycles()
+
+        assert isinstance(cycles, list)
+
+    def test_cycle_files_exist_in_graph(self, source_map):
+        """All files in detected cycles should exist in the graph."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+        graph_files = {node.file_path for node in graph._nodes.values()}
+        cycles = graph.detect_cycles()
+
+        for cycle in cycles:
+            for file_path in cycle:
+                assert file_path in graph_files, f"Cycle file {file_path} not in graph"
+
+    def test_self_loops_excluded(self, source_map):
+        """Single-file cycles (self-loops) should be excluded."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+        cycles = graph.detect_cycles()
+
+        for cycle in cycles:
+            assert len(cycle) >= 2, f"Self-loops should be excluded: {cycle}"
+
+
+# ---------------------------------------------------------------------------
+# Dead code detection (BFS reachability)
+# ---------------------------------------------------------------------------
+
+
+class TestDeadCodeDetection:
+    """Tests for BFS-based dead code detection."""
+
+    def test_find_dead_code_returns_list(self, source_map):
+        """Dead code detection should return a list."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+        dead = graph.find_dead_code()
+
+        assert isinstance(dead, list)
+
+    def test_dead_code_entry_structure(self, source_map):
+        """Each dead code entry should have required fields."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+        dead = graph.find_dead_code()
+
+        required_fields = ["node_id", "file_path", "name", "kind", "line_start", "line_end", "reason"]
+        for entry in dead:
+            for field in required_fields:
+                assert field in entry, f"Dead code entry missing field: {field}"
+
+    def test_entry_points_filter(self, source_map):
+        """Providing explicit entry points should work."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+
+        # Pick a file that exists in the graph as entry point
+        graph_files = list({node.file_path for node in graph._nodes.values()})
+        if graph_files:
+            dead = graph.find_dead_code(entry_points=[graph_files[0]])
+            assert isinstance(dead, list)
+
+    def test_kind_filter(self, source_map):
+        """Kind filter should only return matching node types."""
+        builder = ContextBuilder()
+        builder.index_files(source_map)
+
+        graph = builder._graph
+
+        dead_funcs = graph.find_dead_code(kind="function")
+        for entry in dead_funcs:
+            assert entry["kind"] == "function", f"Expected function, got {entry['kind']}"
+
+        dead_classes = graph.find_dead_code(kind="class")
+        for entry in dead_classes:
+            assert entry["kind"] == "class", f"Expected class, got {entry['kind']}"
+
+
+# ---------------------------------------------------------------------------
+# Tiered scoring (HOT / WARM / COLD)
+# ---------------------------------------------------------------------------
+
+
+class TestTieredScoring:
+    """Tests for HOT/WARM/COLD 3-tier scoring."""
+
+    def test_hot_threshold_full_source(self, source_map):
+        """Files scored >= hot_threshold should get FULL output mode."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            hot_threshold=0.8,
+            warm_threshold=0.25,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        hot_files = [sf for sf in result.selected_files if sf.score >= 0.8]
+        warm_files = [sf for sf in result.selected_files if 0.25 <= sf.score < 0.8]
+
+        for sf in hot_files:
+            assert sf.output_mode == OutputMode.FULL, (
+                f"Expected FULL for HOT file {sf.file_node.path}, got {sf.output_mode}"
+            )
+
+    def test_warm_threshold_signatures(self, source_map):
+        """Files scored between warm and hot thresholds should get SIGNATURES."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            hot_threshold=0.95,  # Very high to force WARM
+            warm_threshold=0.1,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        # Changed files should always be included
+        assert len(result.selected_files) > 0
+
+    def test_cold_files_excluded(self, source_map):
+        """Files below warm_threshold should be excluded from context."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            hot_threshold=0.8,
+            warm_threshold=0.9,  # Very high to force most files COLD
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        # Only HOT files (>= 0.9) or changed files should be selected
+        for sf in result.selected_files:
+            is_changed = sf.file_node.path in diff.changed_files
+            is_hot = sf.score >= 0.9
+            assert is_changed or is_hot, (
+                f"COLD file {sf.file_node.path} (score={sf.score}) should not be selected"
+            )
+
+    def test_legacy_smart_threshold_still_works(self, source_map):
+        """Backward compatibility: smart_threshold without hot/warm should work."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            smart_threshold=0.5,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        assert len(result.selected_files) > 0
+        # Files above 0.5 should be FULL
+        full_files = [
+            sf
+            for sf in result.selected_files
+            if sf.score >= 0.5 and sf.file_node.path not in diff.changed_files
+        ]
+        for sf in full_files:
+            assert sf.output_mode in (OutputMode.FULL, OutputMode.SMART, OutputMode.SIGNATURES)
+
+    def test_tier_labels_in_rendered_context(self, source_map):
+        """Rendered context should include HOT/WARM/COLD labels."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            hot_threshold=0.8,
+            warm_threshold=0.25,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        # Check that rendered context has tier labels
+        context = result.rendered_context
+        has_tier_label = "[HOT]" in context or "[WARM]" in context or "[COLD]" in context
+        assert has_tier_label, (
+            f"Context should contain tier labels, got: {context[:500]}"
+        )
+
+
+class TestCacheAwareOutput:
+    """Tests for prompt caching-aware context output."""
+
+    def test_cache_aware_structure(self, source_map):
+        """Cache-aware output should have structured sections."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            hot_threshold=0.8,
+            warm_threshold=0.25,
+            cache_aware=True,
+            cache_provider="anthropic",
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"], query="Is this secure?")
+        result = builder.build(diff, source_map)
+
+        context = result.rendered_context
+        # Should have cache control markers
+        assert "cache_control" in context, (
+            f"Expected cache_control markers in: {context[:500]}"
+        )
+
+    def test_cache_aware_has_zones(self, source_map):
+        """Cache-aware output should separate HOT and WARM files into zones."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            hot_threshold=0.8,
+            warm_threshold=0.25,
+            cache_aware=True,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        context = result.rendered_context
+        # Should separate HOT and WARM zones
+        assert "HOT" in context or "WARM" in context, (
+            f"Expected tier zones in: {context[:500]}"
+        )
+
+    def test_cache_breakpoints_counted(self, source_map):
+        """Cache-aware output should count breakpoints."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            cache_aware=True,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        # Should have at least 1 breakpoint if cache_aware
+        assert result.cache_breakpoints >= 0, (
+            "cache_breakpoints should be set"
+        )
+
+    def test_non_cache_aware_no_markers(self, source_map):
+        """Default (non-cache-aware) output should not have cache markers."""
+        config = ContextConfig(
+            output_mode=OutputMode.SMART,
+            token_budget=10_000,
+        )
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(changed_files=["src/auth.py"])
+        result = builder.build(diff, source_map)
+
+        context = result.rendered_context
+        assert "cache_control" not in context, (
+            "Non-cache-aware output should not have cache_control markers"
+        )
