@@ -113,6 +113,8 @@ from .adapters.postprocess import (
     RiskScorer,
     WikiGenerator,
 )
+from .compress import compress, compress_tee, COMPRESSORS, detect_type as detect_command_type
+from .analytics import gain, discover, history, record_call, reset as reset_analytics
 
 __all__ = [
     # Core
@@ -188,6 +190,16 @@ __all__ = [
     "RiskScorer",
     "WikiGenerator",
     "RefactorEngine",
+    # Compress & Analytics
+    "compress",
+    "compress_tee",
+    "COMPRESSORS",
+    "detect_command_type",
+    "gain",
+    "discover",
+    "history",
+    "record_call",
+    "reset_analytics",
     # MCP / CLI
     "run_server",
 ]

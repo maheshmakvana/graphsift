@@ -75,8 +75,8 @@ def cmd_install(args: argparse.Namespace) -> int:
 
         settings.setdefault("hooks", {})
 
-        # SessionInit - prime Claude with graph awareness
-        settings["hooks"].setdefault("SessionInit", [])
+        # SessionStart - prime Claude with graph awareness
+        settings["hooks"].setdefault("SessionStart", [])
         session_hook = {
             "matcher": "",
             "hooks": [
@@ -95,11 +95,11 @@ def cmd_install(args: argparse.Namespace) -> int:
         # Only add if not already present
         existing_cmds = [
             h.get("command", "")
-            for entry in settings["hooks"]["SessionInit"]
+            for entry in settings["hooks"]["SessionStart"]
             for h in entry.get("hooks", [])
         ]
         if not any("graphsift" in c for c in existing_cmds):
-            settings["hooks"]["SessionInit"].append(session_hook)
+            settings["hooks"]["SessionStart"].append(session_hook)
 
         # PostToolUse - auto-update graph after Write/Edit/Bash
         settings["hooks"].setdefault("PostToolUse", [])
@@ -123,12 +123,54 @@ def cmd_install(args: argparse.Namespace) -> int:
         if not any("graphsift" in c for c in existing_post):
             settings["hooks"]["PostToolUse"].append(post_hook)
 
+        # PostToolUse for Bash — compress command output to save tokens
+        bash_post_hook = {
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        f"{_python_executable()} -c \""
+                        "import sys, os; "
+                        "from graphsift.compress import compress; "
+                        "from graphsift.analytics import record_call; "
+                        "text = sys.stdin.read(); "
+                        "if text and len(text) > 200: "
+                        "    compressed = compress(text); "
+                        "    record_call(tokens_saved=(len(text)-len(compressed))//4, command_type='bash', original_chars=len(text), compressed_chars=len(compressed)); "
+                        "    sys.stdout.write(compressed) "
+                        "else: "
+                        "    sys.stdout.write(text or '')"
+                        "\""
+                    ),
+                }
+            ],
+        }
+        if not any("graphsift.compress" in h.get("command", "") for entry in settings["hooks"]["PostToolUse"] for h in entry.get("hooks", [])):
+            settings["hooks"]["PostToolUse"].append(bash_post_hook)
+
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         print(f"[graphsift] Wrote hooks -> {settings_path}")
 
     # 3. Write skill files
     if not args.no_skills:
         _write_skills(project_root)
+
+    # 4. Install bash wrapper (auto-compress commands)
+    if args.bash_wrapper:
+        from .hooks import get_bash_wrapper_script
+        bashrc_path = Path.home() / ".bashrc"
+        wrapper_script = get_bash_wrapper_script(python_path=_python_executable())
+
+        # Check if already installed
+        existing = bashrc_path.read_text(encoding="utf-8") if bashrc_path.exists() else ""
+        if "# graphsift: transparent output compression" not in existing:
+            with open(bashrc_path, "a", encoding="utf-8") as f:
+                f.write(f"\n# graphsift: transparent output compression\n")
+                f.write(f'eval "$({_python_executable()} -m graphsift.cli bash-wrapper)"\n')
+            print(f"[graphsift] Installed bash wrapper -> {bashrc_path}")
+        else:
+            print(f"[graphsift] Bash wrapper already installed in {bashrc_path}")
 
     print("[graphsift] Installation complete.")
     print()
@@ -468,7 +510,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
     # Remove skills
     skills_dir = project_root / ".claude" / "skills"
-    for skill_dir in ["graphsift-build", "graphsift-review", "graphsift-impact"]:
+    for skill_dir in ["graphsift-build", "graphsift-review", "graphsift-impact", "graphsift-compress"]:
         import shutil
         target = skills_dir / skill_dir
         if target.exists():
@@ -530,7 +572,20 @@ def _write_skills(project_root: Path) -> None:
         example="What is the blast radius of changes to src/auth.py?",
     )
 
-    print(f"[graphsift] Wrote 3 skill files -> {skills_root}")
+    _write_skill(
+        skills_root / "graphsift-compress" / "SKILL.md",
+        title="graphsift: Compress Output",
+        description="Compress CLI command output to save 60-90% tokens before they reach the LLM context window.",
+        steps=[
+            "After running a Bash command that produced large output, call `compress_output` with the output text.",
+            "The tool auto-detects the command type (git, npm, pytest, etc.) and applies the optimal compression strategy.",
+            "Use the compressed output instead of the raw output in your LLM analysis.",
+            "Check `token_gain` periodically to see cumulative token savings.",
+        ],
+        example="Compress this pytest output before analyzing it",
+    )
+
+    print(f"[graphsift] Wrote 4 skill files -> {skills_root}")
 
 
 def _write_skill(path: Path, title: str, description: str, steps: list[str], example: str) -> None:
@@ -933,6 +988,69 @@ def cmd_repos(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# gain command  (token savings analytics)
+# ---------------------------------------------------------------------------
+
+def cmd_gain(args: argparse.Namespace) -> int:
+    if args.history:
+        from .analytics import history
+        result = history(project_root=args.project_root, limit=20)
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    from .analytics import gain
+    print(gain(project_root=args.project_root, format="json" if args.json else "text"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# compress command  (rtk-style output compression)
+# ---------------------------------------------------------------------------
+
+def cmd_compress(args: argparse.Namespace) -> int:
+    if args.list:
+        from .compress import COMPRESSORS
+        print("Available compressors:")
+        for name in sorted(COMPRESSORS):
+            print(f"  {name}")
+        return 0
+
+    raw = sys.stdin.read()
+
+    if args.tee:
+        from .compress import set_tee_dir, compress_tee
+        set_tee_dir(args.tee)
+        result, tee_path = compress_tee(raw, command=args.type, ultra=args.ultra,
+                                         label=args.tee_label)
+    else:
+        from .compress import compress
+        result = compress(raw, command=args.type, ultra=args.ultra)
+
+    sys.stdout.write(result)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# discover command  (find missed token-saving opportunities)
+# ---------------------------------------------------------------------------
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    from .analytics import discover
+    return discover(args)
+
+
+def cmd_bash_wrapper(args: argparse.Namespace) -> int:
+    """Print bash shell wrapper script for transparent command compression.
+
+    Source the output in .bashrc for automatic compression of 19 command types:
+
+        eval "$(graphsift bash-wrapper)"
+    """
+    from .hooks import get_bash_wrapper_script
+    print(get_bash_wrapper_script(python_path=_python_executable()))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -948,6 +1066,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--project-root", default=_cwd(), help="Repo root (default: cwd)")
     p_install.add_argument("--no-hooks", action="store_true", help="Skip hook injection")
     p_install.add_argument("--no-skills", action="store_true", help="Skip skill file creation")
+    p_install.add_argument("--bash-wrapper", action="store_true", help="Install transparent bash command compression")
 
     # serve
     sub.add_parser("serve", help="Start MCP stdio server (used by Claude Code)")
@@ -1014,6 +1133,32 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("list-repos", help="List all registered repos")
     sub.add_parser("repos", help="List all registered repos (alias for list-repos)")
 
+    # gain
+    p_gain = sub.add_parser("gain", help="Show token savings analytics")
+    p_gain.add_argument("--json", action="store_true", help="Output as JSON")
+    p_gain.add_argument("--history", action="store_true", help="Show analytics history")
+    p_gain.add_argument("--project-root", default=_cwd(), help="Repo root (default: cwd)")
+
+    # compress
+    p_compress = sub.add_parser("compress", help="Compress command output (rtk-style)")
+    p_compress.add_argument("--type", "-t", default="auto",
+                            help="Output type (default: auto-detect)")
+    p_compress.add_argument("--ultra", "-u", action="store_true",
+                            help="Aggressive compression")
+    p_compress.add_argument("--tee", "-e", default=None,
+                            help="Directory to save original (uncompressed) output for tee recovery")
+    p_compress.add_argument("--tee-label", default="output",
+                            help="Filename label for tee save (default: output)")
+    p_compress.add_argument("--list", "-l", action="store_true",
+                            help="List available compressor types and exit")
+
+    # discover
+    p_discover = sub.add_parser("discover", help="Find missed token-saving opportunities")
+    p_discover.add_argument("--project-root", default=_cwd(), help="Repo root (default: cwd)")
+
+    # bash-wrapper
+    sub.add_parser("bash-wrapper", help="Print bash wrapper script for transparent command compression")
+
     return parser
 
 
@@ -1037,6 +1182,10 @@ def main() -> None:
         "unregister": cmd_unregister,
         "list-repos": cmd_list_repos,
         "repos": cmd_repos,
+        "gain": cmd_gain,
+        "compress": cmd_compress,
+        "discover": cmd_discover,
+        "bash-wrapper": cmd_bash_wrapper,
     }
 
     fn = commands.get(args.command)

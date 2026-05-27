@@ -1368,6 +1368,57 @@ def _tool_cross_repo_search(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Compress / Analytics tools
+# ---------------------------------------------------------------------------
+
+
+def _tool_compress_output(params: dict) -> dict:
+    """Compress command output to save 60-90% tokens before sending to LLM."""
+    from graphsift.compress import compress, detect_type as detect_command
+
+    text = params.get("text", "")
+    if not text:
+        return {"error": "text parameter is required"}
+
+    command_type = params.get("command_type", "auto")
+    ultra = params.get("ultra", False)
+
+    original_chars = len(text)
+
+    if command_type == "auto":
+        command_type = detect_command(text)
+
+    compressed = compress(text, command=command_type, ultra=ultra)
+    compressed_chars = len(compressed)
+    savings_pct = round((1 - compressed_chars / max(original_chars, 1)) * 100, 1)
+
+    return {
+        "compressed": compressed,
+        "original_chars": original_chars,
+        "compressed_chars": compressed_chars,
+        "savings_pct": savings_pct,
+        "command_type": command_type,
+    }
+
+
+def _tool_token_gain(params: dict) -> dict:
+    """Show token savings analytics — total calls, tokens saved, estimated cost savings, daily breakdown."""
+    from graphsift.analytics import gain as analytics_gain
+
+    root = params.get("root_path", os.getcwd())
+    result = analytics_gain(project_root=root, format="json")
+    return json.loads(result)
+
+
+def _tool_token_discover(params: dict) -> dict:
+    """Find missed token-saving opportunities — which commands would benefit most from compression."""
+    from graphsift.analytics import discover as analytics_discover
+
+    root = params.get("root_path", os.getcwd())
+    return analytics_discover(project_root=root)
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1798,6 +1849,49 @@ _TOOLS = {
             "properties": {
                 "root_path": {"type": "string"},
                 "force": {"type": "boolean", "description": "Re-embed even if already done (default false)"},
+            },
+        },
+    },
+    "compress_output": {
+        "fn": _tool_compress_output,
+        "description": (
+            "Compress command output to save 60-90% tokens before sending to LLM. "
+            "Supports auto-detection of 18+ command types (pytest, cargo, go test, "
+            "jest, eslint, git, npm, docker, kubectl, aws, etc.)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Raw command output to compress"},
+                "command_type": {"type": "string", "description": "Command type hint, e.g. pytest, cargo, git-status (default: auto)"},
+                "ultra": {"type": "boolean", "description": "Ultra-compact mode — more aggressive filtering (default false)"},
+            },
+            "required": ["text"],
+        },
+    },
+    "token_gain": {
+        "fn": _tool_token_gain,
+        "description": (
+            "Show token savings analytics — total calls, tokens saved, "
+            "estimated cost savings, daily breakdown."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root directory (default: cwd)"},
+            },
+        },
+    },
+    "token_discover": {
+        "fn": _tool_token_discover,
+        "description": (
+            "Find missed token-saving opportunities — which commands "
+            "would benefit most from compression."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root directory (default: cwd)"},
             },
         },
     },

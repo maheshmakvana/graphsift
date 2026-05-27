@@ -14,3 +14,6 @@ htmlcov/
 *.log
 .graphsift/
 docs/gen_images.py
+*.claude/
+.pypirc
+.mcp.json
