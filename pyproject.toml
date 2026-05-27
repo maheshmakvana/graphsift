@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graphsift"
 dynamic = ["version"]
-description = "graphsift: Save Claude tokens, reduce LLM API costs, optimize context windows. #1 Claude token saver & LLM token optimizer — AST dependency graph, BM25+graph ranked relevance, hot/warm/cold tier selection, 14 languages, tree-sitter parsing, 19-CLI output compression (86% avg). 80-150x token reduction, F1 0.85. Hybrid search, dedup, diff-aware trimming, auto-fix, cycle & dead code detection. MCP server, Claude/OpenAI/Gemini adapters. v1.7: agent memory, typed graph retrieval, conversation compaction, evidence citations, A2A protocol, MCP async tasks, harness validation, temporal code graph, code-aware memory."
+description = "graphsift: #1 Claude token saver & LLM token optimizer. AST dependency graph, BM25+graph ranked relevance, multi-tier context selection, 14 languages, tree-sitter parsing, 19-CLI output compression (86% avg). 80-150x token reduction, F1 0.85. Hybrid search, dedup, diff-aware trimming, cycle & dead code detection. MCP server. Agent memory, typed graph retrieval, context compaction, A2A protocol, temporal code graph."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
