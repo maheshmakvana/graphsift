@@ -7,8 +7,6 @@ import pytest
 
 from graphsift import (
     AnalysisPipeline,
-    CircuitBreaker,
-    CircuitState,
     graphsiftError,
     ContextBuilder,
     ContextConfig,
@@ -16,12 +14,10 @@ from graphsift import (
     DiffSpec,
     DiffValidator,
     GraphCache,
-    RateLimiter,
     ValidationError,
     async_batch_build,
     async_stream_context,
     batch_index,
-    get_rate_limiter,
     stream_context,
 )
 
@@ -244,57 +240,7 @@ def test_async_batch_build(builder, source_map, diff_spec):
 
 
 # ---------------------------------------------------------------------------
-# 5. RateLimiter
-# ---------------------------------------------------------------------------
-
-
-def test_rate_limiter_acquire():
-    rl = RateLimiter(rate=100, capacity=10)
-    rl.acquire(1)
-    assert rl.stats()["total_acquired"] == 1
-
-
-def test_rate_limiter_context_manager():
-    rl = RateLimiter(rate=100, capacity=10)
-    with rl:
-        pass
-    assert rl.stats()["total_acquired"] == 1
-
-
-def test_rate_limiter_async_context_manager():
-    rl = RateLimiter(rate=100, capacity=10)
-
-    async def run():
-        async with rl:
-            pass
-
-    asyncio.run(run())
-    assert rl.stats()["total_acquired"] == 1
-
-
-def test_rate_limiter_stats_keys():
-    rl = RateLimiter(rate=10, capacity=10, key="test")
-    rl.acquire()
-    stats = rl.stats()
-    assert "key" in stats
-    assert "total_acquired" in stats
-    assert "avg_wait_ms" in stats
-    assert "available_tokens" in stats
-
-
-def test_get_rate_limiter_singleton():
-    a = get_rate_limiter("repo-1")
-    b = get_rate_limiter("repo-1")
-    assert a is b
-
-
-def test_rate_limiter_repr():
-    rl = RateLimiter(rate=5, capacity=5, key="x")
-    assert "RateLimiter" in repr(rl)
-
-
-# ---------------------------------------------------------------------------
-# 6. Streaming
+# 5. Streaming
 # ---------------------------------------------------------------------------
 
 
@@ -373,197 +319,7 @@ def test_context_diff_repr(builder, source_map, diff_spec):
 
 
 # ---------------------------------------------------------------------------
-# 8. CircuitBreaker
-# ---------------------------------------------------------------------------
-
-
-def test_circuit_breaker_closed_by_default():
-    cb = CircuitBreaker(failure_threshold=3)
-    assert cb.state == CircuitState.CLOSED
-
-
-def test_circuit_breaker_opens_after_failures():
-    cb = CircuitBreaker(failure_threshold=3, reset_timeout=60)
-
-    def fail():
-        raise ValueError("boom")
-
-    for _ in range(3):
-        try:
-            cb.call(fail)
-        except ValueError:
-            pass
-    assert cb.state == CircuitState.OPEN
-
-
-def test_circuit_breaker_rejects_when_open():
-    cb = CircuitBreaker(failure_threshold=1, reset_timeout=60)
-
-    def fail():
-        raise RuntimeError("x")
-
-    try:
-        cb.call(fail)
-    except RuntimeError:
-        pass
-
-    with pytest.raises(graphsiftError):
-        cb.call(lambda: "ok")
-
-
-def test_circuit_breaker_half_open_after_timeout():
-    cb = CircuitBreaker(failure_threshold=1, reset_timeout=0.05)
-
-    def fail():
-        raise RuntimeError()
-
-    try:
-        cb.call(fail)
-    except RuntimeError:
-        pass
-
-    time.sleep(0.1)
-    assert cb.state == CircuitState.HALF_OPEN
-
-
-def test_circuit_breaker_closes_on_success():
-    cb = CircuitBreaker(failure_threshold=1, reset_timeout=0.05)
-
-    def fail():
-        raise RuntimeError()
-
-    try:
-        cb.call(fail)
-    except RuntimeError:
-        pass
-
-    time.sleep(0.1)
-    result = cb.call(lambda: 42)
-    assert result == 42
-    assert cb.state == CircuitState.CLOSED
-
-
-def test_circuit_breaker_protect_decorator():
-    cb = CircuitBreaker(failure_threshold=5)
-
-    @cb.protect
-    def double(x: int) -> int:
-        return x * 2
-
-    assert double(5) == 10
-
-
-def test_circuit_breaker_stats():
-    cb = CircuitBreaker()
-    cb.call(lambda: None)
-    stats = cb.stats()
-    assert "state" in stats
-    assert "failures" in stats
-    assert "total_calls" in stats
-    assert stats["total_calls"] == 1
-
-
-def test_circuit_breaker_reset():
-    cb = CircuitBreaker(failure_threshold=1, reset_timeout=60)
-
-    def fail():
-        raise RuntimeError()
-
-    try:
-        cb.call(fail)
-    except RuntimeError:
-        pass
-
-    cb.reset()
-    assert cb.state == CircuitState.CLOSED
-
-
-def test_circuit_breaker_repr():
-    cb = CircuitBreaker()
-    assert "CircuitBreaker" in repr(cb)
-
-
-# ---------------------------------------------------------------------------
-# 9. RetryStrategy
-# ---------------------------------------------------------------------------
-
-from graphsift import RetryStrategy  # noqa: E402
-
-
-def test_retry_strategy_succeeds_first_try():
-    strategy = RetryStrategy(max_attempts=3, base_delay=0.01)
-    result = strategy.call(lambda: 42)
-    assert result == 42
-    assert strategy.audit_log() == []
-
-
-def test_retry_strategy_retries_and_succeeds():
-    attempts = [0]
-
-    def flaky():
-        attempts[0] += 1
-        if attempts[0] < 3:
-            raise ValueError("not yet")
-        return "ok"
-
-    strategy = RetryStrategy(max_attempts=4, base_delay=0.01, jitter=False)
-    result = strategy.call(flaky)
-    assert result == "ok"
-    assert attempts[0] == 3
-    assert len(strategy.audit_log()) == 2  # 2 failures before success
-
-
-def test_retry_strategy_exhausts_and_raises():
-    strategy = RetryStrategy(max_attempts=2, base_delay=0.01, jitter=False)
-    with pytest.raises(RuntimeError):
-        strategy.call(lambda: (_ for _ in ()).throw(RuntimeError("fail")))
-
-
-def test_retry_strategy_no_retry_on_unmatched():
-    strategy = RetryStrategy(max_attempts=3, base_delay=0.01, retry_on=(TimeoutError,))
-    with pytest.raises(ValueError):
-        strategy.call(lambda: (_ for _ in ()).throw(ValueError("wrong type")))
-    assert strategy.audit_log() == []  # not retried
-
-
-def test_retry_strategy_decorator():
-    calls = [0]
-
-    strategy = RetryStrategy(max_attempts=3, base_delay=0.01, jitter=False)
-
-    @strategy.retry
-    def fragile():
-        calls[0] += 1
-        if calls[0] < 2:
-            raise OSError("retry me")
-        return "done"
-
-    assert fragile() == "done"
-    assert calls[0] == 2
-
-
-def test_retry_strategy_repr():
-    s = RetryStrategy(max_attempts=5, base_delay=1.0)
-    assert "RetryStrategy" in repr(s)
-
-
-@pytest.mark.asyncio
-async def test_retry_strategy_acall():
-    calls = [0]
-
-    async def async_fn():
-        calls[0] += 1
-        if calls[0] < 2:
-            raise OSError("retry")
-        return "async_ok"
-
-    strategy = RetryStrategy(max_attempts=3, base_delay=0.01, jitter=False)
-    result = await strategy.acall(async_fn)
-    assert result == "async_ok"
-
-
-# ---------------------------------------------------------------------------
-# 10. SchemaEvolution
+# 8. SchemaEvolution
 # ---------------------------------------------------------------------------
 
 from graphsift import SchemaEvolution  # noqa: E402

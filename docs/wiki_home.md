@@ -244,11 +244,8 @@ Ten advanced feature categories provide production-grade infrastructure:
 - Smart Cache: GraphCache provides LRU plus TTL caching with a memoize decorator, thread-safe access, and cache hit rate statistics
 - Analysis Pipeline: AnalysisPipeline chains processing steps with retry logic and full audit traceability for each step
 - Async Batch: batch_index and async_batch_build process multiple repositories or diffs concurrently with bounded semaphore control
-- Streaming: stream_context yields scored file batches as they are ranked, enabling progressive rendering in the LLM prompt
-- Rate Limiter: token-bucket rate limiter with per-key tracking and statistics, wrapping any LLM call in a context manager
+- Streaming: stream_context yields scored file batches as they are ranked, enabling progressive rendering
 - Diff Engine: ContextDiff compares two ContextResult objects to show exactly how configuration changes affect token usage and file selection
-- Circuit Breaker: CircuitBreaker with three states (closed, open, half-open) prevents cascading failures when LLM APIs are degraded
-- Retry: configurable retry logic with exponential backoff and jitter for transient API failures
 - Schema Evolution: six-version SQLite migration history ensures forward and backward compatibility of the graph database as the schema evolves
 - Audit Trail: every context building operation records its inputs, parameters, and outputs for full traceability
 

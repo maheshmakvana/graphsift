@@ -1,14 +1,12 @@
 """Advanced capabilities for graphsift.
 
-8 mandate categories:
 1. Smart Cache       — LRU+TTL graph cache, .memoize(), .stats(), thread-safe
-2. Pipeline          — staged analysis pipeline, .arun(), audit log, .with_retry()
+2. Pipeline          — staged analysis pipeline, .arun(), audit log
 3. Validator         — declarative diff/context validation DSL
 4. Async Batch       — async_batch_index() + sync batch_index(), bounded semaphore
-5. Rate Limiter      — token-bucket for LLM API calls, per-key, .stats()
-6. Streaming         — async generator yielding ScoredFile chunks
-7. Diff Engine       — structural diff of two ContextResults, .summary(), .to_json()
-8. Circuit Breaker   — protects LLM API calls from cascading failures
+5. Streaming         — async generator yielding ScoredFile chunks
+6. Diff Engine       — structural diff of two ContextResults, .summary(), .to_json()
+7. Schema Evolution  — versioned model migration, compatibility checks
 """
 
 from __future__ import annotations
@@ -22,7 +20,6 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable, Generator
 from dataclasses import dataclass, field
-from enum import Enum
 from functools import wraps
 from typing import Any, Generic, TypeVar
 
@@ -38,7 +35,6 @@ from .models import ContextConfig, IndexStats, ScoredFile
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-R = TypeVar("R")
 
 
 # ===========================================================================
@@ -483,114 +479,7 @@ async def async_batch_build(
 
 
 # ===========================================================================
-# 5. Rate Limiter — token bucket, per-key, sync+async context manager
-# ===========================================================================
-
-
-class RateLimiter:
-    """Token-bucket rate limiter for LLM API calls.
-
-    Args:
-        rate: Tokens replenished per second.
-        capacity: Bucket max capacity.
-        key: Optional per-key label.
-
-    Example::
-
-        limiter = RateLimiter(rate=5, capacity=5, key="claude")
-        with limiter:
-            response, meta = adapter.review(...)
-
-        async with limiter:
-            response, meta = await async_review(...)
-    """
-
-    def __init__(self, rate: float = 5.0, capacity: float = 5.0, key: str = "default") -> None:
-        if rate <= 0 or capacity <= 0:
-            raise ConfigurationError("rate and capacity must be > 0.")
-        self._rate = rate
-        self._capacity = capacity
-        self._key = key
-        self._tokens = capacity
-        self._last = time.monotonic()
-        self._lock = threading.RLock()
-        self._acquired = 0
-        self._waited_ms = 0.0
-
-    def __repr__(self) -> str:
-        return f"RateLimiter(key={self._key!r}, rate={self._rate}/s)"
-
-    def _refill(self) -> None:
-        now = time.monotonic()
-        self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
-        self._last = now
-
-    def acquire(self, n: float = 1.0) -> None:
-        """Block until n tokens available."""
-        t0 = time.monotonic()
-        while True:
-            with self._lock:
-                self._refill()
-                if self._tokens >= n:
-                    self._tokens -= n
-                    self._acquired += 1
-                    self._waited_ms += (time.monotonic() - t0) * 1000
-                    return
-            time.sleep(1.0 / self._rate)
-
-    async def aacquire(self, n: float = 1.0) -> None:
-        """Async acquire."""
-        t0 = time.monotonic()
-        while True:
-            with self._lock:
-                self._refill()
-                if self._tokens >= n:
-                    self._tokens -= n
-                    self._acquired += 1
-                    self._waited_ms += (time.monotonic() - t0) * 1000
-                    return
-            await asyncio.sleep(1.0 / self._rate)
-
-    def stats(self) -> dict[str, Any]:
-        """Return rate limiter stats."""
-        with self._lock:
-            self._refill()
-            return {
-                "key": self._key,
-                "total_acquired": self._acquired,
-                "avg_wait_ms": round(self._waited_ms / max(self._acquired, 1), 2),
-                "available_tokens": round(self._tokens, 2),
-            }
-
-    def __enter__(self) -> "RateLimiter":
-        self.acquire()
-        return self
-
-    def __exit__(self, *_: Any) -> None:
-        pass
-
-    async def __aenter__(self) -> "RateLimiter":
-        await self.aacquire()
-        return self
-
-    async def __aexit__(self, *_: Any) -> None:
-        pass
-
-
-_key_limiters: dict[str, RateLimiter] = {}
-_key_lock = threading.RLock()
-
-
-def get_rate_limiter(key: str, rate: float = 5.0, capacity: float = 5.0) -> RateLimiter:
-    """Get or create a per-key RateLimiter singleton."""
-    with _key_lock:
-        if key not in _key_limiters:
-            _key_limiters[key] = RateLimiter(rate=rate, capacity=capacity, key=key)
-        return _key_limiters[key]
-
-
-# ===========================================================================
-# 6. Streaming — async generator yielding ScoredFile batches
+# 5. Streaming — async generator yielding ScoredFile batches
 # ===========================================================================
 
 
@@ -654,7 +543,7 @@ def stream_context(
 
 
 # ===========================================================================
-# 7. Diff Engine — compare two ContextResults, .summary(), .to_json()
+# 6. Diff Engine — compare two ContextResults, .summary(), .to_json()
 # ===========================================================================
 
 
@@ -756,343 +645,7 @@ class ContextDiff:
 
 
 # ===========================================================================
-# 8. Circuit Breaker — closed/open/half-open, auto-reset, .protect()
-# ===========================================================================
-
-
-class CircuitState(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-class CircuitBreaker:
-    """Circuit breaker protecting LLM API calls from cascading failures.
-
-    Opens after failure_threshold consecutive failures, auto-resets
-    after reset_timeout seconds via HALF_OPEN probe.
-
-    Args:
-        failure_threshold: Failures before opening.
-        reset_timeout: Seconds before OPEN→HALF_OPEN transition.
-        expected_exception: Exception type(s) counted as failures.
-
-    Example::
-
-        cb = CircuitBreaker(failure_threshold=3, reset_timeout=60)
-
-        @cb.protect
-        def call_claude(prompt: str) -> str:
-            ...
-    """
-
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        reset_timeout: float = 60.0,
-        expected_exception: type[Exception] | tuple[type[Exception], ...] = Exception,
-    ) -> None:
-        if failure_threshold < 1:
-            raise ConfigurationError("failure_threshold must be >= 1.")
-        self._threshold = failure_threshold
-        self._timeout = reset_timeout
-        self._expected = expected_exception
-        self._state = CircuitState.CLOSED
-        self._failures = 0
-        self._last_opened: float | None = None
-        self._lock = threading.RLock()
-        self._total = 0
-        self._rejected = 0
-
-    def __repr__(self) -> str:
-        return f"CircuitBreaker(state={self._state.value}, {self._failures}/{self._threshold})"
-
-    @property
-    def state(self) -> CircuitState:
-        with self._lock:
-            self._maybe_half_open()
-            return self._state
-
-    def _maybe_half_open(self) -> None:
-        if (
-            self._state == CircuitState.OPEN
-            and self._last_opened is not None
-            and time.monotonic() - self._last_opened >= self._timeout
-        ):
-            self._state = CircuitState.HALF_OPEN
-
-    def _on_success(self) -> None:
-        with self._lock:
-            self._failures = 0
-            self._state = CircuitState.CLOSED
-
-    def _on_failure(self) -> None:
-        with self._lock:
-            self._failures += 1
-            if self._state == CircuitState.HALF_OPEN or self._failures >= self._threshold:
-                self._state = CircuitState.OPEN
-                self._last_opened = time.monotonic()
-
-    def call(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """Execute fn through the circuit breaker."""
-        with self._lock:
-            self._maybe_half_open()
-            if self._state == CircuitState.OPEN:
-                self._rejected += 1
-                raise graphsiftError(
-                    f"Circuit OPEN (failures={self._failures}). Retry in {self._timeout}s."
-                )
-            self._total += 1
-        try:
-            result = fn(*args, **kwargs)
-            self._on_success()
-            return result
-        except self._expected:
-            self._on_failure()
-            raise
-
-    def protect(self, fn: Callable[..., T]) -> Callable[..., T]:
-        """Decorator: wrap function with circuit breaker."""
-
-        @wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            return self.call(fn, *args, **kwargs)
-
-        return wrapper
-
-    def stats(self) -> dict[str, Any]:
-        """Return circuit breaker stats."""
-        with self._lock:
-            self._maybe_half_open()
-            return {
-                "state": self._state.value,
-                "failures": self._failures,
-                "threshold": self._threshold,
-                "total_calls": self._total,
-                "rejected_calls": self._rejected,
-            }
-
-    def reset(self) -> None:
-        """Manually reset to CLOSED."""
-        with self._lock:
-            self._state = CircuitState.CLOSED
-            self._failures = 0
-            self._last_opened = None
-
-
-# ===========================================================================
-# 9. Retry Strategy — exponential backoff with jitter, per-exception routing
-# ===========================================================================
-
-
-@dataclass
-class _RetryAttempt:
-    attempt: int
-    exception: Exception
-    delay_ms: float
-    exc_type: str
-
-
-class RetryStrategy:
-    """Exponential backoff with jitter and per-exception routing.
-
-    Supports deadline (max wall-clock seconds), per-exception class routing
-    (retry only specific errors, fail fast on others), and per-attempt audit log.
-
-    Args:
-        max_attempts: Maximum total attempts (including first).
-        base_delay: Initial retry delay in seconds.
-        max_delay: Cap on computed delay (before jitter).
-        jitter: If True, multiply computed delay by random(0.5, 1.5).
-        deadline: Optional max wall-clock seconds from first call.
-        retry_on: Exception types to retry; None = retry on all exceptions.
-
-    Example::
-
-        strategy = RetryStrategy(max_attempts=4, base_delay=0.5, retry_on=(TimeoutError,))
-
-        @strategy.retry
-        def call_api(prompt: str) -> str:
-            ...
-
-        result = strategy.call(call_api, prompt)
-        print(strategy.audit_log())
-    """
-
-    def __init__(
-        self,
-        max_attempts: int = 3,
-        base_delay: float = 0.5,
-        max_delay: float = 30.0,
-        jitter: bool = True,
-        deadline: float | None = None,
-        retry_on: tuple[type[Exception], ...] | None = None,
-    ) -> None:
-        if max_attempts < 1:
-            raise ConfigurationError("max_attempts must be >= 1.")
-        if base_delay <= 0:
-            raise ConfigurationError("base_delay must be > 0.")
-        self._max_attempts = max_attempts
-        self._base = base_delay
-        self._max_delay = max_delay
-        self._jitter = jitter
-        self._deadline = deadline
-        self._retry_on = retry_on
-        self._log: list[_RetryAttempt] = []
-        self._lock = threading.RLock()
-
-    def __repr__(self) -> str:
-        return (
-            f"RetryStrategy(max={self._max_attempts}, base={self._base}s, "
-            f"jitter={self._jitter})"
-        )
-
-    def _compute_delay(self, attempt: int) -> float:
-        import random  # noqa: PLC0415
-
-        delay = min(self._base * (2 ** attempt), self._max_delay)
-        if self._jitter:
-            delay *= random.uniform(0.5, 1.5)
-        return delay
-
-    def _should_retry(self, exc: Exception) -> bool:
-        if self._retry_on is None:
-            return True
-        return isinstance(exc, self._retry_on)
-
-    def call(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-        """Execute fn with retry strategy.
-
-        Args:
-            fn: Callable to invoke.
-            *args: Positional arguments for fn.
-            **kwargs: Keyword arguments for fn.
-
-        Returns:
-            Return value of fn on success.
-
-        Raises:
-            The last exception raised after all retries exhausted.
-            graphsiftError: If deadline exceeded.
-        """
-        import random  # noqa: PLC0415
-        import time  # noqa: PLC0415
-
-        with self._lock:
-            self._log = []
-
-        t_start = time.monotonic()
-        last_exc: Exception | None = None
-
-        for attempt in range(self._max_attempts):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-                if not self._should_retry(exc):
-                    raise
-
-                delay = self._compute_delay(attempt)
-                with self._lock:
-                    self._log.append(_RetryAttempt(
-                        attempt=attempt + 1,
-                        exception=exc,
-                        delay_ms=round(delay * 1000, 1),
-                        exc_type=type(exc).__name__,
-                    ))
-
-                if attempt + 1 >= self._max_attempts:
-                    break
-
-                if self._deadline is not None:
-                    elapsed = time.monotonic() - t_start
-                    if elapsed + delay > self._deadline:
-                        raise graphsiftError(
-                            f"RetryStrategy: deadline {self._deadline}s exceeded after {elapsed:.1f}s."
-                        ) from exc
-
-                time.sleep(delay)
-
-        raise last_exc  # type: ignore[misc]
-
-    async def acall(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Async version of call — wraps blocking fn via asyncio.to_thread.
-
-        Args:
-            fn: Callable to invoke (sync or async).
-            *args: Positional arguments.
-            **kwargs: Keyword arguments.
-
-        Returns:
-            Return value of fn on success.
-        """
-        import asyncio as _asyncio  # noqa: PLC0415
-        import time  # noqa: PLC0415
-
-        with self._lock:
-            self._log = []
-
-        t_start = time.monotonic()
-        last_exc: Exception | None = None
-
-        for attempt in range(self._max_attempts):
-            try:
-                if _asyncio.iscoroutinefunction(fn):
-                    return await fn(*args, **kwargs)
-                return await _asyncio.to_thread(fn, *args, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-                if not self._should_retry(exc):
-                    raise
-
-                delay = self._compute_delay(attempt)
-                with self._lock:
-                    self._log.append(_RetryAttempt(
-                        attempt=attempt + 1,
-                        exception=exc,
-                        delay_ms=round(delay * 1000, 1),
-                        exc_type=type(exc).__name__,
-                    ))
-
-                if attempt + 1 >= self._max_attempts:
-                    break
-
-                if self._deadline is not None:
-                    elapsed = time.monotonic() - t_start
-                    if elapsed + delay > self._deadline:
-                        raise graphsiftError(
-                            f"RetryStrategy: deadline exceeded."
-                        ) from exc
-
-                await _asyncio.sleep(delay)
-
-        raise last_exc  # type: ignore[misc]
-
-    def retry(self, fn: Callable[..., T]) -> Callable[..., T]:
-        """Decorator: wrap function with this retry strategy."""
-
-        @wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
-            return self.call(fn, *args, **kwargs)
-
-        return wrapper
-
-    def audit_log(self) -> list[dict[str, Any]]:
-        """Return per-attempt audit records (attempt, exc type, delay ms)."""
-        with self._lock:
-            return [
-                {
-                    "attempt": r.attempt,
-                    "exc_type": r.exc_type,
-                    "error": str(r.exception),
-                    "delay_ms": r.delay_ms,
-                }
-                for r in self._log
-            ]
-
-
-# ===========================================================================
-# 10. Schema Evolution — versioned model migration, compatibility checks
+# 7. Schema Evolution — versioned model migration, compatibility checks
 # ===========================================================================
 
 
