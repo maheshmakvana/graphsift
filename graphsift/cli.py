@@ -1015,6 +1015,24 @@ def cmd_compress(args: argparse.Namespace) -> int:
             print(f"  {name}")
         return 0
 
+    # Detect interactive terminal (no piped input) and show help
+    if sys.stdin.isatty():
+        print("graphsift compress: pipe command output into me to save tokens.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Usage:", file=sys.stderr)
+        print("  pytest -v | graphsift compress", file=sys.stderr)
+        print("  git diff  | graphsift compress", file=sys.stderr)
+        print("  docker ps | graphsift compress", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Available compressors:", file=sys.stderr)
+        from .compress import COMPRESSORS
+        for name in sorted(COMPRESSORS):
+            print(f"  {name}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Transparent mode: eval \"$(graphsift bash-wrapper)\" to auto-compress all supported commands.",
+              file=sys.stderr)
+        return 1
+
     raw = sys.stdin.read()
 
     if args.tee:

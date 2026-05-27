@@ -14,6 +14,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Downloads](https://img.shields.io/pypi/dm/graphsift.svg)](https://pypi.org/project/graphsift/)
 [![GitHub stars](https://img.shields.io/github/stars/maheshmakvana/graphsift.svg)](https://github.com/maheshmakvana/graphsift)
+[![tests](https://img.shields.io/badge/tests-271%20passed-blue)](https://github.com/maheshmakvana/graphsift/actions)
+[![MCP tools](https://img.shields.io/badge/MCP%20tools-25-orange)](https://github.com/maheshmakvana/graphsift)
+[![compressors](https://img.shields.io/badge/compressors-19-green)](https://github.com/maheshmakvana/graphsift)
 
 ---
 
@@ -61,20 +64,26 @@ Beyond code review, graphsift saves Claude tokens on command output too. Every `
 
 | Command | Original tokens | Compressed tokens | **Claude tokens saved** |
 |---|---|---|---|
-| `pytest -v` (45 tests) | 3,544 tk | 224 tk | **94%** |
-| `git diff` (2 files) | 2,320 tk | 184 tk | **92%** |
-| `docker ps` (10 images) | 728 tk | 68 tk | **91%** |
-| `grep -r` (25 results) | 1,756 tk | 44 tk | **97%** |
-| `kubectl get all` | 1,308 tk | 332 tk | **75%** |
-| `npm install` output | 548 tk | 92 tk | **83%** |
-| `git log` (3 commits) | 996 tk | 184 tk | **82%** |
-| `eslint` (9 problems) | 928 tk | 212 tk | **77%** |
-| `pip install` (7 pkgs) | 904 tk | 124 tk | **86%** |
-| `git status` | 712 tk | 124 tk | **83%** |
-| App logs (16 lines) | 1,356 tk | 532 tk | **61%** |
-| **Weighted average** | **3,775 tk** | **530 tk** | **86%** |
+| `grep -r` (25 results) | 413 tk | 22 tk | **95%** |
+| `eslint` (12 problems) | 308 tk | 17 tk | **94%** |
+| `git diff` (2 files) | 889 tk | 60 tk | **93%** |
+| `pytest -v` (45 tests) | 1,334 tk | 136 tk | **90%** |
+| `npm install` output | 288 tk | 39 tk | **87%** |
+| `docker ps` (10 images) | 463 tk | 63 tk | **86%** |
+| `git status` | 174 tk | 25 tk | **86%** |
+| `pip install` (7 pkgs) | 312 tk | 47 tk | **85%** |
+| `cargo build` | 463 tk | 80 tk | **83%** |
+| `kubectl get all` | 581 tk | 110 tk | **81%** |
+| `git log` (3 commits) | 234 tk | 47 tk | **80%** |
+| `make` output | 250 tk | 55 tk | **78%** |
+| `aws` CLI JSON | 477 tk | 115 tk | **76%** |
+| `jest` (10 tests) | 310 tk | 76 tk | **75%** |
+| `go test` | 284 tk | 74 tk | **74%** |
+| App logs (16 lines) | 402 tk | 155 tk | **61%** |
+| `cat` (large file) | 672 tk | 479 tk | **29%** |
+| **Weighted average** | **8,138 tk** | **1,884 tk** | **77%** |
 
-At 100 CLI commands/day piped to Claude, that's **~325,000 tokens saved per day** — roughly **$4.87/day saved** on Claude Opus pricing.
+At 100 CLI commands/day piped to Claude, that's **~625,000 tokens saved per day** — roughly **$9.37/day saved** on Claude Opus pricing.
 
 ---
 
@@ -160,11 +169,11 @@ graphsift treats context selection as a **ranking problem**, not a graph travers
 | **Languages** | Python only | **14 languages** |
 | **Incremental indexing** | None | SHA-256 skip for unchanged files |
 | **Monorepo** | None | `index_roots()` for multi-package repos |
-| **MCP server** | No | Full MCP protocol + 7 token-saving tools |
+| **MCP server** | No | Full MCP protocol + 25 token-saving tools |
 | **CLI** | No | install / serve / build / status / compress / gain |
 | **SQLite persistence** | No | 6-version GraphStore with migrations |
 | **Cache-aware output** | No | Anthropic/OpenAI cache breakpoints |
-| **Output compression** | No | **19 CLI command compressors (86% avg savings)** |
+| **Output compression** | No | **19 CLI command compressors (77% avg savings)** |
 | **Analytics** | No | Token savings tracking + discovery |
 | **Test coverage** | Unknown | 271 tests, >80% coverage |
 
@@ -201,8 +210,10 @@ graphsift treats context selection as a **ranking problem**, not a graph travers
 - **Token analytics** — cumulative tracking, daily breakdown, cost estimates, opportunity discovery
 
 ### Developer Experience
-- **Full MCP server** — compatible with Claude desktop, Claude Code, Cursor, any MCP client
-- **7 MCP tools** — index, build, search, status, compress_output, token_gain, token_discover
+- **Full MCP server** — compatible with Claude Code, Cursor, Copilot, Windsurf, Codex, Gemini and 23+ MCP clients
+- **25 MCP tools** — build/update graph, get_context, get_impact, detect_changes, query_graph, search_symbols, list_flows, list_communities, get_architecture_overview, refactor, apply_refactor, generate_wiki, semantic_search_nodes, cross_repo_search, and more
+- **4 MCP prompts** — review_code, analyze_impact, find_issues, explain_architecture
+- **10 MCP resources** — graph stats, architecture overview, communities, flows, wiki pages, risk index
 - **CLI** — `graphsift install / serve / build / status / compress / gain / discover`
 - **Drop-in adapters** — Claude/Anthropic, OpenAI/Codex, Gemini (Google)
 - **10 advanced features** — cache, pipeline, validator, async batch, rate limiter, streaming, diff engine, circuit breaker, retry, schema evolution
@@ -367,25 +378,25 @@ pytest -v | graphsift compress --tee ~/.graphsift/tee --tee-label pytest_run
 
 | Compressor | What it compresses | Strategy | **Token savings** |
 |---|---|---|---|
-| `pytest` | Test runs | Keep assertions + failures, strip tracebacks | **94%** |
-| `grep` | Search results | Group by match, dedup identical lines | **97%** |
-| `git_diff` | Git diffs | Per-file path + first 3 changed lines | **92%** |
-| `docker` | docker ps/images | ID + name/status, cap at 40 | **91%** |
-| `pip` | pip install | Final summary + errors only | **86%** |
-| `git_status` | git status | Branch + staged/unstaged/untracked counts | **83%** |
-| `npm` | npm/yarn | Error headers + conflict summary + counts | **83%** |
-| `git_log` | git log | Last 5 commits, hash + subject only | **82%** |
-| `eslint` | ESLint output | Per-file error/warning counts | **77%** |
-| `kubectl` | kubectl get | Header + first 5 rows, compress whitespace | **75%** |
+| `grep` | Search results | Group by match, dedup identical lines | **95%** |
+| `eslint` | ESLint output | Per-file error/warning counts | **94%** |
+| `git_diff` | Git diffs | Per-file path + first 3 changed lines | **93%** |
+| `pytest` | Test runs | Keep assertions + failures, strip tracebacks | **90%** |
+| `npm` | npm/yarn | Error headers + conflict summary + counts | **87%** |
+| `docker` | docker ps/images | ID + name/status, cap at 40 | **86%** |
+| `git_status` | git status | Branch + staged/unstaged/untracked counts | **86%** |
+| `pip` | pip install | Final summary + errors only | **85%** |
+| `cargo` | Rust builds | Keep errors + warnings + Finished line | **83%** |
+| `kubectl` | kubectl get | Header + first 5 rows, compress whitespace | **81%** |
+| `git_log` | git log | Last 5 commits, hash + subject only | **80%** |
+| `make` | make output | Error + *** lines only | **78%** |
+| `aws` | AWS CLI JSON | Compact large JSON, keep keys + primitives | **76%** |
+| `jest` | JavaScript tests | Keep FAIL/PASS + snapshot summary | **75%** |
+| `go_test` | Go tests | Keep FAIL lines + panics + summary | **74%** |
 | `log` | App logs | Strip timestamps, keep ERROR/FATAL, dedup WARN | **61%** |
-| `cargo` | Rust builds | Keep errors + warnings + Finished line | — |
-| `go_test` | Go tests | Keep FAIL lines + panics + summary | — |
-| `jest` | JavaScript tests | Keep FAIL/PASS + snapshot summary | — |
-| `make` | make output | Error + *** lines only | — |
-| `aws` | AWS CLI JSON | Compact large JSON, keep keys + primitives | — |
-| `cat` | File output | Truncate to 40 head + 20 tail | — |
+| `cat` | File output | Truncate to 40 head + 20 tail | **29%** |
 | `json_output` | Any JSON | Compact small, strip large to keys + primitives | — |
-| `generic` | Anything | Strip blanks, dedup, truncate at 200 lines | — |
+| `generic` | Anything | Strip blanks, dedup, truncate at 200 lines | **60%** |
 
 ### Transparent Bash Compression — Never Think About Token Savings
 
@@ -423,9 +434,9 @@ print(discover('.'))  # Missed opportunities
 
 ## MCP Server — Save Claude Tokens Inside Claude Code
 
-![graphsift MCP server save Claude tokens — 7 tools, 87% average token reduction per tool call vs reading raw files, compress_output, token_gain analytics](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/token_savings_chart.png)
+![graphsift MCP server save Claude tokens — 25 tools, 4 prompts, 10 resources, 77% average token reduction per tool call vs reading raw files](https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/token_savings_chart.png)
 
-graphsift's MCP server is the easiest way to **save Claude tokens inside Claude Code**, Claude desktop, Cursor, or any MCP-compatible agent. Average **87% token reduction per tool call**.
+graphsift's MCP server is the easiest way to **save Claude tokens inside Claude Code**, Claude desktop, Cursor, or any MCP-compatible agent. Average **77% token reduction per tool call**.
 
 ```bash
 graphsift install   # auto-configures .mcp.json and hooks
@@ -433,15 +444,34 @@ graphsift install   # auto-configures .mcp.json and hooks
 
 ### MCP Tools — Each Designed to Save Claude Tokens
 
-| Tool | What it does | **Claude tokens saved** |
+| Tool | What it does | **Category** |
 |---|---|---|
-| `graphsift_index` | Index files into the dependency graph | — |
-| `graphsift_build` | Build token-budget-capped context for a diff | **93%** |
-| `graphsift_search` | Hybrid BM25+vector semantic search across the graph | **85%** |
-| `graphsift_status` | Show indexing stats + token savings metrics | **75%** |
-| `compress_output` | Compress CLI output (19 types, auto-detect) | **86%** |
-| `token_gain` | Cumulative savings: calls, tokens, cost estimates | — |
-| `token_discover` | Find missed token-saving opportunities | — |
+| `build_graph` | Index all source files and build the dependency graph | Graph |
+| `update_graph` | Incrementally update graph with only changed files | Graph |
+| `get_context` | Build ranked, token-budget-capped context for a diff | Context |
+| `get_impact` | Return blast radius — all files potentially affected by changes | Impact |
+| `graph_status` | Check if graph is built and see current stats | Status |
+| `search_symbols` | Search for functions, classes, or modules by name | Search |
+| `list_files` | List all indexed files sorted by token count | Files |
+| `get_file_context` | Retrieve full source of a specific indexed file | Files |
+| `minimal_context` | Ultra-low-token context — signatures only, no bodies | Context |
+| `clear_graph` | Clear in-memory graph, forcing full rebuild | Graph |
+| `run_postprocess` | Run flow/community detection, FTS rebuild, risk scoring | Analysis |
+| `detect_changes` | Detect changed files with risk-scored impact analysis | Impact |
+| `query_graph` | Run predefined queries: callers_of, callees_of, imports_of, etc. | Query |
+| `list_flows` | List detected execution flows sorted by criticality | Analysis |
+| `get_flow` | Get detailed info about a single execution flow | Analysis |
+| `get_affected_flows` | Find execution flows that pass through changed files | Impact |
+| `list_communities` | List detected code communities sorted by size | Analysis |
+| `get_community` | Get details about a single code community | Analysis |
+| `get_architecture_overview` | Generate architecture overview with communities and risk files | Analysis |
+| `refactor` | Rename preview, dead-code detection, or suggestions | Refactor |
+| `apply_refactor` | Apply a previously previewed rename to source files | Refactor |
+| `generate_wiki` | Generate markdown wiki pages from community structure | Docs |
+| `get_wiki_page` | Get a specific wiki page by community name | Docs |
+| `semantic_search_nodes` | Search code symbols by name or keyword (FTS5-powered) | Search |
+| `list_repos` | List all registered repositories in the registry | Registry |
+| `cross_repo_search` | Search across all registered repositories | Search |
 
 ---
 
@@ -730,6 +760,53 @@ MIT — see [LICENSE](LICENSE).
 
 - **[tokenpruner](https://pypi.org/project/tokenpruner/)** — LLM input token compression used by graphsift's COMPRESSED output mode; adds 3-5x additional Claude token reduction
 - **[code-review-graph](https://github.com/tirth8205/code-review-graph)** — binary blast-radius alternative (no ranking, no budget, no compression — graphsift was built to surpass it)
+
+---
+
+## Repository
+
+| | |
+|---|---|
+| **Stars** | ![GitHub stars](https://img.shields.io/github/stars/maheshmakvana/graphsift) |
+| **Forks** | ![GitHub forks](https://img.shields.io/github/forks/maheshmakvana/graphsift) |
+| **Releases** | 12 (187 commits) |
+| **MCP tools** | 25 tools + 4 prompts + 10 resources |
+| **Test coverage** | 271 tests across 8 test files, 20 test classes |
+| **Latest version** | v1.6.1 |
+| **License** | MIT |
+
+### Languages
+
+| Language | % |
+|---|---|
+| Python | 94.5% |
+| Shell | 2.3% |
+| Dockerfile | 1.1% |
+| Other | 2.1% |
+
+### Topics
+
+`python` `ai` `mcp` `developer-tools` `claude` `llm` `copilot` `claude-code` `token-optimization` `mcp-server` `code-review` `agentic-coding` `context-engineering` `reduce-token-costs` `ast-parser` `dependency-graph` `context-window` `tree-sitter` `output-compression` `bm25`
+
+### Contributing
+
+Issues and pull requests welcome at [github.com/maheshmakvana/graphsift](https://github.com/maheshmakvana/graphsift).
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. Easy first PR: add a new CLI compression pattern via the issue template.
+
+### Privacy & Security
+
+- **No telemetry** — graphsift runs 100% locally, no data ever leaves your machine
+- **No internet required** — all parsing, ranking, and compression is local
+- **Zero cloud dependencies** — SQLite for persistence, no accounts or API keys needed
+- MCP server binds to localhost only (127.0.0.1)
+
+### Uninstall
+
+```bash
+pip uninstall graphsift
+rm -rf ~/.graphsift
+```
 
 ---
 

@@ -534,7 +534,7 @@ def compress_aws(text: str) -> str:
             return "..."
         if isinstance(obj, dict):
             if len(obj) > 8:
-                return {k: _compact(v, depth + 1) for k in list(obj)[:8]} | {"...": f"+{len(obj) - 8} keys"}
+                return {k: _compact(obj[k], depth + 1) for k in list(obj)[:8]} | {"...": f"+{len(obj) - 8} keys"}
             return {k: _compact(v, depth + 1) for k, v in obj.items()}
         if isinstance(obj, list):
             if len(obj) > 5:
