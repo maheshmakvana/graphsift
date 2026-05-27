@@ -131,6 +131,15 @@ from .adapters.postprocess import (
 from .compress import compress, compress_tee, COMPRESSORS, detect_type as detect_command_type
 from .analytics import gain, discover, history, record_call, reset as reset_analytics
 from .hybrid_search import HybridSearcher
+from .memory import AgentMemory, MemoryFact, SessionInfo
+from .typed_retrieval import TypedRetriever, QueryIntent, TypedPath, TypedNeighborhood
+from .compact_context import ConversationCompactor, AutonomousCompressor, CriticalFact, CompactionStats
+from .evidence import EvidenceTracer, EvidenceResult, FileEvidence
+from .a2a_server import A2AServer, build_agent_card, run_server as run_a2a_server
+from .mcp_tasks import TaskManager, Task, TaskState, ToolRegistry, ToolCategory, ToolDef
+from .harness import Harness, HarnessHook, DriftDetector, AgentAction, DriftAlert, HarnessStats
+from .temporal_graph import TemporalGraph, TemporalStats, SymbolVersion, FileVersion, CommitInfo
+from .code_memory import CodeMemory, CodeMemoryEntry, CodeMemoryStats
 
 __all__ = [
     # Core
@@ -225,6 +234,52 @@ __all__ = [
     "HybridSearcher",
     # Auto-fix
     "FixSuggester",
+    # Agent Memory
+    "AgentMemory",
+    "MemoryFact",
+    "SessionInfo",
+    # Typed Retrieval
+    "TypedRetriever",
+    "QueryIntent",
+    "TypedPath",
+    "TypedNeighborhood",
+    # Context Compaction
+    "ConversationCompactor",
+    "AutonomousCompressor",
+    "CriticalFact",
+    "CompactionStats",
+    # Evidence
+    "EvidenceTracer",
+    "EvidenceResult",
+    "FileEvidence",
+    # A2A Protocol
+    "A2AServer",
+    "build_agent_card",
+    "run_a2a_server",
+    # MCP Tasks
+    "TaskManager",
+    "Task",
+    "TaskState",
+    "ToolRegistry",
+    "ToolCategory",
+    "ToolDef",
+    # Harness
+    "Harness",
+    "HarnessHook",
+    "DriftDetector",
+    "AgentAction",
+    "DriftAlert",
+    "HarnessStats",
+    # Temporal Graph
+    "TemporalGraph",
+    "TemporalStats",
+    "SymbolVersion",
+    "FileVersion",
+    "CommitInfo",
+    # Code Memory
+    "CodeMemory",
+    "CodeMemoryEntry",
+    "CodeMemoryStats",
     # MCP / CLI
     "run_server",
 ]
