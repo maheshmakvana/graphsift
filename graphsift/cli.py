@@ -1223,6 +1223,180 @@ def cmd_detect_dead_code(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# terse command  (inline terse mode prefix)
+# ---------------------------------------------------------------------------
+
+def cmd_terse(args: argparse.Namespace) -> int:
+    """Return a terse mode prefix for LLM prompts."""
+    level = args.level
+    prefix = f"[TERSE:{level}]"
+    if args.prompt:
+        prefix = f"{prefix} {args.prompt}"
+    print(prefix)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# fix command  (bug fix template)
+# ---------------------------------------------------------------------------
+
+def cmd_fix(args: argparse.Namespace) -> int:
+    from graphsift.prompt_templates import FixBugTemplate
+
+    tpl = FixBugTemplate()
+    result = tpl.render(
+        bug=args.bug,
+        file=args.file,
+        line=args.line,
+        expected=args.expected or "",
+        actual=args.actual or "",
+    )
+    if args.json:
+        print(json.dumps({"prompt": result}))
+    else:
+        print(result)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# add command  (feature template)
+# ---------------------------------------------------------------------------
+
+def cmd_add(args: argparse.Namespace) -> int:
+    from graphsift.prompt_templates import AddFeatureTemplate
+
+    tpl = AddFeatureTemplate()
+    result = tpl.render(
+        feature=args.feature,
+        files=args.files or None,
+        acceptance_criteria=args.acceptance_criteria or None,
+    )
+    if args.json:
+        print(json.dumps({"prompt": result}))
+    else:
+        print(result)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# refactor command  (refactor template)
+# ---------------------------------------------------------------------------
+
+def cmd_refactor(args: argparse.Namespace) -> int:
+    from graphsift.prompt_templates import RefactorTemplate
+
+    tpl = RefactorTemplate()
+    result = tpl.render(
+        target=args.target,
+        goal=args.goal or "",
+        files=args.files or None,
+    )
+    if args.json:
+        print(json.dumps({"prompt": result}))
+    else:
+        print(result)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# verify command
+# ---------------------------------------------------------------------------
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    from graphsift.verify_hooks import Verifier
+
+    verifier = Verifier(project_root=args.project_root)
+    result = verifier.check(args.file)
+    print(f"File     : {result.file}")
+    print(f"Syntax   : {'OK' if result.syntax_ok else 'FAIL'}")
+    if result.syntax_error:
+        print(f"Error    : {result.syntax_error}")
+    print(f"Passed   : {result.passed}")
+    return 0 if result.passed else 1
+
+
+# ---------------------------------------------------------------------------
+# tool-budgets command
+# ---------------------------------------------------------------------------
+
+def cmd_tool_budgets(args: argparse.Namespace) -> int:
+    from graphsift.tool_budgets import ToolBudget
+
+    budget = ToolBudget()
+    if args.set_lines is not None and args.tool:
+        budget.set_budget(args.tool, args.set_lines)
+        print(f"Set budget for '{args.tool}' to {args.set_lines} lines.")
+        return 0
+    if args.tool:
+        val = budget.get_budget(args.tool)
+        print(f"{args.tool}: {val} lines")
+        return 0
+    # Show all budgets
+    print("Tool budgets:")
+    for tool, limit in sorted(budget.budgets.items()):
+        print(f"  {tool}: {limit} lines")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# read-cache command
+# ---------------------------------------------------------------------------
+
+_READ_CACHE: object = None  # module-level singleton
+
+
+def _get_read_cache():
+    global _READ_CACHE
+    if _READ_CACHE is None:
+        from graphsift.read_cache import ReadCache
+
+        _READ_CACHE = ReadCache()
+    return _READ_CACHE
+
+
+def cmd_read_cache(args: argparse.Namespace) -> int:
+    cache = _get_read_cache()
+    if args.clear:
+        cache.clear()
+        print("Read cache cleared.")
+        return 0
+    if args.stats:
+        print(f"Stubs served: {cache.stubs_served}")
+        print(f"Cached files: {len(cache._fingerprints)}")
+        return 0
+    # Default: show stats
+    print(f"Stubs served: {cache.stubs_served}")
+    print(f"Cached files: {len(cache._fingerprints)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# evidence command
+# ---------------------------------------------------------------------------
+
+def cmd_evidence(args: argparse.Namespace) -> int:
+    from graphsift.evidence_check import EvidenceChecker
+
+    checker = EvidenceChecker(project_root=args.project_root)
+    citations = checker.check_response(args.text)
+    if not citations:
+        print("No citations found in text.")
+        return 0
+    valid = [c for c in citations if c.valid]
+    invalid = [c for c in citations if not c.valid]
+    print(f"Citations found: {len(citations)}")
+    print(f"  Valid  : {len(valid)}")
+    print(f"  Invalid: {len(invalid)}")
+    if invalid:
+        print()
+        print("Invalid citations:")
+        for c in invalid:
+            loc = f"{c.file_path}:{c.line}" if c.line else c.file_path
+            print(f"  {loc}  ({c.error})")
+    return 1 if invalid else 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1362,6 +1536,59 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Minimum confidence threshold 0-1 (default 0.0)")
     p_suggest.set_defaults(func=cmd_suggest_fixes)
 
+    # terse
+    p_terse = sub.add_parser("terse", help="Return a terse mode prefix for LLM prompts")
+    p_terse.add_argument("--level", choices=["lite", "full", "ultra"], default="lite",
+                         help="Terseness level (default: lite)")
+    p_terse.add_argument("--prompt", type=str, default="",
+                         help="Optional prompt text to prefix")
+
+    # fix
+    p_fix = sub.add_parser("fix", help="Generate a bug-fix prompt template")
+    p_fix.add_argument("--bug", required=True, help="Bug description")
+    p_fix.add_argument("--file", required=True, help="File path containing the bug")
+    p_fix.add_argument("--line", type=int, default=None, help="Line number of the bug")
+    p_fix.add_argument("--expected", default="", help="Expected behavior")
+    p_fix.add_argument("--actual", default="", help="Actual behavior")
+    p_fix.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # add
+    p_add = sub.add_parser("add", help="Generate a feature-addition prompt template")
+    p_add.add_argument("--feature", required=True, help="Feature description")
+    p_add.add_argument("--files", nargs="*", metavar="FILE", help="Files to modify")
+    p_add.add_argument("--acceptance-criteria", nargs="*", metavar="CRITERION",
+                       help="Acceptance criteria")
+    p_add.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # refactor
+    p_refactor = sub.add_parser("refactor", help="Generate a refactoring prompt template")
+    p_refactor.add_argument("--target", required=True, help="Target to refactor")
+    p_refactor.add_argument("--goal", default="", help="Refactoring goal")
+    p_refactor.add_argument("--files", nargs="*", metavar="FILE", help="Files involved")
+    p_refactor.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # verify
+    p_verify = sub.add_parser("verify", help="Verify file syntax and lint")
+    p_verify.add_argument("--file", required=True, help="File path to verify")
+    p_verify.add_argument("--project-root", default=_cwd(), help="Project root (default: cwd)")
+
+    # tool-budgets
+    p_tb = sub.add_parser("tool-budgets", help="Show or set per-tool output line budgets")
+    p_tb.add_argument("--show", action="store_true", help="Show all tool budgets")
+    p_tb.add_argument("--tool", default=None, help="Tool name (bash, read, grep)")
+    p_tb.add_argument("--set", type=int, default=None, dest="set_lines",
+                      help="Set line cap for the specified --tool")
+
+    # read-cache
+    p_rc = sub.add_parser("read-cache", help="Show or clear the read-dedup cache")
+    p_rc.add_argument("--stats", action="store_true", help="Show cache statistics")
+    p_rc.add_argument("--clear", action="store_true", help="Clear the cache")
+
+    # evidence
+    p_ev = sub.add_parser("evidence", help="Check text for hallucinated file:line citations")
+    p_ev.add_argument("--text", required=True, help="Text to check for citations")
+    p_ev.add_argument("--project-root", default=_cwd(), help="Project root (default: cwd)")
+
     return parser
 
 
@@ -1392,6 +1619,14 @@ def main() -> None:
         "detect-cycles": cmd_detect_cycles,
         "detect-dead-code": cmd_detect_dead_code,
         "suggest-fixes": cmd_suggest_fixes,
+        "terse": cmd_terse,
+        "fix": cmd_fix,
+        "add": cmd_add,
+        "refactor": cmd_refactor,
+        "verify": cmd_verify,
+        "tool-budgets": cmd_tool_budgets,
+        "read-cache": cmd_read_cache,
+        "evidence": cmd_evidence,
     }
 
     # Support func-based dispatch for new-style subcommands

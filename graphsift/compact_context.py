@@ -585,11 +585,13 @@ class ConversationCompactor:
         self,
         preserve_system: bool = True,
         preserve_last_n: int = 3,
+        max_context_tokens: int = 200000,
     ) -> None:
         self._preserve_system = preserve_system
         self._preserve_last_n = max(1, preserve_last_n)
         self._last_stats: CompactionStats = CompactionStats()
         self._critical_facts: list[CriticalFact] = []
+        self.max_context_tokens = max_context_tokens
 
     # ------------------------------------------------------------------
     # Public API
@@ -688,6 +690,23 @@ class ConversationCompactor:
             )
 
         return compacted
+
+    def should_compact(self, current_tokens: int, threshold_pct: int = 80) -> bool:
+        """Return True if current token count exceeds threshold_pct of max_context.
+
+        Parameters
+        ----------
+        current_tokens : int
+            Current token count of the conversation.
+        threshold_pct : int
+            Percentage of max_context at which to trigger (default 80).
+
+        Returns
+        -------
+        bool
+            True if compaction is recommended.
+        """
+        return current_tokens >= (self.max_context_tokens * threshold_pct // 100)
 
     def extract_critical(self, messages: list[dict]) -> list[CriticalFact]:
         """Find decisions, constraints, preferences, and gotchas in *messages*.
