@@ -2820,3 +2820,7 @@ def run_server() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.exception("handler %s failed", method)
             _err(req_id, -32603, str(exc))
+
+
+if __name__ == "__main__":
+    run_server()

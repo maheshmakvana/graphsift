@@ -1,25 +1,7 @@
 """Public adapter exports for graphsift."""
 
-from .claude import ClaudeCodeReviewAdapter, ClaudeContextAdapter
-from .gemini import GeminiCodeReviewAdapter, GeminiContextAdapter
-from .openai import (
-    CodexCodeReviewAdapter,
-    CodexContextAdapter,
-    OpenAICodeReviewAdapter,
-    OpenAICompatibleCodeReviewAdapter,
-    OpenAICompatibleContextAdapter,
-    OpenAIContextAdapter,
-)
+from .storage import GraphStore
 
 __all__ = [
-    "ClaudeCodeReviewAdapter",
-    "ClaudeContextAdapter",
-    "OpenAICodeReviewAdapter",
-    "OpenAIContextAdapter",
-    "CodexCodeReviewAdapter",
-    "CodexContextAdapter",
-    "OpenAICompatibleCodeReviewAdapter",
-    "OpenAICompatibleContextAdapter",
-    "GeminiCodeReviewAdapter",
-    "GeminiContextAdapter",
+    "GraphStore",
 ]

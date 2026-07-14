@@ -201,7 +201,6 @@ graphsift treats context selection as a **ranking problem**, not a graph travers
 - **4 MCP prompts** — review_code, analyze_impact, find_issues, explain_architecture
 - **10 MCP resources** — graph stats, architecture overview, communities, flows, wiki pages, risk index
 - **CLI** — `graphsift install / serve / build / status / compress / gain / discover`
-- **Drop-in adapters** — Claude/Anthropic, OpenAI/Codex, Gemini (Google)
 - **10 advanced features** — cache, pipeline, validator, async batch, rate limiter, streaming, diff engine, circuit breaker, retry, schema evolution
 - **Incremental indexing** — SHA-256 skip on unchanged files; sub-2s re-index
 - **Monorepo support** — `index_roots()` for multi-package repositories
@@ -218,10 +217,6 @@ Use `load_source_map` from the filesystem adapter to scan your repo, then create
 ### 2. Build optimized context for a diff
 
 Create a `DiffSpec` with your changed files and review query, then call `builder.build()`. The result shows how many files were selected, total tokens used, and percentage saved. Paste `result.rendered_context` directly into your LLM prompt.
-
-### 3. Use LLM adapters for automatic token savings
-
-GraphSift provides drop-in adapters for Claude (Anthropic), OpenAI/Codex, and Gemini. Each adapter wraps the provider's client and automatically builds optimized context before every review call. The response metadata includes exact token savings — typically 93-99% vs sending raw source.
 
 ---
 
@@ -340,17 +335,9 @@ graphsift's MCP server is the easiest way to save tokens inside Claude Code, Cla
 
 `stream_context()` yields scored file batches as they're ranked, enabling progressive rendering.
 
-### Rate Limiter — Control API Spend
-
-Token-bucket rate limiter with per-key tracking and stats. Wrap any LLM call in a context manager.
-
 ### Diff Engine — Compare Configurations
 
 `ContextDiff` compares two `ContextResult` objects — see exactly how config changes affect token usage and file selection.
-
-### Circuit Breaker — Protect Against Cascade Failures
-
-`CircuitBreaker` with three states (closed/open/half-open) prevents cascading failures when LLM APIs are degraded.
 
 ---
 
@@ -370,7 +357,7 @@ Without graphsift: $0.50-$2.70 per review. With graphsift: **$0.01-$0.05 per rev
 
 ### Does graphsift work with GPT-4 / GPT-5 / OpenAI?
 
-Yes. Drop-in adapters for OpenAI/Codex and Gemini, plus a generic adapter for any OpenAI-compatible API. The ranking and selection logic is provider-agnostic.
+Yes. The ranking and selection logic is provider-agnostic — paste `result.rendered_context` into any LLM prompt.
 
 ### How is graphsift different from code-review-graph?
 
@@ -382,7 +369,7 @@ Yes. `index_roots()` indexes multiple packages at once, with correct cross-packa
 
 ### Does graphsift need internet access?
 
-No. All parsing, ranking, and compression runs locally. Only LLM API adapters make network calls.
+No. All parsing, ranking, and compression runs locally. No external network calls required.
 
 ### What Python versions are supported?
 
@@ -430,11 +417,11 @@ Clone the repo, install with dev dependencies, and run `pytest tests/ -v`. All 2
 
 ## Architecture — Hexagonal (Ports & Adapters)
 
-**Core modules:** `__init__.py` (public API), `core.py` (domain logic), `models.py` (Pydantic models), `exceptions.py` (typed errors), `advanced.py` (10 feature categories), `compress.py` (19 compressors), `analytics.py` (token tracking), `hooks.py` (bash wrapper), `hybrid_search.py` (BM25+TF-IDF), `auto_fix.py` (fix suggestions), `cli.py` (CLI), `mcp_server.py` (25 MCP tools)
+**Core modules:** `__init__.py` (public API), `core.py` (domain logic), `models.py` (Pydantic models), `exceptions.py` (typed errors), `advanced.py` (7 feature categories), `compress.py` (19 compressors), `analytics.py` (token tracking), `hooks.py` (bash wrapper), `hybrid_search.py` (BM25+TF-IDF), `auto_fix.py` (fix suggestions), `cli.py` (CLI), `mcp_server.py` (25 MCP tools)
 
 **v1.7 modules:** `memory.py` (agent memory), `typed_retrieval.py` (PRISM retrieval), `compact_context.py` (conversation compaction), `evidence.py` (audit trail), `a2a_server.py` (A2A protocol), `mcp_tasks.py` (async tasks), `harness.py` (validation hooks), `temporal_graph.py` (git history), `code_memory.py` (code-anchored memory)
 
-**Adapters:** `storage.py` (SQLite), `claude.py`, `openai.py`, `gemini.py`, `llm.py`, `filesystem.py`, `postprocess.py`
+**Adapters:** `storage.py` (SQLite), `filesystem.py`, `postprocess.py`
 
 **Parsers:** Tree-sitter for 11 languages
 

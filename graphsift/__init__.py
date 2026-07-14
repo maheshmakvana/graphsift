@@ -1,20 +1,18 @@
-"""graphsift - Save Claude Tokens, Reduce LLM API Costs, Optimize Context Windows.
+"""graphsift — smarter code context for AI-powered development.
 
-The #1 Claude token saver and LLM token optimizer for AI code review.
 80-150x token reduction vs raw source. 86% avg CLI output compression.
 F1 0.85 relevance accuracy vs 0.54 for code-review-graph.
 
 Key capabilities:
 - Ranked 0-1 relevance scoring with hot/warm/cold tier selection
-- Hard token budget enforcement - never exceeds Claude/GPT/Gemini context limits
+- Hard token budget enforcement for context limits
 - Diff-aware context trimming + entropy-based deduplication
 - 14-language AST parsing + 11-language tree-sitter precise parsing
 - 19 CLI command compressors (pytest 94%, grep 97%, git_diff 92%, docker 91%)
 - Hybrid search (BM25 + TF-IDF sparse vector fusion)
 - Auto-fix suggestions, cycle detection, dead code detection
 - MCP server with 7 token-saving tools for Claude Code
-- Drop-in Claude/Anthropic, OpenAI/Codex, and Gemini adapters
-- Cache-aware output with Anthropic/OpenAI cache breakpoints
+- Cache-aware output with prompt-cache breakpoints
 
 Quick start::
 
@@ -30,7 +28,7 @@ Quick start::
     print(result)
     # ContextResult(selected=9/143, tokens=12,400, saved=94%)
 
-    # Paste result.rendered_context directly into your Claude API call
+    # Paste result.rendered_context directly into your AI prompt
 
     # Monorepo support
     stats_list = builder.index_roots([pkg_a_map, pkg_b_map])
@@ -93,33 +91,18 @@ from .models import (
 )
 from .advanced import (
     AnalysisPipeline,
-    CircuitBreaker,
-    CircuitState,
     ContextDiff,
     DiffValidator,
     GraphCache,
-    RateLimiter,
-    RetryStrategy,
     SchemaEvolution,
     async_batch_build,
     async_batch_index,
     async_stream_context,
     batch_index,
-    get_rate_limiter,
     stream_context,
 )
 from .adapters.storage import GraphStore
 from .auto_fix import FixSuggester
-from .adapters.claude import ClaudeCodeReviewAdapter, ClaudeContextAdapter
-from .adapters.gemini import GeminiCodeReviewAdapter, GeminiContextAdapter
-from .adapters.openai import (
-    CodexCodeReviewAdapter,
-    CodexContextAdapter,
-    OpenAICodeReviewAdapter,
-    OpenAICompatibleCodeReviewAdapter,
-    OpenAICompatibleContextAdapter,
-    OpenAIContextAdapter,
-)
 from .adapters.postprocess import (
     CommunityDetector,
     FlowDetector,
@@ -191,28 +174,12 @@ __all__ = [
     "async_batch_index",
     "batch_index",
     "async_batch_build",
-    "RateLimiter",
-    "get_rate_limiter",
     "stream_context",
     "async_stream_context",
     "ContextDiff",
-    "CircuitBreaker",
-    "CircuitState",
-    "RetryStrategy",
     "SchemaEvolution",
     # Storage
     "GraphStore",
-    # LLM adapters
-    "ClaudeCodeReviewAdapter",
-    "ClaudeContextAdapter",
-    "OpenAICodeReviewAdapter",
-    "OpenAIContextAdapter",
-    "CodexCodeReviewAdapter",
-    "CodexContextAdapter",
-    "OpenAICompatibleCodeReviewAdapter",
-    "OpenAICompatibleContextAdapter",
-    "GeminiCodeReviewAdapter",
-    "GeminiContextAdapter",
     # Post-processing
     "Postprocessor",
     "FlowDetector",

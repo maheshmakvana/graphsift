@@ -184,11 +184,8 @@ Complete feature inventory as of v1.6.1. Last updated: 2026-05-27.
 | **Pipeline** | AnalysisPipeline | Composable step chain with audit trail |
 | **Validation** | ContextValidator | Pre/post-build validation hooks |
 | **Async** | async_batch_build | Parallel context building with configurable concurrency |
-| **Rate Limiter** | RateLimiter | Token-bucket rate limiter for API cost control |
 | **Streaming** | stream_context | Yield context batches as they're scored |
 | **Diff Engine** | ContextDiff | Compare context results across configurations |
-| **Circuit Breaker** | CircuitBreaker | Fail-fast on repeated errors |
-| **Retry** | RetryStrategy | Exponential backoff with jitter |
 | **Schema Evolution** | SchemaEvolution | Forward-compatible graph schema migrations |
 
 ---
