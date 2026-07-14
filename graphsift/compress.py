@@ -151,6 +151,13 @@ _SIGNATURES: list[tuple[str, re.Pattern[str]]] = [
     ("cat", re.compile(r"(?m)^[a-zA-Z]:\\")),
 ]
 
+_TERRAFORM_RE = re.compile(r"\b(?:terraform|tofu)\b")
+_GH_RE = re.compile(r"\bgh\b")
+_AZ_RE = re.compile(r"\baz\b")
+_GCLOUD_RE = re.compile(r"\bgcloud\b")
+_BREW_RE = re.compile(r"\bbrew\b")
+_DOTNET_RE = re.compile(r"\bdotnet\b")
+
 
 def detect_type(text: str) -> str:
     """Inspect first 500 characters and return the best matching type or 'generic'."""
@@ -158,6 +165,18 @@ def detect_type(text: str) -> str:
     for name, pat in _SIGNATURES:
         if pat.search(head):
             return name
+    if _TERRAFORM_RE.search(head):
+        return "terraform"
+    if _GH_RE.search(head):
+        return "gh"
+    if _AZ_RE.search(head):
+        return "az"
+    if _GCLOUD_RE.search(head):
+        return "gcloud"
+    if _BREW_RE.search(head):
+        return "brew"
+    if _DOTNET_RE.search(head):
+        return "dotnet"
     return "generic"
 
 
@@ -666,17 +685,84 @@ def compress_cat(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def compress_generic(text: str) -> str:
-    """Generic compression: strip blanks, deduplicate, truncate at 200 lines."""
+def compress_generic(text: str, max_lines: int = 200) -> str:
+    """Generic compression: strip blanks, deduplicate, truncate at max_lines."""
     text = _strip_ansi(text)
     cleaned = strip_blanks(text)
     if not cleaned:
         return cleaned
     cleaned = deduplicate(cleaned)
     lines = cleaned.split("\n")
-    if len(lines) > 200:
-        return "\n".join(lines[:200]) + f"\n... ({len(lines) - 200} more lines)"
+    if len(lines) > max_lines:
+        return "\n".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} more lines)"
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# New compressors
+# ---------------------------------------------------------------------------
+
+
+def compress_terraform(text: str) -> str:
+    """Compress terraform plan/output -- keep resource changes, drop refreshes."""
+    lines = text.split("\n")
+    kept = []
+    for line in lines:
+        if any(k in line for k in ("# ", "+", "-", "~", "Plan:", "Changes:", "Error", "Error:")):
+            kept.append(line)
+        elif re.match(r'^\s*[+\-~]', line):
+            kept.append(line)
+    if not kept:
+        return text[:2000]
+    result = "\n".join(kept)
+    if len(result) > 3000:
+        result = result[:1500] + "\n... (truncated) ...\n" + result[-1000:]
+    return result
+
+
+def compress_gh(text: str) -> str:
+    """Compress gh CLI output -- keep titles, states, merge status, PR/issue bodies."""
+    return compress_generic(text, max_lines=40)
+
+
+def compress_az(text: str) -> str:
+    """Compress az CLI output -- keep provisioning state, properties, errors."""
+    return compress_json_output(text) if text.strip().startswith("{") else compress_generic(text, max_lines=50)
+
+
+def compress_gcloud(text: str) -> str:
+    """Compress gcloud output -- keep status, errors, configs."""
+    lines = text.split("\n")
+    kept = [l for l in lines if any(k in l.lower() for k in ("status", "state", "error", "done", "running", "create"))]
+    if not kept:
+        return truncate_middle(text, head=15, tail=10)
+    return truncate_middle("\n".join(kept), head=15, tail=10)
+
+
+def compress_brew(text: str) -> str:
+    """Compress brew output -- keep install/upgrade summaries, errors."""
+    lines = text.split("\n")
+    kept = []
+    for line in lines:
+        if any(k in line.lower() for k in ("error", "warning", "installed", "upgraded", "linked", "summary", "==>")):
+            kept.append(line)
+    if not kept:
+        return truncate_middle(text, head=10, tail=5)
+    return "\n".join(kept)
+
+
+def compress_dotnet(text: str) -> str:
+    """Compress dotnet build/test output -- keep build warnings, errors, test results."""
+    lines = text.split("\n")
+    kept = []
+    for line in lines:
+        if any(k in line.lower() for k in ("error", "warning", "failed", "passed", "build", "test run", "results")):
+            kept.append(line)
+        elif re.match(r'^\s*(?:build|test)\s', line.lower()):
+            kept.append(line)
+    if not kept:
+        return truncate_middle(text, head=20, tail=10)
+    return deduplicate("\n".join(kept))
 
 
 # ---------------------------------------------------------------------------
@@ -702,8 +788,24 @@ COMPRESSORS: dict[str, Callable[[str], str]] = {
     "pip": compress_pip,
     "log": compress_log,
     "cat": compress_cat,
+    "terraform": compress_terraform,
+    "gh": compress_gh,
+    "az": compress_az,
+    "gcloud": compress_gcloud,
+    "brew": compress_brew,
+    "dotnet": compress_dotnet,
     "generic": compress_generic,
 }
+
+
+def get_compressors_list() -> list[str]:
+    """Return sorted list of available compressor names.
+
+    Safe to call even when optional module dependencies are missing
+    (ModuleNotFoundError is caught and re-raised as a friendly message).
+    """
+    return sorted(COMPRESSORS.keys())
+
 
 # ---------------------------------------------------------------------------
 # Tee recovery — save originals to disk
@@ -761,9 +863,28 @@ def compress(text: str, command: str = "auto", ultra: bool = False) -> str:
     result = compressor(text)
 
     if ultra:
-        lines = [l for l in result.split("\n") if l.strip()]
-        if len(lines) > 30:
-            result = "\n".join(lines[:30]) + f"\n... ({len(lines) - 30} more lines)"
+        # Ultra mode v2: smart preservation of error/signal lines
+        _SIGNAL_LINES = {"error", "traceback", "fail", "warning", "exception", "assert"}
+        lines = result.split("\n")
+        kept = []
+        dropped = 0
+        for line in lines:
+            lower = line.lower()
+            # Always keep error/signal lines
+            if any(s in lower for s in _SIGNAL_LINES):
+                kept.append(line)
+                continue
+            # Drop success/test pass noise
+            if re.search(r'^\s*(ok|PASSED|passed|✓|√|\.{2,})', lower):
+                dropped += 1
+                continue
+            kept.append(line)
+
+        # If still over 30, truncate keeping head+tail
+        if len(kept) > 30:
+            result = "\n".join(kept[:15] + [f"  ... ({len(kept) - 30} lines omitted)"] + kept[-15:])
+        else:
+            result = "\n".join(kept)
 
     return result
 

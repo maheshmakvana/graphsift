@@ -123,6 +123,12 @@ from .mcp_tasks import TaskManager, Task, TaskState, ToolRegistry, ToolCategory,
 from .harness import Harness, HarnessHook, DriftDetector, AgentAction, DriftAlert, HarnessStats
 from .temporal_graph import TemporalGraph, TemporalStats, SymbolVersion, FileVersion, CommitInfo
 from .code_memory import CodeMemory, CodeMemoryEntry, CodeMemoryStats
+from .tool_budgets import ToolBudget
+from .read_cache import ReadCache
+from .verify_hooks import Verifier, VerifyResult
+from .evidence_check import EvidenceChecker, Citation
+from .prompt_templates import FixBugTemplate, AddFeatureTemplate, RefactorTemplate, get_template
+from .tiered_memory import TieredMemory
 
 __all__ = [
     # Core
@@ -247,6 +253,23 @@ __all__ = [
     "CodeMemory",
     "CodeMemoryEntry",
     "CodeMemoryStats",
+    # Tool Budgets
+    "ToolBudget",
+    # Read Cache
+    "ReadCache",
+    # Verify Hooks
+    "Verifier",
+    "VerifyResult",
+    # Evidence Check
+    "EvidenceChecker",
+    "Citation",
+    # Prompt Templates
+    "FixBugTemplate",
+    "AddFeatureTemplate",
+    "RefactorTemplate",
+    "get_template",
+    # Tiered Memory
+    "TieredMemory",
     # MCP / CLI
     "run_server",
 ]

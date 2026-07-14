@@ -1660,6 +1660,198 @@ def _tool_suggest_fixes(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# New optimization tool implementations
+# ---------------------------------------------------------------------------
+
+
+def _tool_tool_budgets(params: dict) -> dict:
+    """Apply tool budget line caps to bash/read/grep output."""
+    from graphsift.tool_budgets import ToolBudget
+
+    tool = params.get("tool", "bash")
+    text = params.get("text", "")
+    extract_structured = params.get("extract_structured", False)
+
+    if not text:
+        return {"error": "text parameter is required"}
+
+    original_chars = len(text)
+    budget = ToolBudget()
+    capped = budget.apply(tool, text, extract_structured=extract_structured)
+
+    return {
+        "capped": capped,
+        "original_chars": original_chars,
+        "capped_chars": len(capped),
+        "savings_pct": round((1 - len(capped) / max(original_chars, 1)) * 100, 1),
+        "budget_applied": budget.get_budget(tool),
+    }
+
+
+def _tool_read_cache(params: dict) -> dict:
+    """Fingerprint file reads and return stubs on duplicates."""
+    from graphsift.read_cache import ReadCache
+
+    _cache_inst: ReadCache = getattr(_tool_read_cache, "_cache", None)
+    if _cache_inst is None:
+        _cache_inst = ReadCache()
+        _tool_read_cache._cache = _cache_inst
+
+    path = params.get("path", "")
+    content = params.get("content", "")
+
+    if not path:
+        return {"error": "path parameter is required"}
+
+    result = _cache_inst.read(path, lambda: content)
+
+    return {
+        "result": result,
+        "is_stub": "fingerprint match" in result,
+        "stubs_served": _cache_inst.stubs_served,
+    }
+
+
+def _tool_verify_file(params: dict) -> dict:
+    """Run syntax check on a changed file."""
+    from graphsift.verify_hooks import Verifier
+
+    file_path = params.get("file_path", "")
+    project_root = params.get("project_root", "")
+
+    if not file_path:
+        return {"error": "file_path parameter is required"}
+
+    verifier = Verifier(project_root=project_root)
+    result = verifier.check(file_path)
+
+    return {
+        "file": result.file,
+        "passed": result.passed,
+        "syntax_ok": result.syntax_ok,
+        "syntax_error": result.syntax_error,
+    }
+
+
+def _tool_check_evidence(params: dict) -> dict:
+    """Scan text for file:line citations and validate them."""
+    from graphsift.evidence_check import EvidenceChecker
+
+    text = params.get("text", "")
+    project_root = params.get("project_root", "")
+
+    if not text:
+        return {"error": "text parameter is required"}
+
+    checker = EvidenceChecker(project_root=project_root)
+    citations = checker.check_response(text)
+
+    return {
+        "total_citations": len(citations),
+        "valid": [c for c in citations if c.valid],
+        "invalid": [{"raw": c.raw, "file": c.file_path, "line": c.line, "error": c.error} for c in citations if not c.valid],
+    }
+
+
+def _tool_fix_bug(params: dict) -> dict:
+    """Generate a structured bug-fix prompt."""
+    from graphsift.prompt_templates import FixBugTemplate
+
+    tpl = FixBugTemplate()
+    prompt = tpl.render(
+        bug=params.get("bug", ""),
+        file=params.get("file", ""),
+        line=params.get("line"),
+        expected=params.get("expected", ""),
+        actual=params.get("actual", ""),
+    )
+
+    return {"prompt": prompt, "template": "fix"}
+
+
+def _tool_add_feature(params: dict) -> dict:
+    """Generate a structured feature-addition prompt."""
+    from graphsift.prompt_templates import AddFeatureTemplate
+
+    tpl = AddFeatureTemplate()
+    prompt = tpl.render(
+        feature=params.get("feature", ""),
+        files=params.get("files"),
+        acceptance_criteria=params.get("acceptance_criteria"),
+    )
+
+    return {"prompt": prompt, "template": "add"}
+
+
+def _tool_refactor_code(params: dict) -> dict:
+    """Generate a structured refactoring prompt."""
+    from graphsift.prompt_templates import RefactorTemplate
+
+    tpl = RefactorTemplate()
+    prompt = tpl.render(
+        target=params.get("target", ""),
+        goal=params.get("goal", ""),
+        files=params.get("files"),
+    )
+
+    return {"prompt": prompt, "template": "refactor"}
+
+
+def _tool_terse_mode(params: dict) -> dict:
+    """Generate terse-mode instructions for a given level."""
+    level = params.get("level", "full")
+    prompt = params.get("prompt", "")
+
+    instructions = {
+        "lite": (
+            "[Terse:lite] Be brief but polite. Use short sentences. "
+            "No filler words. Preserve code/commands/errors verbatim."
+        ),
+        "full": (
+            "[Terse:full] Use sentence fragments, not full prose. "
+            "No hedging, transitional phrases, or politeness. "
+            "Preserve code/commands/errors verbatim."
+        ),
+        "ultra": (
+            "[Terse:ultra] Minimum viable response. "
+            "Just code, file paths, commands, and errors. "
+            "No explanations unless explicitly asked."
+        ),
+    }
+
+    instruction = instructions.get(level, instructions["full"])
+    return {
+        "full_prompt": f"{instruction}\n\n{prompt}",
+        "level": level,
+        "instruction": instruction,
+    }
+
+
+def _tool_should_compact(params: dict) -> dict:
+    """Check whether conversation should be compacted."""
+    from graphsift.compact_context import ConversationCompactor
+
+    current = params.get("current_tokens", 0)
+    max_context = params.get("max_context", 200000)
+    threshold_pct = params.get("threshold_pct", 80)
+
+    compactor = ConversationCompactor(max_context_tokens=max_context)
+    should = compactor.should_compact(current, threshold_pct)
+
+    threshold_tokens = max_context * threshold_pct // 100
+    usage_pct = round((current / max(max_context, 1)) * 100, 1)
+
+    return {
+        "should_compact": should,
+        "current_tokens": current,
+        "max_context": max_context,
+        "threshold_tokens": threshold_tokens,
+        "usage_pct": usage_pct,
+        "recommendation": "compact now" if should else "within budget",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -2203,6 +2395,121 @@ _TOOLS = {
                 "changed_files": {"type": "array", "items": {"type": "string"}, "description": "Only analyze these files (optional)"},
                 "min_confidence": {"type": "number", "description": "Minimum confidence 0-1 (default 0.0)"},
             },
+        },
+    },
+    "tool_budgets": {
+        "fn": _tool_tool_budgets,
+        "description": "Apply tool budget line caps to bash/read/grep output — saves ~86% on tool output tokens. Caps bash=80, read=300, grep=120 lines, strips ANSI, collapses blanks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "description": "Tool type: 'bash', 'read', or 'grep'"},
+                "text": {"type": "string", "description": "Text to cap and compress"},
+                "extract_structured": {"type": "boolean", "description": "Extract JSON/XML if detected (default false)"},
+            },
+            "required": ["tool", "text"],
+        },
+    },
+    "read_cache": {
+        "fn": _tool_read_cache,
+        "description": "Fingerprint file reads and return stubs on repeat reads to avoid sending duplicate content. Saves ~99% on repeat file reads.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to read"},
+                "content": {"type": "string", "description": "Current file content"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    "verify_file": {
+        "fn": _tool_verify_file,
+        "description": "Run syntax check on a changed file. Supports Python (compile) and JS/TS (node --check). Catches errors immediately after code changes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the file to verify"},
+                "project_root": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+            "required": ["file_path"],
+        },
+    },
+    "check_evidence": {
+        "fn": _tool_check_evidence,
+        "description": "Scan text for file:line citations and validate they point to real files. Catches hallucinated file references.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Response text to scan"},
+                "project_root": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+            "required": ["text"],
+        },
+    },
+    "fix_bug": {
+        "fn": _tool_fix_bug,
+        "description": "Generate a structured bug-fix prompt using the fix template. Outputs JSON with root_cause, fix, file, line.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bug": {"type": "string", "description": "Description of the bug"},
+                "file": {"type": "string", "description": "File path"},
+                "line": {"type": "integer", "description": "Line number"},
+                "expected": {"type": "string", "description": "Expected behavior"},
+                "actual": {"type": "string", "description": "Actual behavior"},
+            },
+            "required": ["bug", "file"],
+        },
+    },
+    "add_feature": {
+        "fn": _tool_add_feature,
+        "description": "Generate a structured feature-addition prompt. Outputs JSON with approach, changes, tests.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "feature": {"type": "string", "description": "Feature description"},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Files involved"},
+                "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "description": "Acceptance criteria"},
+            },
+            "required": ["feature"],
+        },
+    },
+    "refactor_code": {
+        "fn": _tool_refactor_code,
+        "description": "Generate a structured refactoring prompt. Outputs JSON with changes, verification, risk level.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Target to refactor"},
+                "goal": {"type": "string", "description": "Goal of the refactor"},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Files involved"},
+            },
+            "required": ["target"],
+        },
+    },
+    "terse_mode": {
+        "fn": _tool_terse_mode,
+        "description": "Generate terse-mode instructions for a given level. Preserves code/commands/errors, strips filler/hedging/politeness.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "string", "description": "Terseness level: 'lite', 'full' (default), or 'ultra'"},
+                "prompt": {"type": "string", "description": "The actual prompt to prefix with terse instructions"},
+            },
+            "required": ["prompt"],
+        },
+    },
+    "should_compact": {
+        "fn": _tool_should_compact,
+        "description": "Check whether conversation should be compacted based on current token count vs threshold. Triggers at 80% of max context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "current_tokens": {"type": "integer", "description": "Current conversation token count"},
+                "max_context": {"type": "integer", "description": "Max context window size (default 200000)"},
+                "threshold_pct": {"type": "integer", "description": "Threshold percentage (default 80)"},
+            },
+            "required": ["current_tokens"],
         },
     },
 }
