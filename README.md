@@ -17,7 +17,8 @@
 <p align="center">
   <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/v/graphsift.svg?style=flat&color=blue" alt="PyPI"></a>
   <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/pyversions/graphsift.svg?style=flat" alt="Python"></a>
-  <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/dm/graphsift?style=flat&label=downloads&color=brightgreen" alt="Downloads"></a>
+  <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift?style=flat&color=blue" alt="Downloads"></a>
+  <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift/month?style=flat&color=blue" alt="Downloads/month"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat" alt="License"></a>
   <a href="https://github.com/maheshmakvana/graphsift/actions"><img src="https://img.shields.io/github/actions/workflow/status/maheshmakvana/graphsift/tests.yml?style=flat&label=tests&color=blue" alt="CI"></a>
   <img src="https://img.shields.io/badge/F1-0.85-success" alt="F1">
@@ -68,6 +69,30 @@ Every time you send code to an LLM for review, debugging, or generation, graphsi
 | **MCP-connected agents** | Automatic optimization | 7+ MCP tools for token-efficient workflows |
 | **CI/CD pipelines** | **60-97%** compression | Compress pytest/eslint/kubectl output before LLM analysis |
 | **Multi-agent systems** | **60-82%** conversation savings | ConversationCompactor compresses agent dialogue |
+
+---
+
+## 📊 Live Download Statistics
+
+graphsift is downloaded **10,365 times** (all-time) on PyPI, with **1,533 downloads in the last 30 days** and growing rapidly.
+
+<p align="center">
+  <a href="https://pepy.tech/projects/graphsift?timeRange=threeMonths&category=version&includeCIDownloads=true&granularity=weekly&viewType=line&versions=Total%2C2.%2A%2C1.%2A">
+    <img src="https://pepy.tech/projects/graphsift?timeRange=threeMonths&category=version&includeCIDownloads=true&granularity=weekly&viewType=line&versions=Total%2C2.*%2C1.*" alt="graphsift PyPI Download Chart" width="700">
+  </a>
+  <br>
+  <sub>📈 <a href="https://pepy.tech/projects/graphsift?timeRange=threeMonths&category=version&includeCIDownloads=true&granularity=weekly&viewType=line&versions=Total%2C2.*%2C1.*">View live interactive chart on pepy.tech</a> — weekly downloads, version breakdown, and downloader stats</sub>
+</p>
+
+| Stat | Count | 
+|------|:-----:|
+| ⭐ **Total downloads (all-time)** | **10,365** |
+| 📅 **Last 30 days** | **1,533** |
+| ⏰ **Last 24 hours** | **549** |
+| 🏷️ **Latest version** | **1.5.3** |
+| 👥 **Unique downloaders (approx.)** | Tracked live on [pepy.tech](https://pepy.tech/projects/graphsift) |
+
+> **Note:** PyPI download counts reflect `pip install` and CI pipeline pulls. Unique downloader counts are approximated by IP address on pepy.tech.
 
 ---
 

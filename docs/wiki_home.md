@@ -3,6 +3,16 @@
 > **graphsift v3.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).  
 > The #1 token saver for Claude, GPT-4 & Gemini. 80-150× fewer tokens, F1 0.85 relevance accuracy, 93% feature coverage.
 
+<p align="center">
+  <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift" alt="Downloads"></a>
+  <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift/month" alt="Downloads/month"></a>
+  <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/v/graphsift.svg?style=flat&color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/pyversions/graphsift.svg?style=flat" alt="Python"></a>
+  <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="Stars"></a>
+  <br>
+  <sub>📥 <strong>10,365 total downloads</strong> · 1,533 in last 30 days · <a href="https://pepy.tech/projects/graphsift">View live chart →</a></sub>
+</p>
+
 **Save Claude tokens. Reduce GPT-4 costs. Optimize Gemini context windows.**
 
 ## What is graphsift?
