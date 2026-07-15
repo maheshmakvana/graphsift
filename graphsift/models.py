@@ -33,6 +33,19 @@ class Language(str, Enum):
     UNKNOWN = "unknown"
 
 
+class SourceConfidence(str, Enum):
+    """Confidence level for code symbol extraction.
+
+    ``EXTRACTED`` means the symbol was obtained via a deterministic AST parse
+    (e.g. Python's ``ast`` module or tree-sitter). ``INFERRED`` means it was
+    detected via a best-effort heuristic (regex / BM25 / vector search) and
+    may be incomplete or inaccurate.
+    """
+
+    EXTRACTED = "extracted"
+    INFERRED = "inferred"
+
+
 class NodeKind(str, Enum):
     """Type of a graph node."""
 
@@ -74,6 +87,19 @@ class TierLevel(str, Enum):
     COLD = "cold"      # Excluded from context
 
 
+class DepthTier(str, Enum):
+    """Context depth tier for different development phases.
+
+    - PLANNING: High-level topology — file names, module descriptions, class signatures.
+    - EXPLORATION: Interface-level — add function signatures, docstrings, type hints.
+    - EXECUTION: Full implementation — complete function bodies and inline comments.
+    """
+
+    PLANNING = "planning"
+    EXPLORATION = "exploration"
+    EXECUTION = "execution"
+
+
 # ---------------------------------------------------------------------------
 # Graph nodes and edges
 # ---------------------------------------------------------------------------
@@ -97,7 +123,12 @@ class GraphNode(BaseModel):
     is_async: bool = False
     is_dynamic: bool = False  # True if detected via dynamic-import pattern
     community_id: int | None = Field(default=None, description="Community cluster ID assigned by community detection")
+    source_confidence: SourceConfidence = Field(
+        default=SourceConfidence.EXTRACTED,
+        description="Whether this symbol was extracted via deterministic AST (EXTRACTED) or regex/heuristic (INFERRED)",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return f"GraphNode({self.kind.value}:{self.qualified_name})"
@@ -113,6 +144,7 @@ class GraphEdge(BaseModel):
     kind: EdgeKind
     weight: float = Field(default=1.0, ge=0.0, le=10.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return f"GraphEdge({self.source_id} -{self.kind.value}-> {self.target_id})"
@@ -138,6 +170,7 @@ class FileNode(BaseModel):
     dynamic_imports: list[str] = Field(default_factory=list)
     token_estimate: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return f"FileNode({self.path}, {self.language.value}, {len(self.symbols)} symbols)"
@@ -154,6 +187,11 @@ class ScoredFile(BaseModel):
     reasons: list[str] = Field(default_factory=list, description="Why this file was selected")
     depth: int = Field(default=0, description="Graph distance from changed files")
     output_mode: OutputMode = OutputMode.SMART
+    source_confidence: SourceConfidence = Field(
+        default=SourceConfidence.EXTRACTED,
+        description="Aggregate confidence for this file's symbols — EXTRACTED if all symbols are AST-parsed, INFERRED if any came from regex/heuristic",
+    )
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return f"ScoredFile({self.file_node.path}, score={self.score:.3f}, rank={self.rank})"
@@ -173,6 +211,7 @@ class DiffSpec(BaseModel):
     diff_text: str = Field(default="", description="Optional raw unified diff")
     commit_message: str = Field(default="")
     query: str = Field(default="", description="Free-text question about the change")
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return f"DiffSpec(changed={len(self.changed_files)} files)"
@@ -257,6 +296,10 @@ class ContextConfig(BaseModel):
         le=365,
         description="How many days a cached context entry remains valid.",
     )
+    depth_tier: DepthTier = Field(
+        default=DepthTier.EXECUTION,
+        description="Context depth: planning (broad topology), exploration (interface contracts), execution (full implementation).",
+    )
     exclude_patterns: list[str] = Field(
         default_factory=lambda: [
             "venv", ".venv", "node_modules", "dist", "build",
@@ -267,6 +310,7 @@ class ContextConfig(BaseModel):
         default=True,
         description="Enable entropy-based deduplication of near-identical files to improve context diversity.",
     )
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
 
 class ContextResult(BaseModel):
@@ -287,6 +331,7 @@ class ContextResult(BaseModel):
     files_scanned: int = 0
     files_selected: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return (
@@ -309,6 +354,7 @@ class IndexStats(BaseModel):
     dynamic_imports_found: int = 0
     duration_ms: float = 0.0
     languages: dict[str, int] = Field(default_factory=dict)
+    schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     def __repr__(self) -> str:
         return (

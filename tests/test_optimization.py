@@ -188,7 +188,7 @@ def test_add_template_contains_feature():
 def test_refactor_template_constraint():
     tpl = RefactorTemplate()
     prompt = tpl.render(target="auth.py")
-    assert "Behavior must not change" in prompt
+    assert "MUST NOT change" in prompt
 
 
 def test_get_template_returns_correct():

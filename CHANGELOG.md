@@ -1,0 +1,186 @@
+# Changelog
+
+> **graphsift** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> The #1 Python library to save Claude tokens, reduce GPT-4 costs & optimize LLM context windows.
+
+All notable changes to graphsift are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+### Added
+- Module-level docstrings for `evidence_check.py`, `verify_hooks.py`, `tiered_memory.py`,
+  `tool_budgets.py`, `read_cache.py`, `temporal_graph.py`, `code_memory.py`
+- Type stubs (`.pyi` files) for `graphsift/__init__.pyi` and key modules
+- Sphinx documentation framework (`docs/Makefile`, `docs/conf.py`)
+- `docs/API_REFERENCE.md` — quick reference for all public classes and functions
+- `CHANGELOG.md` — this file
+- `MIGRATION_GUIDE.md` — v1.x → v2.x migration instructions
+- GitHub issue templates (bug report, feature request) and PR template
+
+### Changed
+- Rewrote `README.md` as concise practical guide with quick start, API overview, benchmarks
+- Rewrote `CONTRIBUTING.md` with development setup, code style (ruff/mypy), testing requirements,
+  PR workflow, and ASCII architecture diagram
+- Cleaned up `docs/` directory — removed redundant whitepapers, kept most useful docs
+
+### Fixed
+- N/A
+
+---
+
+## [2.2.0] — 2026-07-01
+
+### Added
+- `evidence_check.py` — validates file:line citations against filesystem
+- `PriorityScorer` — multi-signal priority scoring for findings
+- `verify_hooks.py` — post-change syntax/lint verification hooks
+- `tool_budgets.py` — per-tool output line caps
+- `read_cache.py` — SHA-256 fingerprint dedup for file reads
+- `tiered_memory.py` — hierarchical memory (axioms → rules → topic → archive)
+- Support for Python 3.13
+
+### Changed
+- Enhanced `HybridSearcher` tokenization for camelCase/snake_case identifiers
+- Improved `TemporalGraph` symbol correlation with `DependencyGraph`
+
+---
+
+## [2.1.0] — 2026-05-15
+
+### Added
+- `compact_context.py` — conversation compaction (60-82% token savings)
+- `typed_retrieval.py` — PRISM-style typed graph traversal (6 query intents)
+- `a2a_server.py` — Agent-to-Agent protocol via JSON-RPC over HTTP
+- `mcp_tasks.py` — MCP async task manager with progress tracking
+- `harness.py` — pre/post validation hooks, drift detection
+- `code_memory.py` — code-anchored agent memory with SQLite persistence
+- `temporal_graph.py` — git-history-aware symbol tracking
+
+### Changed
+- Improved MCP server with 25+ tools, 4 prompts, 10 resources
+- Enhanced `ContextBuilder` with `index_files_incremental()` for SHA-256 skip
+
+---
+
+## [2.0.0] — 2026-03-01
+
+### Added
+- Agent memory layer (`memory.py`) — SQLite-backed knowledge graph
+- Evidence tracing (`evidence.py`) — audit trail for file selection
+- Harness engineering system with drift detection
+- A2A protocol support
+- Temporal code graph (git-history-aware)
+- Code-anchored memory system
+- Context compaction (conversation compression)
+- Typed retrieval with 6 query intents
+
+### Changed
+- **Breaking**: `ContextConfig.token_budget` now defaults to 50,000 (was unlimited)
+- **Breaking**: `ContextBuilder.build()` now returns `ContextResult` instead of tuple
+- **Breaking**: `compress()` returns `int` tokens saved instead of `str`
+- **Breaking**: `detect_language()` signature changed — takes `(path, content)` instead of `(path,)`
+- **Breaking**: Removed deprecated `short_tokenize()` function (use tokenpruner instead)
+- **Breaking**: `GraphStore` schema migrated — SQLite databases from v1.x are incompatible
+- Minimum Python raised to 3.9 (dropped 3.8 support)
+
+### Fixed
+- Thread safety for `DependencyGraph` under concurrent access
+- BM25 tokenization edge cases with unicode identifiers
+- False positives in dead code detection for entry-point exports
+
+---
+
+## [1.7.0] — 2025-12-15
+
+### Added
+- 19 CLI output compressors (pytest, grep, git_diff, docker, kubectl, npm, etc.)
+- `graphsift gain` and `graphsift discover` CLI commands
+- Token analytics tracking with cumulative and daily breakdowns
+- 3-tier selection (hot/warm/cold) with signature mode
+- Entropy-based deduplication
+- Cache-aware output with `cache_control` breakpoints
+
+### Changed
+- Improved relevance ranking F1 from 0.78 to 0.85
+- 10× faster indexing for large repositories
+- Enhanced monorepo support via `index_roots()`
+
+---
+
+## [1.6.0] — 2025-10-01
+
+### Added
+- Tree-sitter parsing for 11 languages
+- Hybrid search (BM25 + TF-IDF)
+- 7 edge types (CALLS, IMPORTS, INHERITS, DECORATES, REFERENCES, TEST_COVERS, DYNAMIC_IMPORT)
+- Cycle detection and dead code detection
+- Auto-fix suggestions (5 categories)
+- Incremental indexing with SHA-256 skip
+
+---
+
+## [1.5.0] — 2025-07-15
+
+### Added
+- HCL/Terraform parser
+- Dockerfile and Helm chart support
+- Multi-file diff support
+- Output compression modes (FULL / SIGNATURES / COMPRESSED / SMART)
+
+---
+
+## [1.4.0] — 2025-05-01
+
+### Added
+- 14-language parsing support
+- MCP server with initial tool set
+- SQLite persistence layer (GraphStore)
+- CLI entry point (`graphsift build` / `graphsift install`)
+
+---
+
+## [1.3.0] — 2025-03-01
+
+### Added
+- Diff-aware context trimming
+- Relevance ranking with F1 optimization
+- Token budget enforcement
+
+---
+
+## [1.2.0] — 2025-01-15
+
+### Added
+- AST dependency graph construction
+- Blast-radius analysis for Python
+- Initial ContextBuilder API
+
+---
+
+## [1.1.0] — 2024-11-01
+
+### Added
+- Basic language detection (Python, JS, Go)
+- Generic and bash parser support
+
+---
+
+## [1.0.0] — 2024-09-15
+
+### Added
+- Initial release with core graph construction and basic context selection
+
+[2.2.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v2.2.0
+[2.1.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v2.1.0
+[2.0.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v2.0.0
+[1.7.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.7.0
+[1.6.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.6.0
+[1.5.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.5.0
+[1.4.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.4.0
+[1.3.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.3.0
+[1.2.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.2.0
+[1.1.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.1.0
+[1.0.0]: https://github.com/maheshmakvana/graphsift/releases/tag/v1.0.0

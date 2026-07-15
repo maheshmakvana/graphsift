@@ -1,14 +1,22 @@
 """Read deduplication — fingerprint files and return stubs on repeat reads.
 
 Prevents the same file content from entering the context window twice.
-On first read, the file is fingerprinted (SHA256). On subsequent reads
-within the same session, returns a stub referencing the prior read.
+Uses SHA-256 content fingerprinting to detect identical reads within
+the same session.
+
+On first read, the file content is hashed and cached. On subsequent reads
+of the same file with the same fingerprint, a short stub is returned
+instead of the full content — saving significant tokens for files that
+are repeatedly accessed during agentic workflows.
+
+Supports invalidation when files change (call ``invalidate(path)`` after
+modification), and full session reset via ``clear()``.
 
 Usage::
     cache = ReadCache()
     content = cache.read("src/main.py", lambda: open("src/main.py").read())
     # First call: returns full content
-    # Second call: returns stub
+    # Second call: returns "[graphsift] ... same content ... Skipping."
 """
 
 from __future__ import annotations

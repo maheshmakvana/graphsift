@@ -3,12 +3,29 @@
 Tracks symbol and file changes across git history, providing bi-temporal
 queries (point-in-time, range-diff) and recency-boosted relevance scoring.
 
-Architecture:
-  TemporalGraph  — wraps DependencyGraph with git-log awareness via subprocess
-  SymbolVersion  — a single commit-level event for one symbol
-  FileVersion    — a single commit-level event for one file
-  CommitInfo     — parsed commit metadata
-  TemporalStats  — summary of index_history() run
+The ``TemporalGraph`` wraps an optional ``DependencyGraph`` and correlates
+its parsed symbols with git-log provenance — allowing queries like "what
+symbols existed at commit X?" and "how recently was this file modified?".
+
+Uses only ``subprocess`` to call git — no GitPython dependency required.
+
+Data contracts:
+    TemporalGraph  — wraps DependencyGraph with git-log awareness
+    SymbolVersion  — a single commit-level event for one symbol
+    FileVersion    — a single commit-level event for one file
+    CommitInfo     — parsed commit metadata (hash, author, timestamp, message)
+    TemporalStats  — summary statistics from index_history()
+
+Usage::
+    tg = TemporalGraph("/path/to/repo", graph=dep_graph)
+    stats = tg.index_history(max_commits=500)
+    print(f"Indexed {stats.commits_indexed} commits, {stats.symbols_tracked} symbols")
+
+    # Query symbols at a point in time
+    symbols = tg.symbols_at("abc123def")
+
+    # Recency boost for relevance ranking
+    boost = tg.age_boost("src/auth.py")  # 0.0 (old) to 1.0 (new)
 """
 
 from __future__ import annotations

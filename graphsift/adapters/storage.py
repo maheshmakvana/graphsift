@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ..exceptions import GraphError
+from ..migrations import SchemaEvolution, SchemaRegistry
 from ..models import (
     EdgeKind,
     FileNode,
@@ -40,10 +41,22 @@ from ..models import (
     Language,
     NodeKind,
 )
+from ..pool import DatabasePool
 
 logger = logging.getLogger(__name__)
 
-_CURRENT_VERSION = 8
+_CURRENT_VERSION = 9
+
+# Schema version table for tracking model schema versions
+_SCHEMA_VERSION_SQL = (
+    "CREATE TABLE IF NOT EXISTS schema_version ("
+    "    name    TEXT PRIMARY KEY,"
+    "    version INTEGER NOT NULL DEFAULT 1"
+    ")"
+)
+
+# Auto-evolution instance
+_schema_evolution = SchemaEvolution()
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +245,18 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
             """,
         ],
     ),
+    (
+        9,
+        "created schema_version table for automated model schema migrations",
+        [
+            (
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "    name    TEXT PRIMARY KEY,"
+                "    version INTEGER NOT NULL DEFAULT 1"
+                ")"
+            ),
+        ],
+    ),
 ]
 
 
@@ -247,23 +272,36 @@ class GraphStore:
     migrations automatically on first open and logs each step just like
     ``code-review-graph`` does.
 
+    Uses :class:`DatabasePool` for connection pooling, auto-reconnect,
+    and thread-safe concurrent access.
+
     Args:
         db_path: Absolute path to the SQLite database file. Parent directory
             must exist (or be created by the caller).
+        max_connections: Maximum number of pooled connections (default 5).
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, max_connections: int = 5) -> None:
         self._db_path = str(db_path)
         self._lock = threading.RLock()
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._pool = DatabasePool(self._db_path, max_connections=max_connections)
         self._run_migrations()
 
     def __repr__(self) -> str:
         return f"GraphStore({self._db_path!r})"
+
+    # ------------------------------------------------------------------
+    # Connection helpers
+    # ------------------------------------------------------------------
+
+    def _execute(self, sql: str, params: Any = None) -> sqlite3.Cursor:
+        """Execute a single statement via the pool."""
+        return self._pool.execute(sql, params)
+
+    def _executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
+        """Execute a statement with multiple parameter sets."""
+        return self._pool.executemany(sql, params_list)
 
     # ------------------------------------------------------------------
     # Migrations
@@ -271,7 +309,7 @@ class GraphStore:
 
     def _schema_version(self) -> int:
         try:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()
             return row[0] or 0
@@ -280,56 +318,151 @@ class GraphStore:
 
     def _run_migrations(self) -> None:
         with self._lock:
-            # Bootstrap migrations table
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version    INTEGER PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    applied_at TEXT DEFAULT (datetime('now'))
-                )
-                """
-            )
-            self._conn.commit()
-
-            current = self._schema_version()
-            if current >= _CURRENT_VERSION:
-                logger.info("graphsift: schema already at version %d", current)
-                return
-
-            for version, description, statements in _MIGRATIONS:
-                if version <= current:
-                    continue
-                logger.info("INFO: Running migration v%d", version)
-                try:
-                    for sql in statements:
-                        self._conn.execute(sql.strip())
-                    self._conn.execute(
-                        "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
-                        (version, description),
+            conn = self._pool.acquire()
+            try:
+                # Bootstrap migrations table
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version    INTEGER PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        applied_at TEXT DEFAULT (datetime('now'))
                     )
-                    self._conn.commit()
-                    logger.info("INFO: Migration v%d: %s", version, description)
-                except sqlite3.OperationalError as exc:
-                    # FTS5 may not be available in all SQLite builds — skip gracefully
-                    if version == 5 and "no such module: fts5" in str(exc).lower():
-                        logger.warning(
-                            "graphsift: FTS5 not available in this SQLite build — skipping v5 migration"
-                        )
-                        self._conn.execute(
-                            "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
-                            (version, f"{description} [skipped: no fts5]"),
-                        )
-                        self._conn.commit()
-                    else:
-                        self._conn.rollback()
-                        raise GraphError(
-                            f"Migration v{version} failed: {exc}"
-                        ) from exc
+                    """
+                )
+                conn.commit()
 
-            logger.info(
-                "INFO: Migrations complete, now at schema version %d", _CURRENT_VERSION
-            )
+                current = self._schema_version()
+                if current >= _CURRENT_VERSION:
+                    logger.info("graphsift: schema already at version %d", current)
+                    return
+
+                for version, description, statements in _MIGRATIONS:
+                    if version <= current:
+                        continue
+                    logger.info("INFO: Running migration v%d", version)
+                    try:
+                        for sql in statements:
+                            conn.execute(sql.strip())
+                        conn.execute(
+                            "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
+                            (version, description),
+                        )
+                        conn.commit()
+                        logger.info("INFO: Migration v%d: %s", version, description)
+                    except sqlite3.OperationalError as exc:
+                        # FTS5 may not be available in all SQLite builds — skip gracefully
+                        if version == 5 and "no such module: fts5" in str(exc).lower():
+                            logger.warning(
+                                "graphsift: FTS5 not available in this SQLite build — skipping v5 migration"
+                            )
+                            conn.execute(
+                                "INSERT INTO schema_migrations(version, description) VALUES(?, ?)",
+                                (version, f"{description} [skipped: no fts5]"),
+                            )
+                            conn.commit()
+                        else:
+                            conn.rollback()
+                            raise GraphError(
+                                f"Migration v{version} failed: {exc}"
+                            ) from exc
+
+                logger.info(
+                    "INFO: Migrations complete, now at schema version %d", _CURRENT_VERSION
+                )
+            finally:
+                self._pool.release(conn)
+
+    # ------------------------------------------------------------------
+    # Schema version tracking (model-level, not table-level)
+    # ------------------------------------------------------------------
+
+    def _get_model_version(self, name: str) -> int:
+        """Get the stored schema version for a model family.
+
+        Args:
+            name: Schema family name (e.g. "ContextConfig", "GraphNode").
+
+        Returns:
+            Version number, or 1 if not tracked.
+        """
+        row = self._conn.execute(
+            "SELECT version FROM schema_version WHERE name = ?",
+            (name,),
+        ).fetchone()
+        return row[0] if row else 1
+
+    def _set_model_version(self, name: str, version: int) -> None:
+        """Set or update the stored schema version for a model family.
+
+        Args:
+            name: Schema family name.
+            version: Version number to store.
+        """
+        self._conn.execute(
+            """
+            INSERT INTO schema_version (name, version)
+            VALUES (?, ?)
+            ON CONFLICT(name) DO UPDATE SET version = excluded.version
+            """,
+            (name, version),
+        )
+        self._conn.commit()
+
+    def auto_migrate_data(
+        self,
+        name: str,
+        data: dict,
+        target_version: int | None = None,
+    ) -> dict:
+        """Auto-migrate a data dict to the current schema version.
+
+        Uses :class:`~graphsift.migrations.SchemaRegistry` to apply
+        migrations. Updates the stored version for the model family.
+
+        Args:
+            name: Schema family name.
+            data: Data dict to migrate.
+            target_version: Target version (default: latest registered).
+
+        Returns:
+            Migrated data dict.
+        """
+        stored_v = self._get_model_version(name)
+        data_v = data.get("schema_version", stored_v)
+        target = target_version or SchemaRegistry.current_version(name)
+
+        if data_v == target:
+            return data
+
+        migrated = SchemaRegistry.migrate(name, data, data_v, target)
+        return migrated
+
+    def ensure_schema_version(self, name: str, data: dict) -> dict:
+        """Ensure data has the correct schema_version field set.
+
+        If data doesn't have schema_version, it's inferred from the stored
+        version. If the stored version is behind the latest, auto-migrate.
+
+        Args:
+            name: Schema family name.
+            data: Data dict (possibly without schema_version).
+
+        Returns:
+            Validated and migrated data dict.
+        """
+        stored_v = self._get_model_version(name)
+        latest_v = SchemaRegistry.current_version(name)
+
+        if "schema_version" not in data:
+            data["schema_version"] = stored_v
+
+        if data["schema_version"] < latest_v:
+            data = self.auto_migrate_data(name, data)
+            # Update stored version
+            self._set_model_version(name, latest_v)
+
+        return data
 
     # ------------------------------------------------------------------
     # Nodes
@@ -342,49 +475,53 @@ class GraphStore:
             nodes: Nodes to persist.
         """
         with self._lock:
-            self._conn.executemany(
-                """
-                INSERT INTO nodes
-                    (node_id, file_path, kind, name, qualified_name,
-                     line_start, line_end, language, signature, decorators,
-                     is_async, is_dynamic, community_id, metadata)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(node_id) DO UPDATE SET
-                    file_path=excluded.file_path,
-                    kind=excluded.kind,
-                    name=excluded.name,
-                    qualified_name=excluded.qualified_name,
-                    line_start=excluded.line_start,
-                    line_end=excluded.line_end,
-                    language=excluded.language,
-                    signature=excluded.signature,
-                    decorators=excluded.decorators,
-                    is_async=excluded.is_async,
-                    is_dynamic=excluded.is_dynamic,
-                    community_id=excluded.community_id,
-                    metadata=excluded.metadata
-                """,
-                [
-                    (
-                        n.node_id,
-                        n.file_path,
-                        n.kind.value,
-                        n.name,
-                        n.qualified_name,
-                        n.line_start,
-                        n.line_end,
-                        n.language.value,
-                        n.signature,
-                        json.dumps(n.decorators),
-                        int(n.is_async),
-                        int(n.is_dynamic),
-                        n.community_id,
-                        json.dumps(n.metadata),
-                    )
-                    for n in nodes
-                ],
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO nodes
+                        (node_id, file_path, kind, name, qualified_name,
+                         line_start, line_end, language, signature, decorators,
+                         is_async, is_dynamic, community_id, metadata)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        file_path=excluded.file_path,
+                        kind=excluded.kind,
+                        name=excluded.name,
+                        qualified_name=excluded.qualified_name,
+                        line_start=excluded.line_start,
+                        line_end=excluded.line_end,
+                        language=excluded.language,
+                        signature=excluded.signature,
+                        decorators=excluded.decorators,
+                        is_async=excluded.is_async,
+                        is_dynamic=excluded.is_dynamic,
+                        community_id=excluded.community_id,
+                        metadata=excluded.metadata
+                    """,
+                    [
+                        (
+                            n.node_id,
+                            n.file_path,
+                            n.kind.value,
+                            n.name,
+                            n.qualified_name,
+                            n.line_start,
+                            n.line_end,
+                            n.language.value,
+                            n.signature,
+                            json.dumps(n.decorators),
+                            int(n.is_async),
+                            int(n.is_dynamic),
+                            n.community_id,
+                            json.dumps(n.metadata),
+                        )
+                        for n in nodes
+                    ],
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def load_nodes(self) -> list[GraphNode]:
         """Load all nodes from the database.
@@ -392,8 +529,7 @@ class GraphStore:
         Returns:
             List of GraphNode instances.
         """
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM nodes").fetchall()
+        rows = self._execute("SELECT * FROM nodes").fetchall()
         result: list[GraphNode] = []
         for row in rows:
             try:
@@ -431,9 +567,10 @@ class GraphStore:
         Returns:
             Matching GraphNode instances.
         """
-        with self._lock:
+        conn = self._pool.acquire()
+        try:
             try:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     """
                     SELECT n.* FROM nodes n
                     JOIN nodes_fts f ON n.node_id = f.node_id
@@ -445,10 +582,12 @@ class GraphStore:
             except sqlite3.OperationalError:
                 # FTS5 not available — fall back to LIKE
                 like = f"%{query}%"
-                rows = self._conn.execute(
+                rows = conn.execute(
                     "SELECT * FROM nodes WHERE name LIKE ? OR qualified_name LIKE ? LIMIT ?",
                     (like, like, limit),
                 ).fetchall()
+        finally:
+            self._pool.release(conn)
 
         result: list[GraphNode] = []
         for row in rows:
@@ -486,26 +625,30 @@ class GraphStore:
             edges: Edges to persist.
         """
         with self._lock:
-            self._conn.executemany(
-                """
-                INSERT INTO edges (source_id, target_id, kind, weight, metadata)
-                VALUES (?,?,?,?,?)
-                ON CONFLICT(source_id, target_id, kind) DO UPDATE SET
-                    weight=excluded.weight,
-                    metadata=excluded.metadata
-                """,
-                [
-                    (
-                        e.source_id,
-                        e.target_id,
-                        e.kind.value,
-                        e.weight,
-                        json.dumps(e.metadata),
-                    )
-                    for e in edges
-                ],
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO edges (source_id, target_id, kind, weight, metadata)
+                    VALUES (?,?,?,?,?)
+                    ON CONFLICT(source_id, target_id, kind) DO UPDATE SET
+                        weight=excluded.weight,
+                        metadata=excluded.metadata
+                    """,
+                    [
+                        (
+                            e.source_id,
+                            e.target_id,
+                            e.kind.value,
+                            e.weight,
+                            json.dumps(e.metadata),
+                        )
+                        for e in edges
+                    ],
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def load_edges(self) -> list[GraphEdge]:
         """Load all edges from the database.
@@ -513,8 +656,7 @@ class GraphStore:
         Returns:
             List of GraphEdge instances.
         """
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM edges").fetchall()
+        rows = self._execute("SELECT * FROM edges").fetchall()
         result: list[GraphEdge] = []
         for row in rows:
             try:
@@ -542,38 +684,42 @@ class GraphStore:
             files: Files to persist.
         """
         with self._lock:
-            self._conn.executemany(
-                """
-                INSERT INTO files
-                    (path, language, size_bytes, line_count, sha256,
-                     token_estimate, imports, dynamic_imports, metadata)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(path) DO UPDATE SET
-                    language=excluded.language,
-                    size_bytes=excluded.size_bytes,
-                    line_count=excluded.line_count,
-                    sha256=excluded.sha256,
-                    token_estimate=excluded.token_estimate,
-                    imports=excluded.imports,
-                    dynamic_imports=excluded.dynamic_imports,
-                    metadata=excluded.metadata
-                """,
-                [
-                    (
-                        f.path,
-                        f.language.value,
-                        f.size_bytes,
-                        f.line_count,
-                        f.sha256,
-                        f.token_estimate,
-                        json.dumps(f.imports),
-                        json.dumps(f.dynamic_imports),
-                        json.dumps(f.metadata),
-                    )
-                    for f in files
-                ],
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO files
+                        (path, language, size_bytes, line_count, sha256,
+                         token_estimate, imports, dynamic_imports, metadata)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        language=excluded.language,
+                        size_bytes=excluded.size_bytes,
+                        line_count=excluded.line_count,
+                        sha256=excluded.sha256,
+                        token_estimate=excluded.token_estimate,
+                        imports=excluded.imports,
+                        dynamic_imports=excluded.dynamic_imports,
+                        metadata=excluded.metadata
+                    """,
+                    [
+                        (
+                            f.path,
+                            f.language.value,
+                            f.size_bytes,
+                            f.line_count,
+                            f.sha256,
+                            f.token_estimate,
+                            json.dumps(f.imports),
+                            json.dumps(f.dynamic_imports),
+                            json.dumps(f.metadata),
+                        )
+                        for f in files
+                    ],
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def load_files(self) -> list[FileNode]:
         """Load all files from the database.
@@ -581,8 +727,7 @@ class GraphStore:
         Returns:
             List of FileNode instances (symbols list is empty — use load_nodes for symbols).
         """
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM files").fetchall()
+        rows = self._execute("SELECT * FROM files").fetchall()
         result: list[FileNode] = []
         for row in rows:
             try:
@@ -617,18 +762,22 @@ class GraphStore:
             metadata: Additional metadata dict.
         """
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO communities (community_id, label, node_count, metadata)
-                VALUES (?,?,?,?)
-                ON CONFLICT(community_id) DO UPDATE SET
-                    label=excluded.label,
-                    node_count=excluded.node_count,
-                    metadata=excluded.metadata
-                """,
-                (community_id, label, node_count, json.dumps(metadata or {})),
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO communities (community_id, label, node_count, metadata)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(community_id) DO UPDATE SET
+                        label=excluded.label,
+                        node_count=excluded.node_count,
+                        metadata=excluded.metadata
+                    """,
+                    (community_id, label, node_count, json.dumps(metadata or {})),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def assign_community(self, node_id: str, community_id: int) -> None:
         """Set the community_id for a node.
@@ -638,11 +787,15 @@ class GraphStore:
             community_id: Community cluster ID to assign.
         """
         with self._lock:
-            self._conn.execute(
-                "UPDATE nodes SET community_id=? WHERE node_id=?",
-                (community_id, node_id),
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.execute(
+                    "UPDATE nodes SET community_id=? WHERE node_id=?",
+                    (community_id, node_id),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def load_communities(self) -> list[dict[str, Any]]:
         """Load all community records.
@@ -650,8 +803,7 @@ class GraphStore:
         Returns:
             List of dicts with community_id, label, node_count, metadata.
         """
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM communities").fetchall()
+        rows = self._execute("SELECT * FROM communities").fetchall()
         return [
             {
                 "community_id": row["community_id"],
@@ -676,19 +828,23 @@ class GraphStore:
             metadata: Additional metadata.
         """
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO risk_index (file_path, risk_score, reasons, computed_at, metadata)
-                VALUES (?, ?, ?, datetime('now'), ?)
-                ON CONFLICT(file_path) DO UPDATE SET
-                    risk_score=excluded.risk_score,
-                    reasons=excluded.reasons,
-                    computed_at=excluded.computed_at,
-                    metadata=excluded.metadata
-                """,
-                (file_path, risk_score, json.dumps(reasons), json.dumps(metadata or {})),
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO risk_index (file_path, risk_score, reasons, computed_at, metadata)
+                    VALUES (?, ?, ?, datetime('now'), ?)
+                    ON CONFLICT(file_path) DO UPDATE SET
+                        risk_score=excluded.risk_score,
+                        reasons=excluded.reasons,
+                        computed_at=excluded.computed_at,
+                        metadata=excluded.metadata
+                    """,
+                    (file_path, risk_score, json.dumps(reasons), json.dumps(metadata or {})),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def load_risk_index(self, min_score: float = 0.0) -> list[dict[str, Any]]:
         """Load risk index entries above a minimum score.
@@ -699,11 +855,10 @@ class GraphStore:
         Returns:
             List of dicts sorted by risk_score descending.
         """
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM risk_index WHERE risk_score >= ? ORDER BY risk_score DESC",
-                (min_score,),
-            ).fetchall()
+        rows = self._execute(
+            "SELECT * FROM risk_index WHERE risk_score >= ? ORDER BY risk_score DESC",
+            (min_score,),
+        ).fetchall()
         return [
             {
                 "file_path": row["file_path"],
@@ -729,20 +884,24 @@ class GraphStore:
             metadata: Additional metadata.
         """
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO community_summaries
-                    (community_id, summary_text, key_symbols, created_at, metadata)
-                VALUES (?, ?, ?, datetime('now'), ?)
-                ON CONFLICT(community_id) DO UPDATE SET
-                    summary_text=excluded.summary_text,
-                    key_symbols=excluded.key_symbols,
-                    created_at=excluded.created_at,
-                    metadata=excluded.metadata
-                """,
-                (community_id, summary_text, json.dumps(key_symbols), json.dumps(metadata or {})),
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO community_summaries
+                        (community_id, summary_text, key_symbols, created_at, metadata)
+                    VALUES (?, ?, ?, datetime('now'), ?)
+                    ON CONFLICT(community_id) DO UPDATE SET
+                        summary_text=excluded.summary_text,
+                        key_symbols=excluded.key_symbols,
+                        created_at=excluded.created_at,
+                        metadata=excluded.metadata
+                    """,
+                    (community_id, summary_text, json.dumps(key_symbols), json.dumps(metadata or {})),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     # ------------------------------------------------------------------
     # Flow snapshots
@@ -762,16 +921,20 @@ class GraphStore:
             Row ID of the inserted snapshot.
         """
         with self._lock:
-            cur = self._conn.execute(
-                """
-                INSERT INTO flow_snapshots
-                    (flow_name, entry_point, nodes_json, edges_json, created_at, metadata)
-                VALUES (?, ?, ?, ?, datetime('now'), ?)
-                """,
-                (flow_name, entry_point, json.dumps(nodes), json.dumps(edges), json.dumps(metadata or {})),
-            )
-            self._conn.commit()
-            return cur.lastrowid or 0
+            conn = self._pool.acquire()
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO flow_snapshots
+                        (flow_name, entry_point, nodes_json, edges_json, created_at, metadata)
+                    VALUES (?, ?, ?, ?, datetime('now'), ?)
+                    """,
+                    (flow_name, entry_point, json.dumps(nodes), json.dumps(edges), json.dumps(metadata or {})),
+                )
+                conn.commit()
+                return cur.lastrowid or 0
+            finally:
+                self._pool.release(conn)
 
     # ------------------------------------------------------------------
     # Session memory — cross-session context reuse
@@ -791,30 +954,34 @@ class GraphStore:
             context_data: Dict with rendered_context, selected_file_paths, token stats.
         """
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO session_memory
-                    (session_id, diff_spec_hash, context_json,
-                     files_selected, tokens_rendered, reduction_ratio)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id, diff_spec_hash) DO UPDATE SET
-                    context_json=excluded.context_json,
-                    files_selected=excluded.files_selected,
-                    tokens_rendered=excluded.tokens_rendered,
-                    reduction_ratio=excluded.reduction_ratio,
-                    last_accessed_at=datetime('now'),
-                    access_count=access_count + 1
-                """,
-                (
-                    session_id,
-                    diff_spec_hash,
-                    json.dumps(context_data),
-                    context_data.get("files_selected"),
-                    context_data.get("total_rendered_tokens"),
-                    context_data.get("reduction_ratio"),
-                ),
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO session_memory
+                        (session_id, diff_spec_hash, context_json,
+                         files_selected, tokens_rendered, reduction_ratio)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, diff_spec_hash) DO UPDATE SET
+                        context_json=excluded.context_json,
+                        files_selected=excluded.files_selected,
+                        tokens_rendered=excluded.tokens_rendered,
+                        reduction_ratio=excluded.reduction_ratio,
+                        last_accessed_at=datetime('now'),
+                        access_count=access_count + 1
+                    """,
+                    (
+                        session_id,
+                        diff_spec_hash,
+                        json.dumps(context_data),
+                        context_data.get("files_selected"),
+                        context_data.get("total_rendered_tokens"),
+                        context_data.get("reduction_ratio"),
+                    ),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def load_session_context(
         self,
@@ -832,8 +999,9 @@ class GraphStore:
         Returns:
             The stored context_data dict, or None if missing or expired.
         """
-        with self._lock:
-            row = self._conn.execute(
+        conn = self._pool.acquire()
+        try:
+            row = conn.execute(
                 """
                 SELECT *,
                        julianday('now') - julianday(created_at) AS age_days
@@ -852,7 +1020,7 @@ class GraphStore:
                 )
                 return None
             # Bump access count and last_accessed_at
-            self._conn.execute(
+            conn.execute(
                 """
                 UPDATE session_memory
                 SET access_count = access_count + 1,
@@ -861,12 +1029,14 @@ class GraphStore:
                 """,
                 (row["id"],),
             )
-            self._conn.commit()
+            conn.commit()
             data = json.loads(row["context_json"])
             data["_cached_at"] = row["created_at"]
             data["_access_count"] = row["access_count"] + 1
             data["_memory_id"] = row["id"]
             return data
+        finally:
+            self._pool.release(conn)
 
     def list_recent_sessions(self, limit: int = 10) -> list[dict]:
         """List recent sessions with their metadata.
@@ -877,18 +1047,17 @@ class GraphStore:
         Returns:
             List of dicts with session metadata (no context_json body).
         """
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT id, session_id, diff_spec_hash,
-                       files_selected, tokens_rendered, reduction_ratio,
-                       created_at, last_accessed_at, access_count
-                FROM session_memory
-                ORDER BY last_accessed_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+        rows = self._execute(
+            """
+            SELECT id, session_id, diff_spec_hash,
+                   files_selected, tokens_rendered, reduction_ratio,
+                   created_at, last_accessed_at, access_count
+            FROM session_memory
+            ORDER BY last_accessed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
         return [
             {
                 "id": r["id"],
@@ -920,14 +1089,18 @@ class GraphStore:
         if rating < 1 or rating > 5:
             raise ValueError("rating must be between 1 and 5")
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO context_feedback (context_id, rating, notes)
-                VALUES (?, ?, ?)
-                """,
-                (context_id, rating, notes),
-            )
-            self._conn.commit()
+            conn = self._pool.acquire()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO context_feedback (context_id, rating, notes)
+                    VALUES (?, ?, ?)
+                    """,
+                    (context_id, rating, notes),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
 
     def get_context_quality_stats(self) -> dict:
         """Return aggregate stats on context quality from feedback.
@@ -936,9 +1109,10 @@ class GraphStore:
             Dict with count, average_rating, rating_distribution, and
             recent_feedback summary.
         """
-        with self._lock:
+        conn = self._pool.acquire()
+        try:
             # Overall stats
-            stats_row = self._conn.execute(
+            stats_row = conn.execute(
                 """
                 SELECT COUNT(*) AS count,
                        ROUND(AVG(rating), 2) AS avg_rating,
@@ -948,7 +1122,7 @@ class GraphStore:
                 """,
             ).fetchone()
             # Rating distribution
-            dist_rows = self._conn.execute(
+            dist_rows = conn.execute(
                 """
                 SELECT rating, COUNT(*) AS cnt
                 FROM context_feedback
@@ -957,7 +1131,7 @@ class GraphStore:
                 """,
             ).fetchall()
             # Recent feedback with context info
-            recent = self._conn.execute(
+            recent = conn.execute(
                 """
                 SELECT f.id, f.rating, f.notes, f.created_at,
                        s.session_id, s.diff_spec_hash
@@ -967,6 +1141,8 @@ class GraphStore:
                 LIMIT 20
                 """,
             ).fetchall()
+        finally:
+            self._pool.release(conn)
 
         count = stats_row["count"] if stats_row else 0
         return {
@@ -1004,7 +1180,7 @@ class GraphStore:
         with self._lock:
             def _count(table: str) -> int:
                 try:
-                    return self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    return self._execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 except sqlite3.OperationalError:
                     return 0
 
@@ -1023,9 +1199,8 @@ class GraphStore:
             }
 
     def close(self) -> None:
-        """Close the underlying SQLite connection."""
-        with self._lock:
-            self._conn.close()
+        """Close the underlying database pool."""
+        self._pool.close()
 
     def __enter__(self) -> "GraphStore":
         return self
