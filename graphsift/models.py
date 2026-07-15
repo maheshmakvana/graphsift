@@ -100,6 +100,21 @@ class DepthTier(str, Enum):
     EXECUTION = "execution"
 
 
+class BudgetMode(str, Enum):
+    """How to allocate token budget across selected files."""
+    FIXED = "fixed"           # Equal share per file (current behavior)
+    ADAPTIVE = "adaptive"     # Weighted by centrality/complexity
+    PER_PHASE = "per_phase"   # Allocate per-plan-phase
+
+
+class PruningStrategy(str, Enum):
+    """How aggressively to prune redundant content from rendered context."""
+    NONE = "none"             # No pruning (current behavior)
+    LIGHT = "light"           # Only remove exact duplicate blocks
+    BALANCED = "balanced"     # Remove duplicates + near-duplicates (SimHash)
+    AGGRESSIVE = "aggressive" # Remove duplicates, near-duplicates, and boilerplate
+
+
 # ---------------------------------------------------------------------------
 # Graph nodes and edges
 # ---------------------------------------------------------------------------
@@ -311,6 +326,28 @@ class ContextConfig(BaseModel):
         description="Enable entropy-based deduplication of near-identical files to improve context diversity.",
     )
     schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
+
+    # -- Adaptive budgeting & pruning (v2.4+) --
+    budget_mode: BudgetMode = Field(
+        default=BudgetMode.FIXED,
+        description="How to allocate token budget across selected files.",
+    )
+    pruning_strategy: PruningStrategy = Field(
+        default=PruningStrategy.NONE,
+        description="How aggressively to prune redundant content.",
+    )
+    centrality_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Weight given to graph centrality in adaptive budget allocation.",
+    )
+    overlap_threshold: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Token overlap ratio threshold that triggers dedup during pruning.",
+    )
 
 
 class ContextResult(BaseModel):

@@ -57,6 +57,14 @@ Tag every factual claim with its verification level:
 
 If you cannot verify a claim from the provided context,
 use **[UNKNOWN]** — do not fabricate evidence.
+
+## Output Evidence Enforcement (AUTO-VERIFIED)
+Every file:line claim in your output MUST reference a real file on disk.
+Before returning output, verify every file:line reference against the actual filesystem.
+Unverifiable claims MUST be marked [UNKNOWN] — do not fabricate evidence.
+Output will be scanned by EvidenceChecker after generation.
+Every file:line reference will be validated against the actual filesystem.
+Invalid references will be flagged. You are responsible for accuracy.
 """
 
 _ANTI_HALLUCINATION_RULES = """

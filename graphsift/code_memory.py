@@ -54,6 +54,7 @@ MEMORY_TYPES = {
     "note": {"ttl_days": 90, "description": "General observation"},
     "bug": {"ttl_days": 30, "description": "Known bug or issue"},
     "insight": {"ttl_days": 180, "description": "Deep understanding gained"},
+    "convention": {"ttl_days": 365, "description": "Code style or naming convention"},
 }
 
 

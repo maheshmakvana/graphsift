@@ -1,5 +1,6 @@
 """Stress test: index 10,000 generated source files, measure time/memory."""
 
+import os
 import time
 import gc
 import pytest
@@ -7,6 +8,8 @@ import pytest
 from graphsift import ContextBuilder, ContextConfig
 
 pytestmark = [pytest.mark.stress, pytest.mark.slow]
+
+_XDIST_ACTIVE = os.environ.get("PYTEST_XDIST_WORKER") is not None
 
 
 def _generate_source_files(count: int, base_path: str = "src") -> dict[str, str]:
@@ -98,6 +101,10 @@ class TestLargeRepoIndexing:
             f"Indexing too slow: {files_per_sec:.0f} files/sec"
         )
 
+    @pytest.mark.skipif(
+        _XDIST_ACTIVE,
+        reason="10k-file stress test requires full memory — skip under xdist parallel mode",
+    )
     def test_index_10000_files(self):
         """Index 10,000 files to test large-scale performance."""
         source_map = _generate_source_files(10_000)

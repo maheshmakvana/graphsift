@@ -14,11 +14,24 @@ WITH vs WITHOUT graphsift (15 scenarios, 2,748 tokens tested):
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import re
 import sys
 from pathlib import Path
 from typing import Callable
+
+# ---------------------------------------------------------------------------
+# Compression level
+# ---------------------------------------------------------------------------
+
+
+class CompressionLevel(str, enum.Enum):
+    """How aggressively to compress output."""
+    LIGHT = "light"         # Single pass: existing command-specific compressor
+    BALANCED = "balanced"   # Two passes: compressor + deduplicate
+    ULTRA = "ultra"         # Three passes: compressor + dedup + semantic compression
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -896,6 +909,107 @@ def compress(text: str, command: str = "auto", ultra: bool = False) -> str:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Ultra compression — multi-pass
+# ---------------------------------------------------------------------------
+
+
+def _semantic_compress(text: str) -> str:
+    """Detect and collapse repeated block / boilerplate patterns.
+
+    Third pass after command-specific compression and deduplication.
+    Finds blocks of 3+ consecutive identical lines appearing elsewhere
+    and replaces them with a count marker.
+    """
+    lines = text.split("\n")
+    if len(lines) < 10:
+        return text
+
+    # Count line frequencies across the whole output
+    from collections import Counter
+    line_counts = Counter(lines)
+
+    # Find repeated blocks (3+ consecutive lines that appear together)
+    # Simple approach: mark lines that appear more than once
+    collapsed: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # If this line appears 3+ times and is not an error/signal line
+        if line_counts[line] >= 3 and line.strip() and not any(
+            s in line.lower() for s in ("error", "fail", "traceback", "exception", "warning")
+        ):
+            # Count consecutive duplicates
+            count = 1
+            while i + count < len(lines) and lines[i + count] == line:
+                count += 1
+            if count > 2:
+                collapsed.append(f"{line}  (x{count})")
+                i += count
+                continue
+        collapsed.append(line)
+        i += 1
+
+    # Second pass: collapse getter/setter / trivial method patterns
+    boiler_re = re.compile(
+        r"^\s*(?:def (get|set|is|has)_\w+|return self\.\w+|pass\s*#)"
+    )
+    filtered: list[str] = []
+    boiler_count = 0
+    for line in collapsed:
+        if boiler_re.match(line):
+            boiler_count += 1
+        else:
+            if boiler_count > 0:
+                filtered.append(f"    ... ({boiler_count} boilerplate lines)")
+                boiler_count = 0
+            filtered.append(line)
+    if boiler_count > 0:
+        filtered.append(f"    ... ({boiler_count} boilerplate lines)")
+
+    return "\n".join(filtered)
+
+
+def ultra_compress(
+    text: str,
+    command: str = "auto",
+    passes: int = 2,
+    level: CompressionLevel = CompressionLevel.BALANCED,
+) -> str:
+    """Multi-pass compression that chains strategies for extra savings.
+
+    Pass 1: existing command-specific compressor or auto-detect.
+    Pass 2: deduplicate consecutive identical lines.
+    Pass 3 (ULTRA only): semantic compression — collapse boilerplate
+    and repeated blocks.
+
+    Args:
+        text: Raw CLI output text.
+        command: Command type hint (``"auto"`` = auto-detect).
+        passes: Number of compression passes (2 or 3).
+        level: ``CompressionLevel`` enum.
+
+    Returns:
+        Compressed text, always <= original length.
+    """
+    resolved = command if command != "auto" else detect_type(text)
+    compressor = COMPRESSORS.get(resolved, compress_generic)
+
+    # Pass 1: existing compressor
+    result = compressor(text)
+    result = result or text  # fallback
+
+    # Pass 2: deduplicate
+    if passes >= 2 or level in (CompressionLevel.BALANCED, CompressionLevel.ULTRA):
+        result = deduplicate(result, threshold=1)
+
+    # Pass 3: semantic compression
+    if passes >= 3 or level == CompressionLevel.ULTRA:
+        result = _semantic_compress(result)
+
+    return result
+
+
 def compress_tee(
     text: str,
     command: str = "auto",
@@ -968,6 +1082,21 @@ def _cli() -> None:
     result = compress(text, command=args.type, ultra=args.ultra)
     sys.stdout.write(result)
 
+
+__all__ = [
+    "compress",
+    "compress_tee",
+    "ultra_compress",
+    "_semantic_compress",
+    "deduplicate",
+    "truncate_middle",
+    "filter_lines",
+    "detect_type",
+    "set_tee_dir",
+    "tee_save",
+    "CompressionLevel",
+    "COMPRESSORS",
+]
 
 if __name__ == "__main__":
     _cli()

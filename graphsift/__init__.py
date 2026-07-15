@@ -1,4 +1,4 @@
-"""graphsift — #1 Token Saver for Claude, GPT-4, Gemini & Every LLM.
+"""graphsift v3.0 — #1 Token Saver for Claude, GPT-4, Gemini & Every LLM.
 
 Created by Mahesh Makwana (https://github.com/maheshmakvana).
 
@@ -6,6 +6,11 @@ The Python library that slashes LLM token costs for AI-assisted code review,
 debugging, and code generation. Save 80-150x tokens on every code review with
 Claude Code, GPT-4, Gemini, Codex, or any LLM — zero data exfiltration, zero
 telemetry, zero API calls from library code.
+
+v3.0 delivers 11 new modules, 702 tests (+115%), and 93% feature coverage
+(25/27 features). Includes Planner, ToolChain, AutoVerifier, ConventionLearner,
+ContextEnricher, AsyncEngine, 2-tier ASTCache, SecurePipeline, DataScrubber,
+and SchemaRegistry.
 
 Why graphsift?
 Instead of sending your entire codebase (or using binary blast-radius),
@@ -22,16 +27,19 @@ Core capabilities:
 - Diff-aware context trimming — only changed regions + context
 - Entropy-based deduplication — SimHash near-duplicate detection
 - 14-language AST parsing + 11-language tree-sitter precise parsing
-- 25 CLI command compressors (pytest 94%, grep 97%, git diff 93%, npm 89%, pip 90%, make 89%, docker 82%, go_test 71%, eslint 84%, and more)
+- 19 CLI command compressors + ultra_compress mode
 - Cache-aware output with Claude/GPT prompt-cache breakpoints
-- Hybrid search — BM25 + TF-IDF + optional dense vector fusion
-- MCP server — 7 token-saving tools for Claude Code automatic integration
+- Hybrid search — BM25 + TF-IDF + optional dense vector fusion (3 modes)
+- MCP server — token-saving tools for Claude Code automatic integration
 - Conversation compaction — 60-82% agent conversation savings
 - Temporal graph — git-history-aware symbol tracking
-- Agent memory — SQLite-backed cross-session persistence
+- 3 memory systems — AgentMemory, CodeMemory (7 types), TieredMemory (4 tiers)
 - A2A protocol — Agent-to-Agent communication server
-- Security — path traversal protection, command injection prevention
+- Security — PathValidator + CommandSanitizer + DataScrubber + SecurePipeline
 - Auto-fix suggestions — 5 categories of graph-based fixes
+- Planning — Planner (7 phases), ToolChain (DAG workflows), AutoVerifier (cascade)
+- Concurrency — AsyncEngine, ProcessPool, DatabasePool (3 concurrency tiers)
+- 6 Fable5 prompt templates with [VERIFIED-REAL] markers, confidence tiers
 
 WITH vs WITHOUT graphsift (15 daily-dev scenarios tested):
   WITHOUT: Claude reads 2,748 tokens of raw output per session — ANSI escapes, timestamps,
@@ -70,6 +78,16 @@ Quick start::
     from graphsift import compress
     saved = compress(pytest_output, "pytest")  # 90% compression
 
+    # Autonomous planning workflow (v3.0+)
+    from graphsift.planner import Planner
+    plan = planner.create_plan("Add OAuth2", changed_files=["src/auth.py"])
+    result = planner.execute_plan(plan)
+
+    # Self-verification cascade (v3.0+)
+    from graphsift.auto_verify import AutoVerifier
+    verifier = AutoVerifier()
+    final_result = verifier.verify_and_fix(changed_code, max_retries=3)
+
 Save Claude tokens. Reduce GPT-4 costs. Optimize Gemini context windows.
 All with zero telemetry, zero accounts, and zero API calls.
 """
@@ -106,6 +124,7 @@ from .exceptions import (
     ValidationError,
 )
 from .models import (
+    BudgetMode,
     ContextConfig,
     ContextResult,
     DiffSpec,
@@ -120,6 +139,7 @@ from .models import (
     Language,
     NodeKind,
     OutputMode,
+    PruningStrategy,
     ScoredFile,
     SourceConfidence,
 )
@@ -145,7 +165,7 @@ from .adapters.postprocess import (
     RiskScorer,
     WikiGenerator,
 )
-from .compress import compress, compress_tee, COMPRESSORS, detect_type as detect_command_type
+from .compress import compress, compress_tee, COMPRESSORS, detect_type as detect_command_type, CompressionLevel, ultra_compress
 from .analytics import gain, discover, history, record_call, summary_line, reset as reset_analytics
 from .hybrid_search import HybridSearcher
 from .memory import AgentMemory, MemoryFact, SessionInfo
@@ -160,7 +180,7 @@ from .code_memory import CodeMemory, CodeMemoryEntry, CodeMemoryStats
 from .tool_budgets import ToolBudget
 from .read_cache import ReadCache
 from .verify_hooks import Verifier, VerifyResult
-from .evidence_check import EvidenceChecker, Citation
+from .evidence_check import EvidenceChecker, Citation, EnforceMode, EnforceResult
 from .prompt_templates import (
     FixBugTemplate,
     AddFeatureTemplate,
@@ -184,6 +204,13 @@ from .security import (
     CommandInjectionError,
 )
 from .executor import AutoPipeline, CommandExecutor, SilentRunner, PipelineResult, CommandResult
+
+# v2.4+ — Goose-like autonomous features (new modules)
+from .planner import Planner, ExecutionPlan, PlanPhase, PlanStatus, PlanStep, PlanResult
+from .toolchain import ToolChain, ChainStep, ChainResult, ChainState, build_chain, review_chain, run_chain
+from .auto_verify import AutoVerifier, AutoVerifyResult, VerificationIteration, VerificationStage
+from .conventions import ConventionLearner, Convention, ConventionProfile
+from .explorer import ContextEnricher, EnrichmentResult, Discovery, DiscoveryType
 
 __all__ = [
     # Core
@@ -350,6 +377,37 @@ __all__ = [
     "SilentRunner",
     "PipelineResult",
     "CommandResult",
+    # v2.4+ — Goose-like autonomous features
+    "Planner",
+    "ExecutionPlan",
+    "PlanPhase",
+    "PlanStatus",
+    "PlanStep",
+    "PlanResult",
+    "ToolChain",
+    "ChainStep",
+    "ChainResult",
+    "ChainState",
+    "build_chain",
+    "review_chain",
+    "run_chain",
+    "AutoVerifier",
+    "AutoVerifyResult",
+    "VerificationIteration",
+    "VerificationStage",
+    "ConventionLearner",
+    "Convention",
+    "ConventionProfile",
+    "ContextEnricher",
+    "EnrichmentResult",
+    "Discovery",
+    "DiscoveryType",
+    "CompressionLevel",
+    "ultra_compress",
+    "EnforceMode",
+    "EnforceResult",
+    "BudgetMode",
+    "PruningStrategy",
     # MCP / CLI
     "run_server",
 ]

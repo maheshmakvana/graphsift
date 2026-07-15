@@ -1,7 +1,7 @@
 # Changelog
 
-> **graphsift** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
-> The #1 Python library to save Claude tokens, reduce GPT-4 costs & optimize LLM context windows.
+> **graphsift v3.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> The #1 Python library to save Claude tokens, reduce GPT-4 costs & optimize LLM context windows. 93% feature coverage, 11 new modules.
 
 All notable changes to graphsift are documented here.
 

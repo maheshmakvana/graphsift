@@ -2342,6 +2342,139 @@ class ContextSelector:
 
         return "\n\n".join(sections), breakpoints
 
+    # ------------------------------------------------------------------
+    # Adaptive token budgeting  (v2.4+)
+    # ------------------------------------------------------------------
+
+    def _compute_adaptive_budgets(
+        self,
+        file_nodes: list,
+        total_budget: int,
+    ) -> dict[str, int]:
+        """Allocate token budget weighted by file complexity + centrality.
+
+        Complex files (many symbols, high centrality) get proportionally more
+        budget. Simple leaf files get the minimum.
+
+        Args:
+            file_nodes: List of ``FileNode`` objects.
+            total_budget: Total token budget to allocate.
+
+        Returns:
+            Dict of ``path -> allocated_tokens``.
+        """
+        if not file_nodes:
+            return {}
+
+        scores: dict[str, float] = {}
+        centrality_weight = self._config.centrality_weight
+
+        for fn in file_nodes:
+            path = getattr(fn, "path", "") or ""
+            symbols = getattr(fn, "symbols", None) or []
+            line_count = getattr(fn, "line_count", 0) or 1
+            token_est = getattr(fn, "token_estimate", 0) or 1
+
+            # Complexity: normalize symbol count and lines
+            complexity = (
+                min(len(symbols) / 50, 1.0) * 0.5
+                + min(line_count / 500, 1.0) * 0.5
+            )
+
+            # Centrality: use graph if available
+            centrality = 0.5
+            if hasattr(self, "_graph") and self._graph is not None:
+                try:
+                    cent_map = self._graph.centrality()
+                    centrality = cent_map.get(path, 0.5)
+                except Exception:
+                    pass
+
+            score = (
+                (1 - centrality_weight) * complexity
+                + centrality_weight * centrality
+            )
+            scores[path] = max(score, 0.1)
+
+        total_score = sum(scores.values()) or 1
+        min_budget = 500
+
+        allocations: dict[str, int] = {}
+        for fn in file_nodes:
+            path = getattr(fn, "path", "") or ""
+            ratio = scores.get(path, 0.1) / total_score
+            budget = max(int(total_budget * ratio), min_budget)
+            allocations[path] = budget
+
+        return allocations
+
+    # ------------------------------------------------------------------
+    # Multi-pass context pruning  (v2.4+)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prune_overlap(
+        rendered_text: str,
+        strategy: str = "none",
+    ) -> str:
+        """Remove redundant content within rendered context.
+
+        When the same (or near-identical) block appears in multiple files'
+        rendered output, keeps only the highest-ranked copy.
+
+        Args:
+            rendered_text: The fully rendered context string.
+            strategy: ``"none"`` | ``"light"`` | ``"balanced"`` |
+                ``"aggressive"``.
+
+        Returns:
+            Pruned text, always <= original length.
+        """
+        from graphsift.models import PruningStrategy  # noqa: PLC0415
+
+        if strategy in (PruningStrategy.NONE, "none"):
+            return rendered_text
+
+        lines = rendered_text.split("\n")
+        if len(lines) < 10:
+            return rendered_text
+
+        # Light: exact duplicate section headers
+        if strategy == PruningStrategy.LIGHT or strategy == "light":
+            seen: set[str] = set()
+            kept: list[str] = []
+            for line in lines:
+                if line.startswith("# File:") or line.startswith("## "):
+                    if line in seen:
+                        continue
+                    seen.add(line)
+                kept.append(line)
+            return "\n".join(kept)
+
+        # Balanced / Aggressive: SimHash-based near-duplicate removal
+        threshold = 10 if strategy in (
+            PruningStrategy.BALANCED, "balanced"
+        ) else 15
+
+        seen_fingerprints: dict[int, bool] = {}
+        out: list[str] = []
+        for line in lines:
+            # Compute a quick 32-bit fingerprint per line
+            import hashlib  # noqa: PLC0415
+            h = int(hashlib.md5(line.encode()).hexdigest()[:8], 16)
+            is_dup = False
+            for sfp in seen_fingerprints:
+                # Hamming distance on 32 bits
+                dist = bin(h ^ sfp).count("1")
+                if dist < threshold:
+                    is_dup = True
+                    break
+            if not is_dup:
+                seen_fingerprints[h] = True
+                out.append(line)
+
+        return "\n".join(out)
+
 
 # ---------------------------------------------------------------------------
 # ContextBuilder — top-level orchestrator

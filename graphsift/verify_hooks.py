@@ -115,3 +115,35 @@ class Verifier:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
         return True, ""
+
+    def run_all(
+        self,
+        paths: list[str],
+        skip_lint: bool = False,
+    ) -> dict[str, VerifyResult]:
+        """Run verification on multiple files in batch.
+
+        Args:
+            paths: List of file paths (relative to project_root).
+            skip_lint: When True, only run syntax checks (faster).
+
+        Returns:
+            Dict mapping each file path to its ``VerifyResult``.
+        """
+        results: dict[str, VerifyResult] = {}
+        for file_path in paths:
+            try:
+                vr = self.check(file_path)
+                if not skip_lint and vr.syntax_ok:
+                    lint_ok, lint_out = self.lint(file_path)
+                    vr.lint_ok = lint_ok
+                    vr.lint_output = lint_out[:500] if lint_out else ""
+                    vr.passed = vr.syntax_ok and lint_ok
+                results[file_path] = vr
+            except Exception as exc:
+                results[file_path] = VerifyResult(
+                    file=file_path,
+                    syntax_ok=False,
+                    syntax_error=str(exc),
+                )
+        return results
