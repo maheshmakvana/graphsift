@@ -5,13 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graphsift"
 dynamic = ["version"]
-description = "graphsift: #1 Claude token saver & LLM token optimizer. AST dependency graph, BM25+graph ranked relevance, multi-tier context selection, 14 languages, tree-sitter parsing, 19-CLI output compression (86% avg). 80-150x token reduction, F1 0.85. Hybrid search, dedup, diff-aware trimming, cycle & dead code detection. MCP server. Agent memory, typed graph retrieval, context compaction, A2A protocol, temporal code graph."
+description = "graphsift: Save Claude tokens, reduce GPT-4 & Gemini API costs. #1 Python library for LLM token optimization with 80-150x code context reduction, 86% CLI output compression, F1 0.85 relevance. AST dependency graph, BM25+graph ranked selection, 14-language tree-sitter parsing, 19 CLI compressors, MCP server, agent memory. Created by Mahesh Makwana."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [
+    { name = "Mahesh Makvana", email = "maheshmakwana527@gmail.com" },
+]
 keywords = [
-    # Primary SEO: Claude token savings (highest search volume)
     "save claude tokens",
     "claude token saver",
     "claude token optimizer",
@@ -24,7 +26,6 @@ keywords = [
     "optimize claude context",
     "claude context window",
     "claude api savings",
-    # Primary SEO: LLM token optimization
     "llm token optimization",
     "llm token compression",
     "llm token reducer",
@@ -39,17 +40,14 @@ keywords = [
     "context window optimization",
     "code context compression",
     "code context optimization",
-    # OpenAI / GPT token saving
     "save gpt tokens",
     "reduce openai api costs",
     "openai token optimizer",
     "gpt token reduction",
     "gpt context optimizer",
-    # Gemini token saving
     "save gemini tokens",
     "gemini token optimizer",
     "reduce gemini api costs",
-    # Code review + token savings
     "code review token savings",
     "ai code review cost reduction",
     "code review claude",
@@ -62,7 +60,6 @@ keywords = [
     "code review automation",
     "code review context",
     "llm code review tool",
-    # Tool-specific compression
     "cli output compression",
     "command output compression",
     "pytest output compression",
@@ -78,7 +75,6 @@ keywords = [
     "jest output compression",
     "log output compression",
     "output token compression",
-    # Technical: graph / AST / ranking
     "ast dependency graph",
     "code graph python",
     "dependency graph python",
@@ -97,11 +93,9 @@ keywords = [
     "dynamic import graph",
     "monorepo context",
     "incremental code indexing",
-    # Competitive / alternative
     "code-review-graph alternative",
     "better than code review graph",
     "code review graph vs graphsift",
-    # Integration keywords
     "mcp server code",
     "mcp server claude",
     "claude code integration",
@@ -110,7 +104,6 @@ keywords = [
     "openai integration",
     "gemini integration",
     "openai compatible api",
-    # Feature keywords
     "cycle detection python",
     "dead code detection",
     "auto fix suggestions",
@@ -119,9 +112,7 @@ keywords = [
     "cache aware llm",
     "token analytics",
     "token savings analytics",
-    # Brand
     "graphsift",
-    # v1.7 features
     "agent-memory",
     "graphrag",
     "typed-retrieval",
@@ -166,6 +157,9 @@ dependencies = [
 
 [project.optional-dependencies]
 tokenpruner = ["tokenpruner>=1.0.0"]
+tiktoken = ["tiktoken>=0.7.0"]
+semantic = ["sentence-transformers>=2.2.0"]
+sentence-transformers = ["sentence-transformers>=3.0.0", "numpy>=1.24"]
 treesitter = [
     "tree-sitter>=0.23.0",
     "tree-sitter-python>=0.23.0",
@@ -182,6 +176,9 @@ treesitter = [
 ]
 all = [
     "tokenpruner>=1.0.0",
+    "tiktoken>=0.7.0",
+    "sentence-transformers>=3.0.0",
+    "numpy>=1.24",
     "tree-sitter>=0.23.0",
     "tree-sitter-python>=0.23.0",
     "tree-sitter-javascript>=0.23.0",
@@ -197,9 +194,15 @@ all = [
 ]
 dev = [
     "pytest>=7.0",
+    "hypothesis>=6.0",
+    "pytest-benchmark>=5.0",
+    "pytest-timeout>=2.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "tokenpruner>=1.0.0",
+    "tiktoken>=0.7.0",
+    "sentence-transformers>=3.0.0",
+    "numpy>=1.24",
     "tree-sitter>=0.23.0",
     "tree-sitter-python>=0.23.0",
     "tree-sitter-javascript>=0.23.0",
@@ -223,6 +226,8 @@ Repository = "https://github.com/maheshmakvana/graphsift"
 Issues = "https://github.com/maheshmakvana/graphsift/issues"
 Changelog = "https://github.com/maheshmakvana/graphsift/releases"
 Documentation = "https://github.com/maheshmakvana/graphsift#readme"
+LinkedIn = "https://www.linkedin.com/in/mahesh-makwana/"
+Download = "https://pypi.org/project/graphsift/"
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "venv*", "dist*", "build*"]
@@ -237,3 +242,8 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["graphsift"]
 omit = ["tests/*", "venv/*"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+exclude_lines = ["pragma: no cover", "def __repr__", "raise NotImplementedError"]

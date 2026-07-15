@@ -1,18 +1,48 @@
-"""graphsift — smarter code context for AI-powered development.
+"""graphsift — #1 Token Saver for Claude, GPT-4, Gemini & Every LLM.
 
-80-150x token reduction vs raw source. 86% avg CLI output compression.
-F1 0.85 relevance accuracy vs 0.54 for code-review-graph.
+Created by Mahesh Makwana (https://github.com/maheshmakvana).
 
-Key capabilities:
-- Ranked 0-1 relevance scoring with hot/warm/cold tier selection
-- Hard token budget enforcement for context limits
-- Diff-aware context trimming + entropy-based deduplication
+The Python library that slashes LLM token costs for AI-assisted code review,
+debugging, and code generation. Save 80-150x tokens on every code review with
+Claude Code, GPT-4, Gemini, Codex, or any LLM — zero data exfiltration, zero
+telemetry, zero API calls from library code.
+
+Why graphsift?
+Instead of sending your entire codebase (or using binary blast-radius),
+graphsift ranks every file 0-1 by relevance using AST dependency graphs + BM25
++ diff proximity, then selects only the most relevant files within a hard token
+budget. Combined with 3-tier compression (HOT/WARM/COLD), diff-aware trimming,
+entropy deduplication, and 19 CLI output compressors, you save 80-150x tokens
+vs raw source while maintaining 0.85 F1 relevance accuracy.
+
+Core capabilities:
+- Ranked 0-1 relevance scoring — AST + BM25 + graph-distance fusion
+- Hard token budget enforcement — never exceed Claude/GPT/Gemini limits
+- 3-tier (HOT/WARM/COLD) compression — signatures vs full source
+- Diff-aware context trimming — only changed regions + context
+- Entropy-based deduplication — SimHash near-duplicate detection
 - 14-language AST parsing + 11-language tree-sitter precise parsing
-- 19 CLI command compressors (pytest 94%, grep 97%, git_diff 92%, docker 91%)
-- Hybrid search (BM25 + TF-IDF sparse vector fusion)
-- Auto-fix suggestions, cycle detection, dead code detection
-- MCP server with 7 token-saving tools for Claude Code
-- Cache-aware output with prompt-cache breakpoints
+- 25 CLI command compressors (pytest 94%, grep 97%, git diff 93%, npm 89%, pip 90%, make 89%, docker 82%, go_test 71%, eslint 84%, and more)
+- Cache-aware output with Claude/GPT prompt-cache breakpoints
+- Hybrid search — BM25 + TF-IDF + optional dense vector fusion
+- MCP server — 7 token-saving tools for Claude Code automatic integration
+- Conversation compaction — 60-82% agent conversation savings
+- Temporal graph — git-history-aware symbol tracking
+- Agent memory — SQLite-backed cross-session persistence
+- A2A protocol — Agent-to-Agent communication server
+- Security — path traversal protection, command injection prevention
+- Auto-fix suggestions — 5 categories of graph-based fixes
+
+WITH vs WITHOUT graphsift (15 daily-dev scenarios tested):
+  WITHOUT: Claude reads 2,748 tokens of raw output per session — ANSI escapes, timestamps,
+           PASSED lines, traceback frames, and package metadata all mixed with real signals.
+           Claude must FIND the signal in the noise before it can act. ($9.07/mo at 220 runs)
+  WITH:    Claude reads 930 tokens of pre-filtered signal — only error types, failure messages,
+           changed lines, and severity counts. Claude starts reasoning immediately with 3x
+           more useful content in the same context window. ($3.07/mo at 220 runs)
+  SAVINGS: 66% average token reduction. 100% critical code-quality signals preserved.
+  SECURITY: DataScrubber redacts secrets, PathValidator blocks traversal, CommandSanitizer
+           prevents injection — none of which exist WITHOUT graphsift.
 
 Quick start::
 
@@ -38,7 +68,10 @@ Quick start::
 
     # CLI output compression - save tokens on command output
     from graphsift import compress
-    saved = compress(pytest_output, "pytest")
+    saved = compress(pytest_output, "pytest")  # 90% compression
+
+Save Claude tokens. Reduce GPT-4 costs. Optimize Gemini context windows.
+All with zero telemetry, zero accounts, and zero API calls.
 """
 
 from ._version import __version__
@@ -88,6 +121,7 @@ from .models import (
     NodeKind,
     OutputMode,
     ScoredFile,
+    SourceConfidence,
 )
 from .advanced import (
     AnalysisPipeline,
@@ -112,7 +146,7 @@ from .adapters.postprocess import (
     WikiGenerator,
 )
 from .compress import compress, compress_tee, COMPRESSORS, detect_type as detect_command_type
-from .analytics import gain, discover, history, record_call, reset as reset_analytics
+from .analytics import gain, discover, history, record_call, summary_line, reset as reset_analytics
 from .hybrid_search import HybridSearcher
 from .memory import AgentMemory, MemoryFact, SessionInfo
 from .typed_retrieval import TypedRetriever, QueryIntent, TypedPath, TypedNeighborhood
@@ -179,6 +213,7 @@ __all__ = [
     "IndexStats",
     "Language",
     "NodeKind",
+    "SourceConfidence",
     "EdgeKind",
     "OutputMode",
     "FixSeverity",
@@ -223,6 +258,7 @@ __all__ = [
     "discover",
     "history",
     "record_call",
+    "summary_line",
     "reset_analytics",
     # Hybrid Search
     "HybridSearcher",
