@@ -1280,24 +1280,141 @@ class DependencyGraph:
         return dead
 
     def _detect_entry_points(self) -> list[str]:
-        """Auto-detect entry-point files in the graph."""
+        """Auto-detect entry-point files in the graph.
+
+        Detects entry points for:
+          - **Python**: ``__main__.py``, ``main()`` functions, Flask/FastAPI
+            route decorators, Click command groups, Django URL configs,
+            ``pyproject.toml`` script references, ``app`` / ``application``
+            WSGI/ASGI objects.
+          - **Next.js** (JS/TS): Files under ``pages/``, ``app/**/page.tsx``,
+            ``layout.tsx``, ``loading.tsx``, ``error.tsx``, ``route.ts``,
+            ``middleware.ts``, ``next.config.*``.
+          - **React / general JS/TS**: ``index.tsx`` / ``index.js`` (app
+            entry), ``main.tsx`` / ``main.js`` (Vite/CRA entry),
+            ``export default`` components at module root, ``App.tsx``.
+          - **General**: ``main.go``, ``main.rs``, ``index.js``,
+            ``Main.java``, and any file with the most incoming edges (hub
+            fallback).
+        """
         entry_files: list[str] = []
         seen: set[str] = set()
-        for node in self._nodes.values():
-            if node.file_path in seen:
-                continue
-            # Heuristic: files with main() function or __main__ pattern
-            if node.name == "main" and node.kind in (NodeKind.FUNCTION, NodeKind.METHOD):
-                entry_files.append(node.file_path)
-                seen.add(node.file_path)
-            # Check for __main__ in the file path or module patterns
-            if node.file_path.endswith("__main__.py") or node.file_path.endswith("main.go"):
-                if node.file_path not in seen:
-                    entry_files.append(node.file_path)
-                    seen.add(node.file_path)
 
+        # --- Reusable helper ---
+        def _add(fp: str) -> None:
+            if fp not in seen:
+                entry_files.append(fp)
+                seen.add(fp)
+
+        for node in self._nodes.values():
+            fp = node.file_path
+            if fp in seen:
+                continue
+
+            # ----------------------------------------------------------
+            # Python entry points
+            # ----------------------------------------------------------
+            if fp.endswith("__main__.py") or fp.endswith("main.py"):
+                _add(fp)
+                continue
+
+            # Flask / FastAPI style: @app.route(...) or @router.get(...)
+            if node.kind == NodeKind.FUNCTION and node.decorators:
+                for deco in node.decorators:
+                    if any(
+                        pat in deco
+                        for pat in (".route(", ".get(", ".post(", ".put(",
+                                    ".patch(", ".delete(", ".options(")
+                    ):
+                        _add(fp)
+                        break
+
+            # Python Click command groups (@click.group, @click.command)
+            if node.kind == NodeKind.FUNCTION and node.decorators:
+                for deco in node.decorators:
+                    if "click.group" in deco or "click.command" in deco:
+                        _add(fp)
+                        break
+
+            # WSGI/ASGI application objects
+            if node.name in ("app", "application") and node.kind in (
+                NodeKind.FUNCTION, NodeKind.METHOD, NodeKind.VARIABLE
+            ):
+                _add(fp)
+                continue
+
+            # Django: urls.py with urlpatterns
+            if fp.endswith("urls.py"):
+                _add(fp)
+                continue
+
+            # ----------------------------------------------------------
+            # Next.js / React / JS / TS entry points
+            # ----------------------------------------------------------
+            ext = Path(fp).suffix.lower()
+            is_js_like = ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+            if is_js_like:
+                # Next.js App Router: app/**/page.tsx, layout.tsx, loading.tsx,
+                # error.tsx, not-found.tsx, route.ts (API routes)
+                if re.search(r"(?:^|[/\\])app[/\\]", fp):
+                    basename = Path(fp).stem
+                    if basename in (
+                        "page", "layout", "loading", "error",
+                        "not-found", "route", "global-error",
+                        "template", "default",
+                    ):
+                        _add(fp)
+                        continue
+
+                # Next.js Pages Router: pages/**/*.tsx
+                if re.search(r"(?:^|[/\\])pages[/\\]", fp):
+                    _add(fp)
+                    continue
+
+                # Next.js middleware / config / instrumentation
+                if Path(fp).name in (
+                    "middleware.ts", "middleware.js",
+                    "next.config.ts", "next.config.js", "next.config.mjs",
+                    "instrumentation.ts", "instrumentation.js",
+                    "sitemap.ts", "sitemap.js",
+                ):
+                    _add(fp)
+                    continue
+
+                # Vite / CRA / general: main.tsx, main.jsx, index.tsx,
+                # index.js, App.tsx, App.jsx
+                basename = Path(fp).stem
+                if basename in ("main", "index", "App", "app") and ext in (
+                    ".tsx", ".jsx", ".ts", ".js"
+                ):
+                    _add(fp)
+                    continue
+
+                # JS/TS exported default component (function returning JSX)
+                if node.kind == NodeKind.FUNCTION and "default" in getattr(
+                    node, "signature", ""
+                ):
+                    _add(fp)
+                    continue
+
+            # ----------------------------------------------------------
+            # Other language entry points
+            # ----------------------------------------------------------
+            if fp.endswith("main.go"):
+                _add(fp)
+                continue
+
+            if fp.endswith("main.rs"):
+                _add(fp)
+                continue
+
+            if fp.endswith("Main.java"):
+                _add(fp)
+                continue
+
+        # --- Fallback: files with most incoming edges (hub nodes) ---
         if not entry_files:
-            # Fallback: files with the most incoming edges (likely hubs)
             incoming: dict[str, int] = defaultdict(int)
             for edge in self._edges:
                 tgt_file = self._resolve_file(edge.target_id)
@@ -1305,7 +1422,8 @@ class DependencyGraph:
                     incoming[tgt_file] += 1
             if incoming:
                 top = sorted(incoming.items(), key=lambda x: x[1], reverse=True)[:3]
-                entry_files = [f for f, _ in top]
+                for f, _ in top:
+                    _add(f)
 
         return entry_files
 

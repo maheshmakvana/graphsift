@@ -201,14 +201,51 @@ class FixSuggester:
                 seen.add(key)
                 unique.append(s)
 
-        # Sort by severity (error first) then confidence descending
-        severity_order = {"error": 0, "warning": 1, "info": 2}
-        unique.sort(
-            key=lambda s: (
-                severity_order.get(s.severity.value, 99),
-                -s.confidence,
+        # Priority-scored sorting using PriorityScorer
+        try:
+            from .prioritize import PriorityScorer  # noqa: PLC0415
+
+            scorer = PriorityScorer(
+                graph=self._graph, source_map=self._source_map
             )
-        )
+            ranked = scorer.score_fix_suggestions(unique)
+            scored_map: dict[str, float] = {}
+            for s in unique:
+                for se in ranked.entries:
+                    if se.entry.get("suggestion_id") == s.suggestion_id:
+                        scored_map[s.suggestion_id] = se.score
+                        break
+                if s.suggestion_id not in scored_map:
+                    scored_map[s.suggestion_id] = s.confidence
+            unique.sort(
+                key=lambda s: -scored_map.get(s.suggestion_id, s.confidence)
+            )
+            summary = ranked.summary
+            total = ranked.total
+        except ImportError:
+            # Fallback: sort by severity then confidence
+            severity_order = {"error": 0, "warning": 1, "info": 2}
+            unique.sort(
+                key=lambda s: (
+                    severity_order.get(s.severity.value, 99),
+                    -s.confidence,
+                )
+            )
+            by_severity_fb: dict[str, int] = defaultdict(int)
+            by_category_fb: dict[str, int] = defaultdict(int)
+            for s in unique:
+                by_severity_fb[s.severity.value] += 1
+                by_category_fb[s.category] += 1
+            parts = [f"Found {len(unique)} issue(s)"]
+            if by_category_fb:
+                parts.append(
+                    ": "
+                    + ", ".join(
+                        f"{k}={v}" for k, v in sorted(by_category_fb.items())
+                    )
+                )
+            summary = "".join(parts)
+            total = len(unique)
 
         by_severity: dict[str, int] = defaultdict(int)
         by_category: dict[str, int] = defaultdict(int)
@@ -216,19 +253,9 @@ class FixSuggester:
             by_severity[s.severity.value] += 1
             by_category[s.category] += 1
 
-        parts = [f"Found {len(unique)} issue(s)"]
-        if by_category:
-            parts.append(
-                ": "
-                + ", ".join(
-                    f"{k}={v}" for k, v in sorted(by_category.items())
-                )
-            )
-        summary = "".join(parts)
-
         return FixReport(
             suggestions=unique,
-            total_issues=len(unique),
+            total_issues=total,
             by_severity=dict(by_severity),
             by_category=dict(by_category),
             summary=summary,

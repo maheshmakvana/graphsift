@@ -874,6 +874,23 @@ def _tool_refactor(params: dict) -> dict:
         file_pattern = params.get("file_pattern")
         limit = int(params.get("limit", 50))
         dead = engine.find_dead_code(graph, kind=kind, file_pattern=file_pattern, limit=limit)
+
+        # Apply priority scoring when results are large
+        prioritize = params.get("prioritize", True)
+        if prioritize and dead:
+            from .prioritize import PriorityScorer  # noqa: PLC0415
+            scorer = PriorityScorer(graph=graph, source_map=source_map)
+            ranked = scorer.score_dead_code(dead)
+            return {
+                "mode": "dead_code",
+                "results": [e.to_dict() for e in ranked.entries],
+                "total": len(dead),
+                "tiers": ranked.tiers,
+                "summary": ranked.summary,
+                "truncated": ranked.truncated,
+                "truncated_count": ranked.truncated_count,
+            }
+
         return {"mode": "dead_code", "results": dead, "total": len(dead)}
 
     return {"error": f"Unknown mode: {mode}. Valid: rename, dead_code, suggest"}
@@ -917,6 +934,8 @@ def _tool_detect_dead_code(params: dict) -> dict:
     root = params.get("root", os.getcwd())
     kind = params.get("kind")  # None for all, or "function", "class", "method"
     entry_points = params.get("entry_points")  # Optional list of entry-point file paths
+    prioritize = params.get("prioritize", True)  # Apply priority scoring
+    max_results = params.get("max_results", 0)  # 0 = unlimited
 
     builder, source_map = _get_builder(root)
 
@@ -925,13 +944,42 @@ def _tool_detect_dead_code(params: dict) -> dict:
 
     dead = builder._graph.find_dead_code(entry_points=entry_points, kind=kind)
 
-    return {
-        "entries": dead,
+    result: dict = {
         "total_dead": len(dead),
         "confidence": "high" if entry_points else "medium",
         "root": root,
-        "note": "Auto-detected entry points may miss some. Provide explicit entry_points for high confidence." if not entry_points else "",
+        "note": (
+            "Auto-detected entry points may miss some. Provide explicit "
+            "entry_points for high confidence."
+        )
+        if not entry_points
+        else "",
     }
+
+    # Apply priority scoring when results are large or scoring is requested
+    if prioritize and dead:
+        from .prioritize import PriorityScorer  # noqa: PLC0415
+
+        scorer = PriorityScorer(
+            graph=builder._graph, source_map=source_map
+        )
+        ranked = scorer.score_dead_code(dead)
+        result["entries"] = [
+            e.to_dict() for e in ranked.entries
+        ]
+        result["tiers"] = ranked.tiers
+        result["summary"] = ranked.summary
+        result["truncated"] = ranked.truncated
+        result["truncated_count"] = ranked.truncated_count
+    else:
+        result["entries"] = dead
+
+    if max_results > 0 and len(result.get("entries", [])) > max_results:
+        result["entries"] = result["entries"][:max_results]
+        result["truncated"] = True
+        result["truncated_count"] = len(dead) - max_results
+
+    return result
 
 
 def _tool_apply_refactor(params: dict) -> dict:
@@ -2102,7 +2150,7 @@ _TOOLS = {
     },
     "refactor": {
         "fn": _tool_refactor,
-        "description": "Rename preview, dead-code detection, or suggestions. mode: rename | dead_code | suggest.",
+        "description": "Rename preview, dead-code detection, or suggestions. mode: rename | dead_code | suggest. Dead code results are priority-scored.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2112,6 +2160,7 @@ _TOOLS = {
                 "new_name": {"type": "string", "description": "For rename mode"},
                 "kind": {"type": "string", "description": "For dead_code: function | class | method"},
                 "file_pattern": {"type": "string"},
+                "prioritize": {"type": "boolean", "description": "Apply priority scoring (default true)", "default": True},
             },
         },
     },
@@ -2340,13 +2389,15 @@ _TOOLS = {
     },
     "detect_dead_code": {
         "fn": _tool_detect_dead_code,
-        "description": "Find potentially unreachable code via BFS reachability from entry points.",
+        "description": "Find potentially unreachable code via BFS reachability from entry points. Results are priority-scored when large.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "root": {"type": "string", "description": "Repository root path."},
                 "kind": {"type": "string", "enum": ["function", "class", "method"], "description": "Filter by node kind."},
                 "entry_points": {"type": "array", "items": {"type": "string"}, "description": "List of entry-point file paths."},
+                "prioritize": {"type": "boolean", "description": "Apply priority scoring (default true).", "default": True},
+                "max_results": {"type": "integer", "description": "Max results to return (0 = unlimited, default 0).", "default": 0},
             },
         },
     },
@@ -2921,19 +2972,42 @@ _PROMPTS: dict[str, dict[str, Any]] = {
 
 
 def _build_review_code_prompt(args: dict) -> list[dict]:
-    """Build a review_code prompt message."""
+    """Build a review_code prompt message (2026 anti-hallucination patterns)."""
     root = args.get("root_path", os.getcwd())
     changed_files = args.get("changed_files", [])
     diff_text = args.get("diff_text", "")
 
     text = (
-        "You are reviewing code changes. Please analyze the following changes "
-        "and provide a thorough code review.\n\n"
+        "# Role: senior code reviewer\n\n"
+        "## Task: Review the following code changes\n\n"
+        "--- ANTI-HALLUCINATION RULES ---\n"
+        "- Tag every finding with [VERIFIED-REAL] (confirmed from diff) "
+        "or [UNKNOWN] (speculative)\n"
+        "- Do NOT flag issues that don't exist in the diff\n"
+        "- If uncertain about a pattern's intent, mark it [UNKNOWN] "
+        "rather than assuming it's a bug\n"
+        "- After writing your review, self-check: is every claim "
+        "traceable to the diff?\n\n"
         f"Repository root: {root}\n"
         f"Files changed: {json.dumps(changed_files, indent=2)}\n"
     )
     if diff_text:
         text += f"\nDiff:\n```diff\n{diff_text}\n```\n"
+
+    text += (
+        "\nReview dimensions (in order):\n"
+        "1. Correctness — logic errors, race conditions, edge cases\n"
+        "2. Security — injection, authz, data leakage, path traversal\n"
+        "3. Performance — N+1 queries, unnecessary re-renders, memory\n"
+        "4. Maintainability — duplication, naming, complexity\n"
+        "5. Testing — adequate coverage for the change\n\n"
+        "Output ONLY valid JSON:\n"
+        '{"findings": [{"severity": "error|warning|info", '
+        '"file": "...", "line": N, '
+        '"issue": "[VERIFIED-REAL] description", '
+        '"suggestion": "..."}], '
+        '"self_review_passed": true}\n'
+    )
 
     return [
         {
@@ -2947,76 +3021,117 @@ def _build_review_code_prompt(args: dict) -> list[dict]:
 
 
 def _build_analyze_impact_prompt(args: dict) -> list[dict]:
-    """Build an analyze_impact prompt message."""
+    """Build an analyze_impact prompt message (2026 anti-hallucination)."""
     root = args.get("root_path", os.getcwd())
     changed_files = args.get("changed_files", [])
     max_depth = args.get("max_depth", 3)
+
+    text = (
+        "# Role: senior software architect\n\n"
+        "## Task: Analyze impact and blast radius\n\n"
+        "--- ANTI-HALLUCINATION RULES ---\n"
+        "- Tag every dependency claim with [VERIFIED-REAL] or [UNKNOWN]\n"
+        "- Do NOT speculate about dependencies outside the provided context\n"
+        "- If you cannot trace a dependency path, say so\n\n"
+        f"Repository root: {root}\n"
+        f"Changed files: {json.dumps(changed_files, indent=2)}\n"
+        f"Max traversal depth: {max_depth}\n\n"
+        "Analyze:\n"
+        "1. Dependents — which files/modules import from changed files?\n"
+        "2. Risk level per file — low/medium/high with justification\n"
+        "3. Architectural concerns — coupling, circular deps, violated layers\n"
+        "4. Testing priorities — what must be tested after this change\n\n"
+        "Output ONLY valid JSON:\n"
+        '{"impacted_files": [{"path": "...", "risk": "low|medium|high", '
+        '"reason": "[VERIFIED-REAL] ..."}], '
+        '"architectural_concerns": [], '
+        '"testing_priorities": [], '
+        '"self_review_passed": true}\n'
+    )
 
     return [
         {
             "role": "user",
             "content": {
                 "type": "text",
-                "text": (
-                    "Analyze the impact and blast radius of the following changes.\n\n"
-                    f"Repository root: {root}\n"
-                    f"Changed files: {json.dumps(changed_files, indent=2)}\n"
-                    f"Max traversal depth: {max_depth}\n\n"
-                    "Consider:\n"
-                    "1. Which other files/modules depend on the changed files?\n"
-                    "2. What is the risk level of each change?\n"
-                    "3. Are there any circular dependencies or architectural concerns?\n"
-                    "4. What testing areas should be prioritized?\n"
-                ),
+                "text": text,
             },
         },
     ]
 
 
 def _build_find_issues_prompt(args: dict) -> list[dict]:
-    """Build a find_issues prompt message."""
+    """Build a find_issues prompt message (2026 anti-hallucination)."""
     root = args.get("root_path", os.getcwd())
     focus = args.get("focus", "all")
+
+    text = (
+        "# Role: senior code auditor\n\n"
+        f"## Task: Find code issues in {root}\n"
+        f"Focus: {focus}\n\n"
+        "--- ANTI-HALLUCINATION RULES ---\n"
+        "- Only report issues you can [VERIFY-REAL] from the codebase\n"
+        "- Do NOT flag generated/placeholder code as production issues\n"
+        "- For every finding, provide a file path and line number\n"
+        "- If uncertain, mark [UNKNOWN]\n\n"
+        "Search for:\n"
+        "- Circular dependencies (import/call cycles) [VERIFIED-REAL]\n"
+        "- Dead code (unused exports, functions, classes) [VERIFIED-REAL]\n"
+        "- Large functions >50 lines or classes >300 lines\n"
+        "- Missing error handling or type annotations\n"
+        "- Security-sensitive patterns (hardcoded secrets, missing validation)\n\n"
+        "Output ONLY valid JSON:\n"
+        '{"issues": [{"file": "...", "line": N, '
+        '"type": "cycle|dead_code|large_function|security|type", '
+        '"severity": "error|warning|info", '
+        '"description": "[VERIFIED-REAL] ...", '
+        '"suggestion": "..."}], '
+        '"total": 0}\n'
+    )
 
     return [
         {
             "role": "user",
             "content": {
                 "type": "text",
-                "text": (
-                    "Search for potential code issues in this codebase.\n\n"
-                    f"Repository root: {root}\n"
-                    f"Focus area: {focus}\n\n"
-                    "Look for:\n"
-                    "- Circular dependencies (import/call cycles)\n"
-                    "- Dead code (unused functions, classes, or methods)\n"
-                    "- Large functions or classes that may need refactoring\n"
-                    "- High-risk files that are complex and widely depended upon\n"
-                    "- Missing error handling or type annotations\n"
-                ),
+                "text": text,
             },
         },
     ]
 
 
 def _build_explain_architecture_prompt(args: dict) -> list[dict]:
-    """Build an explain_architecture prompt message."""
+    """Build an explain_architecture prompt message (2026 patterns)."""
     root = args.get("root_path", os.getcwd())
     community_name = args.get("community_name", "")
 
     text = (
-        "Explain the high-level architecture of this codebase.\n\n"
+        "# Role: senior software architect\n\n"
+        "## Task: Explain codebase architecture\n\n"
+        "--- ANTI-HALLUCINATION RULES ---\n"
+        "- Tag every architectural claim with [VERIFIED-REAL] "
+        "(confirmed from graph analysis) or [UNKNOWN]\n"
+        "- Do NOT invent architectural patterns that aren't visible in the graph\n"
+        "- If a community has no clear responsibility, say so rather than guessing\n\n"
         f"Repository root: {root}\n"
     )
     if community_name:
-        text += f"Focus on the community/module: {community_name}\n\n"
+        text += f"Focus on community/module: {community_name}\n\n"
     text += (
         "Cover:\n"
-        "1. The main modules/communities and their responsibilities\n"
-        "2. How data flows between modules\n"
-        "3. Key entry points and their dependencies\n"
-        "4. Architectural patterns used\n"
-        "5. Areas of potential improvement or technical debt\n"
+        "1. Main modules/communities and their responsibilities [VERIFIED-REAL]\n"
+        "2. Data flow between modules (from dependency edges)\n"
+        "3. Key entry points and their dependency chains\n"
+        "4. Architectural patterns actually used (not aspirational)\n"
+        "5. Concrete improvement areas with evidence\n\n"
+        "Output ONLY valid JSON:\n"
+        '{"modules": [{"name": "...", "responsibility": "...", '
+        '"dependencies": [...], "entry_points": [...]}], '
+        '"data_flow": "...", '
+        '"patterns_used": ["..."], '
+        '"improvements": [{"area": "...", "evidence": "[VERIFIED-REAL]", '
+        '"suggestion": "..."}], '
+        '"self_review_passed": true}\n'
     )
 
     return [

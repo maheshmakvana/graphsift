@@ -127,8 +127,29 @@ from .tool_budgets import ToolBudget
 from .read_cache import ReadCache
 from .verify_hooks import Verifier, VerifyResult
 from .evidence_check import EvidenceChecker, Citation
-from .prompt_templates import FixBugTemplate, AddFeatureTemplate, RefactorTemplate, get_template
+from .prompt_templates import (
+    FixBugTemplate,
+    AddFeatureTemplate,
+    RefactorTemplate,
+    ProductionAppTemplate,
+    ThemeChangeTemplate,
+    SecurityArchitectureTemplate,
+    get_template,
+)
 from .tiered_memory import TieredMemory
+from .prioritize import PriorityScorer, PrioritizedResult, ScoredFinding
+from .security import (
+    CommandSanitizer,
+    DataScrubber,
+    DataLeakError,
+    NetworkAccessError,
+    PathTraversalError,
+    PathValidator,
+    SecurePipeline,
+    SecurityError,
+    CommandInjectionError,
+)
+from .executor import AutoPipeline, CommandExecutor, SilentRunner, PipelineResult, CommandResult
 
 __all__ = [
     # Core
@@ -267,9 +288,32 @@ __all__ = [
     "FixBugTemplate",
     "AddFeatureTemplate",
     "RefactorTemplate",
+    "ProductionAppTemplate",
+    "ThemeChangeTemplate",
+    "SecurityArchitectureTemplate",
     "get_template",
     # Tiered Memory
     "TieredMemory",
+    # Priority Scorer
+    "PriorityScorer",
+    "PrioritizedResult",
+    "ScoredFinding",
+    # Security
+    "SecurityError",
+    "PathTraversalError",
+    "CommandInjectionError",
+    "DataLeakError",
+    "NetworkAccessError",
+    "PathValidator",
+    "CommandSanitizer",
+    "DataScrubber",
+    "SecurePipeline",
+    # Executor
+    "AutoPipeline",
+    "CommandExecutor",
+    "SilentRunner",
+    "PipelineResult",
+    "CommandResult",
     # MCP / CLI
     "run_server",
 ]

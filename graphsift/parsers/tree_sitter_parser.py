@@ -809,6 +809,138 @@ class TreeSitterParser:
                         seen_imports.add(src)
                         imports.append(src)
 
+        # --- Export default detection (function, class, or expression) ---
+        for dnode in self._capture(
+            root_node, ts_lang, "(export_statement) @n"
+        ):
+            # Check if this export has the "default" keyword
+            if source[dnode.start_byte : dnode.start_byte + 14] == "export default":
+                # Find the inner declaration
+                for child in dnode.named_children:
+                    if child.type == "function_declaration":
+                        name_node = child.child_by_field_name("name")
+                        if name_node is None:
+                            continue
+                        ename = self._node_text(source, name_node)
+                        sig_text = (
+                            f"export default function {ename}"
+                            f"{self._node_text(source, child).split('{')[0].strip()}"
+                        )
+                        line_start = self._line_num(dnode)
+                        line_end = dnode.end_point[0] + 1
+                        symbols.append(GraphNode(
+                            node_id=f"{path}::{ename}__default_export",
+                            file_path=path,
+                            kind=NodeKind.FUNCTION,
+                            name=ename,
+                            qualified_name=ename,
+                            line_start=line_start,
+                            line_end=line_end,
+                            language=lang,
+                            signature=sig_text,
+                            metadata={"is_export_default": True},
+                        ))
+                    elif child.type == "class_declaration":
+                        name_node = child.child_by_field_name("name")
+                        if name_node is None:
+                            continue
+                        cname = self._node_text(source, name_node)
+                        symbols.append(GraphNode(
+                            node_id=f"{path}::{cname}__default_export",
+                            file_path=path,
+                            kind=NodeKind.CLASS,
+                            name=cname,
+                            qualified_name=cname,
+                            line_start=self._line_num(dnode),
+                            line_end=dnode.end_point[0] + 1,
+                            language=lang,
+                            metadata={"is_export_default": True},
+                        ))
+                    # Handle: export default function() {} (anonymous default)
+                    elif child.type == "arrow_function":
+                        line_start = self._line_num(dnode)
+                        line_end = dnode.end_point[0] + 1
+                        sig_text = "export default " + self._node_text(
+                            source, child
+                        ).split("{")[0].strip()
+                        symbols.append(GraphNode(
+                            node_id=f"{path}::__anonymous_default__{line_start}",
+                            file_path=path,
+                            kind=NodeKind.FUNCTION,
+                            name="(anonymous default)",
+                            qualified_name="(anonymous default)",
+                            line_start=line_start,
+                            line_end=line_end,
+                            language=lang,
+                            signature=sig_text,
+                            is_async="async" in sig_text,
+                            metadata={"is_export_default": True},
+                        ))
+                    elif child.type == "assignment_expression":
+                        # export default value = expression;
+                        left = child.child_by_field_name("left")
+                        if left is not None and left.type == "identifier":
+                            aname = self._node_text(source, left)
+                            symbols.append(GraphNode(
+                                node_id=f"{path}::{aname}__default_export",
+                                file_path=path,
+                                kind=NodeKind.VARIABLE,
+                                name=aname,
+                                qualified_name=aname,
+                                line_start=self._line_num(dnode),
+                                line_end=dnode.end_point[0] + 1,
+                                language=lang,
+                                metadata={
+                                    "is_export_default": True,
+                                    "is_react_component": True,
+                                },
+                            ))
+
+        # --- JSX component detection (functions returning JSX) ---
+        # Mark any function or arrow function as a React component when
+        # its body contains a JSX element (tag starting with <[A-Za-z]).
+        jsx_nodes = self._capture(
+            root_node,
+            ts_lang,
+            """
+            (jsx_element) @jsx
+            (jsx_self_closing_element) @jsx
+            """,
+        )
+        jsx_lines: set[int] = set()
+        for jsx_node in jsx_nodes:
+            start_line = self._line_num(jsx_node)
+            end_line = jsx_node.end_point[0] + 1
+            for ln in range(start_line, end_line + 1):
+                jsx_lines.add(ln)
+
+        if jsx_lines:
+            for sym in symbols:
+                if sym.kind in (
+                    NodeKind.FUNCTION, NodeKind.METHOD, NodeKind.CLASS
+                ):
+                    for ln in range(sym.line_start, sym.line_end + 1):
+                        if ln in jsx_lines:
+                            sym.metadata["is_react_component"] = True
+                            break
+
+        # --- React hooks detection (useEffect, useState, etc.) ---
+        hook_query = """
+            (expression_statement
+                (call_expression
+                    function: (identifier) @hook_name
+                )
+            )
+        """
+        react_hooks: set[str] = set()
+        for hnode in self._capture(root_node, ts_lang, hook_query):
+            hook_name = self._node_text(source, hnode).strip()
+            if hook_name.startswith("use") and hook_name[3:4].isupper():
+                react_hooks.add(hook_name)
+        if react_hooks:
+            if symbols:
+                symbols[0].metadata["react_hooks"] = list(react_hooks)
+
         # --- Dynamic imports via regex ---
         self._extract_dynamic_imports(source, dynamic_imports)
 

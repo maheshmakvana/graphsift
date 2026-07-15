@@ -1212,12 +1212,48 @@ def cmd_detect_dead_code(args: argparse.Namespace) -> int:
         print("No dead code detected.")
         return 0
 
-    print(f"Found {len(dead)} potentially unreachable elements:\n")
-    for item in dead:
-        print(f"  [{item['kind']}] {item['name']}")
-        print(f"    File: {item['file_path']}:{item['line_start']}")
-        print(f"    Reason: {item['reason']}")
+    # Apply priority scoring for large result sets (>20 entries)
+    prioritize = getattr(args, "prioritize", True)
+    show_all = getattr(args, "all", False)
+
+    if prioritize and len(dead) > 5:
+        from graphsift.prioritize import PriorityScorer  # noqa: PLC0415
+
+        scorer = PriorityScorer(graph=graph, source_map=source_map)
+        ranked = scorer.score_dead_code(dead)
+        entries_to_show = (
+            ranked.all_entries if show_all else ranked.entries
+        )
+
+        print(ranked.summary)
         print()
+
+        if ranked.tiers:
+            table_header = f"{'Tier':<12} {'Kind':<12} {'Name':<30} {'File':<40} {'Score':<8}"
+            print(table_header)
+            print("-" * len(table_header))
+            for sf in entries_to_show:
+                e = sf.entry
+                print(
+                    f"{sf.tier:<12} "
+                    f"[{e.get('kind', '?'):<10}] "
+                    f"{e.get('name', ''):<30} "
+                    f"{e.get('file_path', '')[-39:]:<40} "
+                    f"{sf.score:<8.3f}"
+                )
+        print()
+        if ranked.truncated:
+            print(
+                f"Tip: {ranked.truncated_count} findings hidden. "
+                f"Use --all to see everything."
+            )
+    else:
+        print(f"Found {len(dead)} potentially unreachable elements:\n")
+        for item in dead:
+            print(f"  [{item['kind']}] {item['name']}")
+            print(f"    File: {item['file_path']}:{item['line_start']}")
+            print(f"    Reason: {item['reason']}")
+            print()
 
     return 0
 
@@ -1521,6 +1557,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_dead.add_argument("--root", default=None, help="Repository root path")
     p_dead.add_argument("--kind", choices=["function", "class", "method"], help="Filter by node kind")
     p_dead.add_argument("--entry-points", help="Comma-separated entry-point file paths")
+    p_dead.add_argument("--prioritize", default=True, action="store_true",
+                        help="Apply priority scoring (default: on)")
+    p_dead.add_argument("--no-prioritize", dest="prioritize", action="store_false",
+                        help="Skip priority scoring, show raw results")
+    p_dead.add_argument("--all", action="store_true",
+                        help="Show all findings, including low-priority ones")
     p_dead.set_defaults(func=cmd_detect_dead_code)
 
     # suggest-fixes
