@@ -25,7 +25,7 @@ from typing import Any
 
 from graphsift.core import GenericParser, detect_language, estimate_tokens, register_parser
 from graphsift.exceptions import ParseError
-from graphsift.models import FileNode, GraphNode, Language, NodeKind
+from graphsift.models import FileNode, GraphNode, Language, NodeKind, SourceConfidence
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +127,20 @@ class TreeSitterParser:
         try:
             mod = importlib.import_module(pkg_name)
             # Each grammar module exposes a ``language()`` callable
-            # that returns a ``tree_sitter.Language`` instance.
+            # that returns a ``tree_sitter.Language`` instance or a
+            # raw ``PyCapsule`` (depending on tree-sitter version).
             lang_obj = mod.language()
+            # Some tree-sitter API versions (< 0.23) return a raw PyCapsule
+            # from language() instead of a Language wrapper. Wrap if needed.
+            if not isinstance(lang_obj, self._ts.Language):
+                try:
+                    lang_obj = self._ts.Language(lang_obj)
+                except Exception:
+                    logger.warning(
+                        "Failed to wrap PyCapsule into Language for %s",
+                        pkg_name,
+                    )
+                    return None
             self._grammars[lang] = lang_obj
             logger.debug("Loaded tree-sitter grammar for %s", lang.value)
             return lang_obj

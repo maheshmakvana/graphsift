@@ -1,11 +1,20 @@
-"""Verification hooks — auto-run syntax/lint/test after code changes.
+"""Verification hooks — auto-run syntax/lint checks after code changes.
 
-Hooks that fire after Write/Edit tools to catch errors before they
-compound. Designed to run as PostToolUse hooks.
+Post-edit verification hooks that catch syntax errors, lint issues, and
+other problems before they compound. Designed to run as PostToolUse hooks
+in agentic coding workflows.
+
+Supports Python (via ``compile()``) and JavaScript/TypeScript (via
+``node --check``). Extensible to additional languages via the language
+mapping.
 
 Usage::
     verify = Verifier(project_root="/path/to/repo")
     result = verify.check("src/main.py")
+    if not result.passed:
+        print(f"Syntax error: {result.syntax_error}")
+
+    ok, output = verify.lint("src/main.py")
 """
 
 from __future__ import annotations

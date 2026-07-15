@@ -263,7 +263,9 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     # ── Step 3: Parse & index ─────────────────────────────────────────────────
     print(f"  [3/5] Parsing {total_files} files ...")
-    builder = ContextBuilder(ContextConfig())
+    from graphsift.models import DepthTier  # noqa: PLC0415
+    depth_tier_val = DepthTier(getattr(args, 'depth', 'execution'))
+    builder = ContextBuilder(ContextConfig(depth_tier=depth_tier_val))
     all_paths = list(source_map.keys())
     skipped = 0
     t_parse_start = time.monotonic()
@@ -398,6 +400,14 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         print(f"  flows    : {pp_result.get('flows_detected', 0)}  |  communities: {pp_result.get('communities_detected', 0)}  |  fts rows: {pp_result.get('fts_indexed', 0)}")
     print(f"  db       : {db_path}")
     print(f"  manifest : {manifest_path}")
+    # Analytics summary
+    try:
+        from .analytics import summary_line
+        sl = summary_line(str(root))
+        if "Run" not in sl:
+            print(f"  {sl}")
+    except Exception:
+        pass
     print()
 
     return 0
@@ -1003,6 +1013,13 @@ def cmd_gain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Show cumulative token savings and cost estimate."""
+    from .analytics import summary_line
+    print(summary_line(project_root=args.project_root))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # compress command  (rtk-style output compression)
 # ---------------------------------------------------------------------------
@@ -1045,6 +1062,14 @@ def cmd_compress(args: argparse.Namespace) -> int:
         result = compress(raw, command=args.type, ultra=args.ultra)
 
     sys.stdout.write(result)
+    # Analytics summary to stderr (so it doesn't mix with piped output)
+    try:
+        from .analytics import summary_line
+        sl = summary_line()
+        if "Run" not in sl:
+            print(sl, file=sys.stderr)
+    except Exception:
+        pass
     return 0
 
 
@@ -1433,13 +1458,252 @@ def cmd_evidence(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# claude-md command  (auto-generate CLAUDE.md with project topology)
+# ---------------------------------------------------------------------------
+
+def _detect_build_tools(root: Path) -> dict[str, str]:
+    """Detect common build/test tools from project config files.
+
+    Returns dict with keys like "build", "test", "type_check",
+    "lint" with detected commands.
+    """
+    tools: dict[str, str] = {}
+
+    # pyproject.toml
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            import tomllib  # noqa: PLC0415
+            with open(pyproject, "rb") as f:
+                data = tomllib.load(f)
+            # Test command
+            if "pytest" in str(data):
+                tools["test"] = "pytest -xvs"
+            # Build system
+            build_sys = data.get("build-system", {})
+            backend = build_sys.get("build-backend", "")
+            if "setuptools" in backend:
+                tools["build"] = "python -m build"
+            elif "poetry" in backend or "poetry" in str(data):
+                tools["build"] = "poetry build"
+            # Scripts
+            scripts = data.get("project", {}).get("scripts", {})
+            if scripts:
+                tools["scripts"] = ", ".join(scripts.keys())
+        except Exception:
+            pass
+
+    # package.json
+    pkg_json = root / "package.json"
+    if pkg_json.exists():
+        try:
+            import json  # noqa: PLC0415
+            pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+            scripts = pkg.get("scripts", {})
+            if "test" in scripts:
+                tools["test"] = f"npm test  ({scripts['test']})"
+            if "build" in scripts:
+                tools["build"] = f"npm run build  ({scripts['build']})"
+            if "lint" in scripts:
+                tools["lint"] = f"npm run lint  ({scripts['lint']})"
+        except Exception:
+            pass
+
+    # Cargo.toml
+    cargo = root / "Cargo.toml"
+    if cargo.exists():
+        tools["build"] = "cargo build"
+        tools["test"] = "cargo test"
+
+    # go.mod
+    go_mod = root / "go.mod"
+    if go_mod.exists():
+        tools["test"] = "go test ./..."
+        tools["build"] = "go build ./..."
+
+    # Makefile
+    makefile = root / "Makefile"
+    if makefile.exists():
+        try:
+            content = makefile.read_text(encoding="utf-8")
+            if ".PHONY" in content or ":" in content:
+                tools["has_makefile"] = "make"
+                for target in ("test", "build", "lint", "fmt", "install"):
+                    if re.search(rf"^{target}:", content, re.MULTILINE):
+                        tools[target] = f"make {target}"
+        except Exception:
+            pass
+
+    return tools
+
+
+def _count_files_by_lang(root: Path, exclude_dirs: set[str]) -> dict[str, int]:
+    """Count source files grouped by language extension."""
+    counts: dict[str, int] = {}
+    ext_map: dict[str, str] = {
+        ".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
+        ".ts": "TypeScript", ".tsx": "TypeScript", ".go": "Go",
+        ".rs": "Rust", ".java": "Java", ".rb": "Ruby",
+        ".php": "PHP", ".c": "C", ".h": "C", ".cpp": "C++",
+        ".hpp": "C++", ".sh": "Shell", ".bash": "Shell",
+        ".tf": "Terraform", ".yaml": "YAML", ".yml": "YAML",
+        ".md": "Markdown", ".json": "JSON", ".toml": "TOML",
+    }
+    extra_exclude = exclude_dirs | {".claude", ".graphsift"}
+    for ext in ext_map:
+        for fp in root.rglob(f"*{ext}"):
+            parts = fp.relative_to(root).parts
+            if any(d in parts for d in extra_exclude):
+                continue
+            lang = ext_map[ext]
+            counts[lang] = counts.get(lang, 0) + 1
+    return counts
+
+
+def cmd_claude_md(args: argparse.Namespace) -> int:
+    """Auto-generate CLAUDE.md with project topology for optimal AI context.
+
+    Scans the project root, detects language distribution, build tools,
+    and key entry points, then writes a structured CLAUDE.md.
+    """
+    root = Path(args.project_root).resolve()
+    claude_md_path = root / "CLAUDE.md"
+
+    if claude_md_path.exists() and not args.force:
+        print(f"[graphsift] CLAUDE.md already exists at {claude_md_path}")
+        print("  Use --force to overwrite.")
+        return 0
+
+    print(f"[graphsift] Scanning {root} for CLAUDE.md generation ...")
+
+    exclude_dirs: set[str] = {
+        "venv", ".venv", "node_modules", ".git", "__pycache__",
+        "dist", "build", ".mypy_cache", ".pytest_cache",
+    }
+
+    # Detect project name
+    project_name = root.name
+
+    # Analyze language distribution
+    lang_counts = _count_files_by_lang(root, exclude_dirs)
+    sorted_langs = sorted(lang_counts.items(), key=lambda x: -x[1])
+    total_files = sum(lang_counts.values())
+
+    # Detect build tools
+    tools = _detect_build_tools(root)
+
+    # Detect key directories
+    key_dirs: list[str] = []
+    for d in ["src", "graphsift", "app", "lib", "core", "api", "cmd"]:
+        if (root / d).is_dir():
+            key_dirs.append(d)
+
+    # Detect entry points (exclude .claude worktrees, venv, etc.)
+    entry_points: list[str] = []
+    main_patterns = [
+        "**/__main__.py", "**/main.py", "**/main.go", "**/main.rs",
+        "**/cli.py", "**/app.py", "**/index.js", "**/index.ts",
+        "**/App.tsx", "**/app.tsx",
+    ]
+    extra_exclude = exclude_dirs | {".claude"}
+    for pat in main_patterns:
+        for fp in root.glob(pat):
+            parts = fp.relative_to(root).parts
+            if not any(d in parts for d in extra_exclude):
+                entry_points.append(str(fp.relative_to(root)))
+
+    # Detect dependency count
+    dep_count = 0
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            import tomllib  # noqa: PLC0415
+            with open(pyproject, "rb") as f:
+                data = tomllib.load(f)
+            deps = data.get("project", {}).get("dependencies", [])
+            dep_count = len(deps)
+        except Exception:
+            pass
+
+    # ── Build CLAUDE.md ──────────────────────────────────────────────────
+    lines: list[str] = [
+        f"# {project_name}",
+        "",
+        "Auto-generated by graphsift. Optimized for AI-assisted development.",
+        "",
+        "## Project Overview",
+        "",
+        f"- **Files**: {total_files} source files across {len(sorted_langs)} languages",
+        f"- **Languages**: {', '.join(f'{lang} ({count})' for lang, count in sorted_langs[:8])}",
+        f"- **Dependencies**: {dep_count}",
+        f"- **Key dirs**: {', '.join(key_dirs) if key_dirs else 'flat layout'}",
+        "",
+    ]
+
+    if entry_points:
+        lines.append("## Entry Points")
+        lines.append("")
+        for ep in entry_points[:5]:
+            lines.append(f"- `{ep}`")
+        lines.append("")
+
+    if tools:
+        lines.append("## Build & Test")
+        lines.append("")
+        for key in ("build", "test", "lint", "type_check", "scripts"):
+            if key in tools:
+                lines.append(f"- **{key.replace('_', ' ').title()}**: `{tools[key]}`")
+        if "has_makefile" in tools:
+            lines.append(f"- **Make targets**: check `make help` or the Makefile")
+        lines.append("")
+
+    lines.extend([
+        "## AI Context Rules",
+        "",
+        "When assisting with this codebase:",
+        "",
+        "1. **Graphsift is installed** — use it to save tokens on every operation:",
+        f"   - `graphsift build` — index the repo (already done if CLAUDE.md exists)",
+        "   - `graphsift compress` — pipe CLI output to save 60-97% tokens",
+        "   - Use `get_context` MCP tool for token-efficient code reviews",
+        "2. **Before reading files**, check if graphsift can provide targeted context",
+        "3. **For review requests**, always ask for the specific files/functions",
+        "4. **Token budget**: aim for <50k tokens per context request",
+        "",
+    ])
+
+    content = "\n".join(lines)
+
+    claude_md_path.parent.mkdir(parents=True, exist_ok=True)
+    claude_md_path.write_text(content, encoding="utf-8")
+
+    print()
+    print(f"  Written: {claude_md_path}")
+    print(f"  Files   : {total_files}")
+    print(f"  Languages: {', '.join(f'{l}:{c}' for l, c in sorted_langs[:6])}")
+    print(f"  Tools  : {', '.join(tools.keys()) if tools else 'none detected'}")
+    print()
+    print("  Next: share CLAUDE.md with your AI assistants for optimal context.")
+    print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
+    from ._version import __version__  # noqa: PLC0415
+
     parser = argparse.ArgumentParser(
         prog="graphsift",
         description="graphsift - smarter code context for LLMs",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show version and exit",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1460,6 +1724,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--exclude-dirs", nargs="*", metavar="DIR")
     p_build.add_argument("--progress-interval", type=int, default=200,
                          help="Log progress every N files (default 200, 0=disable)")
+    p_build.add_argument("--depth", choices=["planning", "exploration", "execution"],
+                         default="execution", help="Context depth tier (default: execution)")
     p_build.add_argument("--skip-postprocess", action="store_true",
                          help="Skip flow/community/risk/FTS post-processing after indexing")
 
@@ -1482,6 +1748,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # watch
     p_watch = sub.add_parser("watch", help="Watch for file changes and auto-update graph")
     p_watch.add_argument("--project-root", default=_cwd())
+
+    # claude-md
+    p_claude = sub.add_parser("claude-md", help="Auto-generate CLAUDE.md with project topology")
+    p_claude.add_argument("--project-root", default=_cwd())
+    p_claude.add_argument("--force", action="store_true", help="Overwrite existing CLAUDE.md")
 
     # detect-changes
     p_dc = sub.add_parser("detect-changes", help="Show risk-scored impact analysis for changed files")
@@ -1655,6 +1926,7 @@ def main() -> None:
         "list-repos": cmd_list_repos,
         "repos": cmd_repos,
         "gain": cmd_gain,
+        "stats": cmd_stats,
         "compress": cmd_compress,
         "discover": cmd_discover,
         "bash-wrapper": cmd_bash_wrapper,
@@ -1669,6 +1941,7 @@ def main() -> None:
         "tool-budgets": cmd_tool_budgets,
         "read-cache": cmd_read_cache,
         "evidence": cmd_evidence,
+        "claude-md": cmd_claude_md,
     }
 
     # Support func-based dispatch for new-style subcommands

@@ -2,11 +2,20 @@
 
 Scans generated text for file references and verifies they point to real
 files with valid line numbers. Catches hallucinated file references before
-they compound.
+they compound into downstream errors.
+
+The checker searches for patterns like ``src/main.py:42`` or
+``'src/main.py:42'`` in text, resolves them relative to a project root
+(including common source directories), and verifies the referenced file
+and line number exist on disk.
 
 Usage::
     checker = EvidenceChecker(project_root="/path/to/repo")
     violations = checker.check_response(response_text)
+
+    for citation in violations:
+        if not citation.valid:
+            print(f"Hallucinated reference: {citation.raw} — {citation.error}")
 """
 
 from __future__ import annotations

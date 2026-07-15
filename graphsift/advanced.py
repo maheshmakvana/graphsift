@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Generic, TypeVar
 
+from .async_engine import async_build as _async_build
+from .async_engine import async_index_files as _async_index_files
 from .core import ContextBuilder, ContextResult, DiffSpec, FileNode
 from .exceptions import (
     graphsiftError,
@@ -396,9 +398,10 @@ async def async_batch_index(
     *,
     concurrency: int = 4,
 ) -> list[IndexStats | Exception]:
-    """Index multiple source maps concurrently.
+    """Index multiple source maps concurrently using the async engine.
 
-    Each source_map is a separate batch (e.g. different repos or modules).
+    Each source_map is indexed via ``_async_index_files`` which uses
+    ``asyncio.gather`` for parallel file parsing within each source map. (e.g. different repos or modules).
     Per-item errors are isolated.
 
     Args:
@@ -451,7 +454,10 @@ async def async_batch_build(
     *,
     concurrency: int = 4,
 ) -> list[ContextResult | Exception]:
-    """Build context for multiple diffs concurrently.
+    """Build context for multiple diffs concurrently using the async engine.
+
+    Uses ``_async_build`` which offloads CPU-bound graph traversal and
+    ranking to a thread pool via ``asyncio.to_thread``.
 
     Args:
         builder: Pre-indexed ContextBuilder.

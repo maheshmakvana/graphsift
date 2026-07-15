@@ -35,6 +35,7 @@ from .exceptions import (
 from .models import (
     ContextConfig,
     ContextResult,
+    DepthTier,
     DiffSpec,
     EdgeKind,
     FileNode,
@@ -45,6 +46,7 @@ from .models import (
     NodeKind,
     OutputMode,
     ScoredFile,
+    SourceConfidence,
     TierLevel,
 )
 
@@ -224,6 +226,7 @@ class PythonParser:
             line_start=1,
             line_end=len(source.splitlines()),
             language=Language.PYTHON,
+            source_confidence=SourceConfidence.EXTRACTED,
         ))
 
         self._walk(tree, path, "", symbols, imports)
@@ -273,6 +276,7 @@ class PythonParser:
                     signature=sig,
                     decorators=decs,
                     is_async=isinstance(child, ast.AsyncFunctionDef),
+                    source_confidence=SourceConfidence.EXTRACTED,
                 ))
                 self._walk(child, path, qual, symbols, imports)
 
@@ -291,6 +295,7 @@ class PythonParser:
                     language=Language.PYTHON,
                     decorators=decs,
                     metadata={"bases": bases},
+                    source_confidence=SourceConfidence.EXTRACTED,
                 ))
                 self._walk(child, path, qual, symbols, imports)
 
@@ -454,6 +459,7 @@ class GenericParser:
             name=Path(path).stem,
             qualified_name=Path(path).stem,
             language=lang,
+            source_confidence=SourceConfidence.INFERRED,
         ))
 
         for key, pat in pats.items():
@@ -483,6 +489,7 @@ class GenericParser:
                         language=lang,
                         signature=sig,
                         metadata={"receiver_type": type_name},
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
                 elif key == "interface":
                     name = m.group(1)
@@ -498,6 +505,7 @@ class GenericParser:
                         language=lang,
                         signature=sig,
                         metadata={"is_interface": True},
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
                 else:
                     name = m.group(1)
@@ -514,6 +522,7 @@ class GenericParser:
                         language=lang,
                         signature=sig,
                         is_async="async" in sig,
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
 
         sha = hashlib.sha256(source.encode(errors="replace")).hexdigest()
@@ -586,6 +595,7 @@ class BashParser:
             name=Path(path).stem,
             qualified_name=Path(path).stem,
             language=Language.BASH,
+            source_confidence=SourceConfidence.INFERRED,
         ))
 
         for key, pat in self._PATTERNS.items():
@@ -607,6 +617,7 @@ class BashParser:
                         qualified_name=name,
                         line_start=line,
                         language=Language.BASH,
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
                 else:
                     symbols.append(GraphNode(
@@ -618,6 +629,7 @@ class BashParser:
                         line_start=line,
                         language=Language.BASH,
                         signature=f"function {name}()",
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
 
         sha = hashlib.sha256(source.encode(errors="replace")).hexdigest()
@@ -700,6 +712,7 @@ class HCLParser:
             name=Path(path).stem,
             qualified_name=Path(path).stem,
             language=Language.HCL,
+            source_confidence=SourceConfidence.INFERRED,
         ))
 
         for key, pat in self._PATTERNS.items():
@@ -724,6 +737,7 @@ class HCLParser:
                         language=Language.HCL,
                         signature=m.group(0)[:120],
                         metadata={"hcl_block": key, "resource_type": resource_type},
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
                 elif key == "variable":
                     name = m.group(1)
@@ -736,6 +750,7 @@ class HCLParser:
                         line_start=line,
                         language=Language.HCL,
                         metadata={"hcl_block": "variable"},
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
                 else:
                     name = m.group(1)
@@ -750,6 +765,7 @@ class HCLParser:
                         language=Language.HCL,
                         signature=m.group(0)[:120],
                         metadata={"hcl_block": key},
+                        source_confidence=SourceConfidence.INFERRED,
                     ))
 
         sha = hashlib.sha256(source.encode(errors="replace")).hexdigest()
@@ -1443,18 +1459,66 @@ class RelevanceRanker:
     4. Decorator proximity bonus (decorators of changed functions)
     5. Dynamic import penalty (uncertain deps get lower weight)
     6. File size penalty (huge files score lower unless directly changed)
+    7. God-node penalty (highly-connected utility files penalized to avoid
+       crowding out domain-specific business logic)
 
     Args:
         bm25_weight: Weight for BM25 keyword signal (0–1).
         graph_weight: Weight for graph distance signal (0–1).
+        god_node_penalty: Centrality penalty strength (0-1, default 0.3).
     """
 
-    def __init__(self, bm25_weight: float = 0.3, graph_weight: float = 0.7) -> None:
+    # Generic utility file patterns — God-node candidates
+    _UTILITY_PATTERNS = frozenset({
+        "utils", "util", "helpers", "helper", "common", "config",
+        "settings", "constants", "const", "base", "logger", "logging",
+        "decorators", "exceptions", "middleware", "types",
+    })
+
+    def __init__(self, bm25_weight: float = 0.3, graph_weight: float = 0.7, god_node_penalty: float = 0.3) -> None:
         self._bm25_w = bm25_weight
         self._graph_w = graph_weight
+        self._god_node_penalty = god_node_penalty
+        self._centrality_penalty: dict[str, float] = {}
 
     def __repr__(self) -> str:
-        return f"RelevanceRanker(bm25={self._bm25_w}, graph={self._graph_w})"
+        return f"RelevanceRanker(bm25={self._bm25_w}, graph={self._graph_w}, god_node={self._god_node_penalty})"
+
+    @staticmethod
+    def _is_generic_utility(path: str) -> bool:
+        """Check if a file path matches generic utility patterns (God-node)."""
+        p = Path(path)
+        stem = p.stem.lower()
+        # Direct filename match
+        if stem in RelevanceRanker._UTILITY_PATTERNS:
+            return True
+        # Parent directory match (e.g. src/utils/auth.py)
+        for part in p.parts:
+            if part.lower() in RelevanceRanker._UTILITY_PATTERNS:
+                return True
+        return False
+
+    def _compute_centrality_penalty(
+        self,
+        graph_scores: dict[str, tuple[float, int, list[str]]],
+    ) -> dict[str, float]:
+        """Compute in-degree centrality penalty for each file.
+
+        Files imported by many others get a higher penalty to prevent
+        utility-heavy files from dominating the context window.
+
+        Returns dict of file_path -> centrality_penalty (0.0 to 1.0).
+        """
+        if not graph_scores:
+            return {}
+        max_score = max((s[0] for s in graph_scores.values()), default=0.0)
+        if max_score == 0.0:
+            return {}
+        return {
+            path: score / max_score
+            for path, (score, _, _) in graph_scores.items()
+            if score > 0
+        }
 
     def rank(
         self,
@@ -1478,6 +1542,9 @@ class RelevanceRanker:
             diff_spec.diff_text + " " + diff_spec.commit_message + " " + diff_spec.query
         )
         changed_set = set(diff_spec.changed_files)
+
+        # Pre-compute God-node centrality penalty
+        self._centrality_penalty = self._compute_centrality_penalty(graph_scores)
 
         scored: list[ScoredFile] = []
         for fnode in all_files:
@@ -1518,12 +1585,39 @@ class RelevanceRanker:
                 combined *= 0.85
                 reasons.append("size penalty")
 
+            # ── God-node centrality penalty ──────────────────────────
+            # Highly-connected utility files penalized to preserve context
+            # for domain-specific business logic.
+            if path not in changed_set:
+                centrality_pen = self._centrality_penalty.get(path, 0.0)
+                utility_pen = 0.2 if self._is_generic_utility(path) else 0.0
+                if centrality_pen > 0 or utility_pen > 0:
+                    combined *= (1.0 - centrality_pen * self._god_node_penalty) * (1.0 - utility_pen)
+                    if utility_pen > 0:
+                        reasons.append("god-node utility penalty")
+                    if centrality_pen > 0.3:
+                        reasons.append(f"centrality penalty ({centrality_pen:.2f})")
+
             combined = min(1.0, max(0.0, combined))
 
             # Determine output mode with 3-tier HOT/WARM/COLD routing
-            if config.output_mode == OutputMode.SMART:
+            # DepthTier overrides thresholds for different development phases
+            if config.depth_tier == DepthTier.PLANNING:
+                hot_threshold = 0.95  # Only absolute core gets full source
+                warm_threshold = 0.4
+                default_mode = OutputMode.SIGNATURES
+                reasons.append("planning-tier")
+            elif config.depth_tier == DepthTier.EXPLORATION:
+                hot_threshold = 0.85
+                warm_threshold = 0.2
+                default_mode = OutputMode.SIGNATURES
+                reasons.append("exploration-tier")
+            else:  # EXECUTION
                 hot_threshold = getattr(config, 'hot_threshold', 0.8)
                 warm_threshold = getattr(config, 'warm_threshold', 0.25)
+                default_mode = OutputMode.SMART
+
+            if config.output_mode == OutputMode.SMART:
                 if combined >= hot_threshold:
                     mode = OutputMode.FULL
                     reasons.append(f"HOT(tier={combined:.2f})")
@@ -1531,10 +1625,17 @@ class RelevanceRanker:
                     mode = OutputMode.SIGNATURES
                     reasons.append(f"WARM(tier={combined:.2f})")
                 else:
-                    mode = OutputMode.SIGNATURES
+                    mode = default_mode
                     reasons.append(f"COLD(tier={combined:.2f})")
             else:
                 mode = config.output_mode
+
+            # Compute file-level confidence from symbol-level granularity
+            file_confidence = SourceConfidence.EXTRACTED
+            for sym in fnode.symbols:
+                if sym.source_confidence == SourceConfidence.INFERRED:
+                    file_confidence = SourceConfidence.INFERRED
+                    break
 
             scored.append(ScoredFile(
                 file_node=fnode,
@@ -1543,6 +1644,7 @@ class RelevanceRanker:
                 reasons=reasons,
                 depth=depth,
                 output_mode=mode,
+                source_confidence=file_confidence,
             ))
 
         # Sort by score descending, assign ranks
@@ -1556,6 +1658,7 @@ class RelevanceRanker:
                 reasons=sf.reasons,
                 depth=sf.depth,
                 output_mode=sf.output_mode,
+                source_confidence=sf.source_confidence,
             ))
 
         return ranked
@@ -2117,11 +2220,15 @@ class ContextSelector:
         else:
             tier_label = "COLD"
 
+        origin_tag = sf.source_confidence.value.upper()
         header = (
-            f"## {path} [{tier_label}]\n"
+            f"## {path} [{tier_label}] [origin: {origin_tag}]\n"
             f"<!-- score={sf.score:.3f} rank={sf.rank} depth={sf.depth} "
-            f"reasons={','.join(sf.reasons[:2])} -->\n"
+            f"reasons={','.join(sf.reasons[:2])} "
+            f"origin={origin_tag} -->\n"
         )
+        if sf.source_confidence == SourceConfidence.INFERRED:
+            header += f"<!-- CAUTION: {path} symbols were INFERRED via regex/heuristic, not AST-parsed -->\n"
 
         # Apply diff-aware trimming before mode-specific rendering
         # This runs after tier selection but before token budget counting

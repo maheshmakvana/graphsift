@@ -1,7 +1,14 @@
 """Tiered memory — axioms, rules, topic files, archives.
 
-Each tier has a different loading strategy and token budget. Only the
-first two tiers are auto-loaded; deeper tiers are loaded on demand.
+Manages a hierarchical memory structure for token-efficient context loading.
+Each tier has a different loading strategy and token budget, allowing LLM
+agents to access the right level of detail without blowing the context window.
+
+Tiers (in order of loading priority):
+    1. **axioms** — Always loaded, capped at 12 items. Core truths about the project.
+    2. **rules** — Auto-loaded from ``.claude/rules/`` directory. Project conventions.
+    3. **topic** — Keys only are pre-loaded; full content loaded on demand.
+    4. **archive** — Grep-only. Not loaded automatically; searched when needed.
 
 Usage::
     mem = TieredMemory(repo_root)

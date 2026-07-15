@@ -2,6 +2,34 @@
 
 Every memory links to code symbols, with SQLite persistence, TTL-based
 expiry, importance decay, and recall via graph proximity to changed symbols.
+
+Memory types (with default TTLs):
+    - **decision** (365d) — Architectural or design decisions
+    - **gotcha** (180d) — Non-obvious pitfalls or edge cases
+    - **note** (90d) — General observations
+    - **insight** (180d) — Deep understanding gained
+    - **todo** (30d) — Pending tasks or fixes
+    - **bug** (30d) — Known bugs or issues
+
+Recall strategies:
+    - ``recall_for_diff()`` — Ranks by symbol match > file match > graph proximity
+    - ``recall()`` — Text-based keyword overlap with importance/recency boost
+    - ``recall_for_symbol()`` — All memories linked to a specific symbol
+    - ``recall_for_file()`` — All memories linked to a specific file
+
+Maintenance:
+    - ``forget()`` — Soft-delete by setting ``invalid_at``
+    - ``decay()`` — Expire TTL-passed memories, reduce importance by 2%
+    - ``summarize_for_context()`` — One-paragraph summary for context injection
+
+Usage::
+    mem = CodeMemory()
+    mem_id = mem.remember(
+        "auth module uses bcrypt for password hashing",
+        linked_symbols=["auth.hash_password"],
+        memory_type="decision", importance=0.9,
+    )
+    entries = mem.recall_for_diff(changed_files=["src/auth.py"])
 """
 
 from __future__ import annotations

@@ -3,12 +3,16 @@
 Equivalent of rtk "gain" — tracks tokens saved per call, daily aggregates,
 per-command breakdowns, and compression ratios. Data stored at
 ``~/.graphsift/analytics.json``.
+
+Includes optional tiktoken integration for precise token counting
+(lazy-loaded, requires ``tiktoken>=0.7.0``).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from collections import defaultdict
 from datetime import date, datetime
@@ -16,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 _ANALYTICS_PATH = Path.home() / ".graphsift" / "analytics.json"
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +49,160 @@ def _load(project_root: str | None = None) -> dict[str, Any]:
 def _save(data: dict[str, Any]) -> None:
     _ANALYTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
     _ANALYTICS_PATH.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Tiktoken integration (lazy-loaded)
+# ---------------------------------------------------------------------------
+
+_ENCODING_CACHE: dict[str, object] = {}
+
+
+def _get_encoding(model: str = "claude") -> object | None:
+    """Get tiktoken encoding, returning None if tiktoken is unavailable.
+
+    Args:
+        model: ``"claude"`` or ``"gpt"`` — maps to cl100k_base encoding.
+
+    Returns:
+        tiktoken encoding object, or None.
+    """
+    if model in _ENCODING_CACHE:
+        return _ENCODING_CACHE[model]
+    try:
+        import tiktoken  # noqa: PLC0415
+        enc = tiktoken.get_encoding("cl100k_base")
+        _ENCODING_CACHE[model] = enc
+        return enc
+    except ImportError:
+        logger.debug("tiktoken not available — falling back to heuristic")
+        return None
+
+
+def estimate_tokens_precise(text: str, model: str = "claude") -> int:
+    """Count tokens precisely using tiktoken (when available).
+
+    Falls back to ``len(text) // 4`` heuristic when tiktoken is not
+    installed.
+
+    Args:
+        text: Text to count tokens for.
+        model: ``"claude"`` or ``"gpt"`` (both use cl100k_base).
+
+    Returns:
+        Token count.
+    """
+    enc = _get_encoding(model)
+    if enc is not None:
+        try:
+            return len(enc.encode(text, disallowed_special=()))  # type: ignore[arg-type]
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def estimate_cost(tokens: int, model: str = "claude", direction: str = "input") -> float:
+    """Estimate the cost of *tokens* in USD.
+
+    Args:
+        tokens: Number of tokens.
+        model: Model family (``"claude"`` or ``"gpt"``).
+        direction: ``"input"`` or ``"output"``.
+
+    Returns:
+        Estimated cost in USD.
+    """
+    rates = {
+        "claude": {"input": 3.0, "output": 15.0},   # $/M tokens (Sonnet)
+        "gpt": {"input": 2.5, "output": 10.0},       # $/M tokens (GPT-4o)
+    }
+    rate_map = rates.get(model, rates["claude"])
+    rate = rate_map.get(direction, rate_map["input"])
+    return tokens * rate / 1_000_000
+
+
+def token_report(data: dict[str, Any] | None = None, format: str = "text") -> str:
+    """Generate a detailed token savings report with cost estimates.
+
+    Args:
+        data: Analytics data dict. If None, loads from disk.
+        format: ``"text"`` or ``"json"``.
+
+    Returns:
+        Formatted report string.
+    """
+    if data is None:
+        data = _load()
+
+    tc = data["total_calls"]
+    ts = data["total_tokens_saved"]
+    avg = ts // max(tc, 1)
+    est_cost_saved = estimate_cost(ts)
+    orig_c = data["total_original_chars"]
+    comp_c = data["total_compressed_chars"]
+    ratio = (1 - comp_c / max(orig_c, 1)) * 100 if orig_c > 0 else 0.0
+
+    cmds_sorted = sorted(
+        data.get("by_command", {}).items(),
+        key=lambda x: -x[1]["tokens_saved"],
+    )
+
+    if format == "json":
+        return json.dumps({
+            "total_calls": tc,
+            "total_tokens_saved": ts,
+            "avg_tokens_per_call": avg,
+            "est_cost_saved_usd": round(est_cost_saved, 4),
+            "compression_ratio_pct": round(ratio, 1),
+            "by_command": [
+                {"command": c, **s} for c, s in cmds_sorted
+            ],
+        }, indent=2, default=str)
+
+    lines = [
+        "graphsift Token Report",
+        "=" * 50,
+        f"  Total calls            : {tc}",
+        f"  Tokens saved           : {ts:,}",
+        f"  Avg tokens/call        : {avg:,}",
+        f"  Est. cost saved        : ${est_cost_saved:.4f}",
+        f"  Compression ratio      : {ratio:.1f}%"
+        f"  ({comp_c:,} chars vs {orig_c:,})",
+        "",
+        "By command:",
+    ]
+    for cmd, s in cmds_sorted:
+        cmd_cost = estimate_cost(s["tokens_saved"])
+        lines.append(
+            f"  {cmd:<20} {s['calls']:>4} calls  "
+            f"{s['tokens_saved']:>10,} tokens  "
+            f"${cmd_cost:.4f}"
+        )
+    return "\n".join(lines)
+
+
+def summary_line(project_root: str | None = None) -> str:
+    """Return a one-liner with cumulative token savings and estimated cost saved.
+
+    Args:
+        project_root: Ignored; kept for API consistency.
+
+    Returns:
+        A single-line string summarizing token savings and estimated cost,
+        or a hint to run build/compress first if no analytics data exists yet.
+    """
+    if not _ANALYTICS_PATH.exists():
+        return 'Run `graphsift build` or `graphsift compress` first to generate analytics.'
+    data = _load(project_root)
+    ts = data["total_tokens_saved"]
+    est_cost = ts * 15 / 1_000_000
+    return f"Tokens saved: {ts:,} | Est. cost saved: ${est_cost:.4f}"
+
+
+# Lazy alias — resolves at call time so gain() is always defined
+def token_report(*args: Any, **kwargs: Any) -> str:
+    """Alias for gain()."""
+    return gain(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

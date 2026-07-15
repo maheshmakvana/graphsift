@@ -1,12 +1,20 @@
 """Tool budget system — per-tool line caps to limit token consumption.
 
-Enforces max lines on tool output, strips ANSI, collapses blank lines,
-and extracts structured data (JSON/XML) from verbose command output.
+Enforces maximum line limits on tool output to prevent context window
+overflow. Each tool type has a configurable cap (defaults: bash=80,
+read=300, grep=120).
+
+Processing pipeline:
+    1. Strip ANSI escape sequences (colored output)
+    2. Collapse repeated blank lines (3+ → 2)
+    3. Optionally extract structured JSON/XML content
+    4. Cap at tool's line limit with head/tail summary notation
 
 Usage::
     budget = ToolBudget()
     capped = budget.apply("bash", long_output)
     capped = budget.apply("read", file_content)
+    budget.set_budget("bash", 50)  # tighten budget
 """
 
 from __future__ import annotations
