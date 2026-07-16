@@ -325,6 +325,22 @@ class ContextConfig(BaseModel):
         default=True,
         description="Enable entropy-based deduplication of near-identical files to improve context diversity.",
     )
+    auto_evolve: bool = Field(
+        default=False,
+        description="When True, ContextBuilder automatically runs EvolutionOptimizer to tune parameters for this codebase.",
+    )
+    evolve_rounds: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Number of evolution rounds when auto_evolve is enabled.",
+    )
+    evolve_population: int = Field(
+        default=6,
+        ge=2,
+        le=20,
+        description="Population size per evolution round when auto_evolve is enabled.",
+    )
     schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 
     # -- Adaptive budgeting & pruning (v2.4+) --

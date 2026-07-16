@@ -211,6 +211,7 @@ from .toolchain import ToolChain, ChainStep, ChainResult, ChainState, build_chai
 from .auto_verify import AutoVerifier, AutoVerifyResult, VerificationIteration, VerificationStage
 from .conventions import ConventionLearner, Convention, ConventionProfile
 from .explorer import ContextEnricher, EnrichmentResult, Discovery, DiscoveryType
+from .evolve import EvolutionOptimizer, EvolutionResult, ParameterSpace
 
 __all__ = [
     # Core
@@ -402,6 +403,10 @@ __all__ = [
     "EnrichmentResult",
     "Discovery",
     "DiscoveryType",
+    # Evolution Optimizer
+    "EvolutionOptimizer",
+    "EvolutionResult",
+    "ParameterSpace",
     "CompressionLevel",
     "ultra_compress",
     "EnforceMode",

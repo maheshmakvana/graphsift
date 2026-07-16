@@ -2522,6 +2522,7 @@ class ContextBuilder:
         )
         self._ranker = RelevanceRanker()
         self._selector = ContextSelector(self._config)
+        self._evolved_params: dict[str, Any] | None = None
         self._index_stats = IndexStats()
         self._lock = threading.RLock()
         self._store = store
@@ -2534,6 +2535,71 @@ class ContextBuilder:
 
     def __repr__(self) -> str:
         return f"ContextBuilder(budget={self._config.token_budget:,}, {self._graph})"
+
+    @staticmethod
+    def _compute_fingerprint(source_map: dict[str, str]) -> str:
+        """Deterministic SHA-256 fingerprint of source map keys.
+
+        Used to identify a codebase for evolution caching.
+        """
+        sorted_keys = sorted(source_map.keys())
+        raw = "\n".join(sorted_keys)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _maybe_run_evolution(
+        self,
+        diff_spec: DiffSpec,
+        source_map: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """Run evolution if no cached params exist for this codebase.
+
+        Args:
+            diff_spec: The diff specification.
+            source_map: File path -> source text mapping.
+
+        Returns:
+            Evolved params dict, or None if evolution didn't run.
+        """
+        if not self._config.auto_evolve:
+            return None
+
+        # Lazy imports to avoid circular deps
+        from .evolve import EvolutionOptimizer, ParameterSpace, make_evaluator
+        from .evolve_registry import EvolveRegistry
+
+        fingerprint = self._compute_fingerprint(source_map)
+        registry = EvolveRegistry()
+
+        # Check cache
+        cached = registry.get(fingerprint, "full")
+        if cached is not None:
+            logger.info("Using cached evolved params for fingerprint %s", fingerprint)
+            return cached
+
+        # Run evolution
+        logger.info("Running evolution for fingerprint %s (%d rounds)...",
+                    fingerprint, self._config.evolve_rounds)
+        try:
+            space = ParameterSpace.full_space()
+            optimizer = EvolutionOptimizer(space, seed=42, verbose=False)
+            evaluator = make_evaluator(source_map, diff_spec, space_type="full")
+            seed_params = space.defaults()
+
+            result = optimizer.optimize(
+                seed_params=seed_params,
+                evaluator=evaluator,
+                rounds=self._config.evolve_rounds,
+                population=self._config.evolve_population,
+            )
+
+            # Cache result
+            registry.set(fingerprint, "full", result.best_params, result.best_score)
+            logger.info("Evolution complete: score=%.4f, improvements=%d/%d",
+                        result.best_score, result.improvements, result.rounds)
+            return result.best_params
+        except Exception as exc:
+            logger.warning("Evolution failed: %s", exc)
+            return None
 
     def index_file(self, path: str, source: str) -> FileNode:
         """Parse and index a single source file.
@@ -2768,17 +2834,60 @@ class ContextBuilder:
         if cached is not None:
             return cached
 
+        # ── Run auto-evolution if enabled ────────────────────────────
+        if self._config.auto_evolve and self._evolved_params is None:
+            self._evolved_params = self._maybe_run_evolution(diff_spec, source_map)
+
+        # ── Apply evolved params ─────────────────────────────────────
+        if self._evolved_params:
+            # Create temporary config with evolved overrides
+            evolved_token_budget = self._evolved_params.get("token_budget", self._config.token_budget)
+            evolved_min_score = self._evolved_params.get("min_score", self._config.min_score)
+            evolved_hot = self._evolved_params.get("hot_threshold", self._config.hot_threshold)
+            evolved_warm = self._evolved_params.get("warm_threshold", self._config.warm_threshold)
+            evolved_trimming = self._evolved_params.get("trimming_context_lines", self._config.trimming_context_lines)
+
+            # Create override config preserving all other settings
+            from .models import ContextConfig
+            evolved_config = ContextConfig(
+                token_budget=evolved_token_budget,
+                min_score=evolved_min_score,
+                hot_threshold=evolved_hot,
+                warm_threshold=evolved_warm,
+                trimming_context_lines=evolved_trimming,
+                diff_aware_trimming=self._config.diff_aware_trimming,
+                dedup_enabled=self._config.dedup_enabled,
+                output_mode=self._config.output_mode,
+                depth_tier=self._config.depth_tier,
+                include_tests=self._config.include_tests,
+                include_dynamic=self._config.include_dynamic,
+            )
+
+            # Use evolved ranker params
+            evolved_ranker = RelevanceRanker(
+                bm25_weight=self._evolved_params.get("bm25_weight", 0.3),
+                graph_weight=self._evolved_params.get("graph_weight", 0.7),
+                god_node_penalty=self._evolved_params.get("god_node_penalty", 0.3),
+            )
+
+            # Store for use below
+            active_config = evolved_config
+            active_ranker = evolved_ranker
+        else:
+            active_config = self._config
+            active_ranker = self._ranker
+
         # ── Full build ────────────────────────────────────────────────────
         try:
             graph_scores = self._graph.ranked_neighbors(
                 diff_spec.changed_files,
-                include_dynamic=self._config.include_dynamic,
+                include_dynamic=active_config.include_dynamic,
             )
         except Exception as exc:
             raise GraphError(f"Graph traversal failed: {exc}") from exc
 
         all_files = self._graph.all_files()
-        ranked = self._ranker.rank(diff_spec, graph_scores, all_files, self._config)
+        ranked = active_ranker.rank(diff_spec, graph_scores, all_files, active_config)
 
         selected, context, orig_tokens, rendered_tokens = self._selector.select_and_render(
             ranked, source_map, diff_spec

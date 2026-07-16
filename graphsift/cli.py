@@ -498,6 +498,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     skill_count = len(list(skills_dir.glob("*/SKILL.md"))) if skills_dir.exists() else 0
     print(f"  Skills    : {skill_count} installed")
     print()
+
+    # Evolution status
+    try:
+        from graphsift.evolve_registry import EvolveRegistry
+        registry = EvolveRegistry()
+        entries = registry.list_entries()
+        if entries:
+            print(f"Evolution cache: {len(entries)} entries")
+            for e in entries:
+                print(f"  {e.get('fingerprint', '?')[:16]}: score={e.get('score', 0):.4f}")
+        else:
+            print("Evolution cache: empty")
+    except ImportError:
+        pass  # evolve module not available
+
     return 0
 
 
@@ -1902,12 +1917,102 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--text", required=True, help="Text to check for citations")
     p_ev.add_argument("--project-root", default=_cwd(), help="Project root (default: cwd)")
 
+    # evolve
+    evolve_parser = sub.add_parser(
+        "evolve",
+        help="Run or manage evolutionary parameter optimization.",
+    )
+    evolve_sub = evolve_parser.add_subparsers(dest="evolve_action")
+
+    # evolve run
+    run_parser = evolve_sub.add_parser("run", help="Run evolution on the current codebase.")
+    run_parser.add_argument("--rounds", type=int, default=40, help="Number of evolution rounds.")
+    run_parser.add_argument("--population", type=int, default=6, help="Population per round.")
+    run_parser.add_argument("--source-dir", type=str, default=".", help="Root directory of the codebase.")
+
+    # evolve status
+    evolve_sub.add_parser("status", help="Show cached evolution results.")
+
+    # evolve clear
+    evolve_sub.add_parser("clear", help="Clear all cached evolution results.")
+
     return parser
 
 
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Handle evolve command with sub-actions inline
+    if args.command == "evolve":
+        from graphsift.evolve_registry import EvolveRegistry
+        registry = EvolveRegistry()
+
+        if args.evolve_action == "status":
+            entries = registry.list_entries()
+            if not entries:
+                print("No evolution results cached.")
+                return
+            print(f"Cached evolution results ({len(entries)}):")
+            print(f"  {'Fingerprint':<20} {'Score':<10} {'Params':<60}")
+            print(f"  {'-'*90}")
+            for e in entries:
+                fp = e.get("fingerprint", "?")[:16]
+                score = f"{e.get('score', 0):.4f}"
+                params_str = str(e.get("params", {}))
+                if len(params_str) > 55:
+                    params_str = params_str[:55] + "..."
+                print(f"  {fp:<20} {score:<10} {params_str:<60}")
+
+        elif args.evolve_action == "clear":
+            registry.clear()
+            print("Evolution cache cleared.")
+
+        elif args.evolve_action == "run":
+            # Collect source files
+            from pathlib import Path
+            from graphsift import PythonParser, DependencyGraph, DiffSpec
+
+            src_dir = Path(args.source_dir).resolve()
+            source_map = {}
+            for py_file in src_dir.rglob("*.py"):
+                if "venv" in str(py_file) or ".venv" in str(py_file) or "__pycache__" in str(py_file):
+                    continue
+                try:
+                    source_map[str(py_file.relative_to(src_dir))] = py_file.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+
+            if not source_map:
+                print(f"No Python files found in {args.source_dir}")
+                return
+
+            print(f"Found {len(source_map)} Python files. Running evolution...")
+            print(f"  Rounds: {args.rounds}, Population: {args.population}")
+
+            from graphsift.evolve import EvolutionOptimizer, ParameterSpace, make_evaluator
+
+            diff = DiffSpec(changed_files=list(source_map.keys())[:3], query="Optimize params")
+            space = ParameterSpace.full_space()
+            optimizer = EvolutionOptimizer(space, seed=42, verbose=True)
+            evaluator = make_evaluator(source_map, diff, space_type="full")
+
+            result = optimizer.optimize(
+                seed_params=space.defaults(),
+                evaluator=evaluator,
+                rounds=args.rounds,
+                population=args.population,
+            )
+
+            print(f"\nEvolution complete!")
+            print(f"  Best score: {result.best_score:.4f}")
+            print(f"  Improvements: {result.improvements}/{result.rounds}")
+            print(f"  Duration: {result.duration_s:.1f}s")
+            print(f"\nBest params:")
+            for k, v in result.best_params.items():
+                print(f"  {k}: {v}")
+
+        return
 
     commands = {
         "install": cmd_install,
