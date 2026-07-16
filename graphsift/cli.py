@@ -1704,11 +1704,236 @@ def cmd_claude_md(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# loop-engineering commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_loop_init(args: argparse.Namespace) -> int:
+	"""Scaffold loop config for the project."""
+	from graphsift.loop_config import LoopConfig
+
+	root = Path(args.project_root).resolve()
+	config = LoopConfig()
+	config.save(str(root))
+	print(f"[graphsift] Loop config initialized at {root / '.graphsift' / 'loop-config.json'}")
+	print()
+	# Run audit
+	from graphsift.loop_engineering import LoopEngine
+	engine = LoopEngine(repo_root=str(root))
+	audit = engine.audit_readiness()
+	print(f"  Loop Readiness Score: {audit['score']}/{audit['max_score']} ({audit['percentage']}%)")
+	print(f"  Level: {audit['level']}")
+	if audit['suggestions']:
+		print("  Suggestions:")
+		for s in audit['suggestions']:
+			print(f"    - {s}")
+	return 0
+
+
+def cmd_loop_run(args: argparse.Namespace) -> int:
+	"""Run a specific loop pattern."""
+	from graphsift.loop_engineering import LoopEngine, PatternType
+
+	engine = LoopEngine(repo_root=args.project_root)
+	pattern = PatternType(args.pattern)
+
+	method_map = {
+		PatternType.DAILY_TRIAGE: engine.run_daily_triage,
+		PatternType.PR_BABYSITTER: engine.run_pr_babysitter,
+		PatternType.CI_SWEEPER: engine.run_ci_sweeper,
+		PatternType.DEP_SWEEPER: engine.run_dep_sweeper,
+		PatternType.CHANGELOG_DRAFT: engine.run_changelog,
+		PatternType.POST_MERGE_CLEANUP: engine.run_cleanup,
+		PatternType.ISSUE_TRIAGE: engine.run_issue_triage,
+	}
+
+	fn = method_map.get(pattern)
+	if not fn:
+		print(f"[graphsift] Unknown pattern: {args.pattern}")
+		return 1
+
+	result = fn()
+	print(f"[graphsift] Loop run: {result.pattern.value}")
+	print(f"  Status  : {result.status.value}")
+	print(f"  Summary : {result.summary}")
+	print(f"  Duration: {result.duration_ms:.0f}ms")
+	print(f"  Tokens  : {result.tokens_used}")
+	print(f"  Run ID  : {result.run_id[:12]}")
+	if result.error:
+		print(f"  Error   : {result.error}")
+	return 0 if result.status.value == "success" else 1
+
+
+def cmd_loop_status(args: argparse.Namespace) -> int:
+	"""Show loop engine status."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	report = engine.full_report()
+	sched = report.get("scheduler", {})
+	budget = report.get("budget", {})
+
+	print(f"[graphsift] Loop Engine Status")
+	print(f"  Scheduler     : {'running' if sched.get('running') else 'stopped'}")
+	print(f"  Patterns      : {len(sched.get('patterns', {}))}")
+	print(f"  Daily budget  : {budget.get('daily_limit', 500_000):,} tokens")
+	print(f"  Today spend   : {budget.get('today_total', 0):,} tokens")
+	print(f"  Budget remain : {budget.get('budget_remaining', 0):,} tokens")
+	print(f"  Week spend    : {budget.get('week_total', 0):,} tokens")
+	print(f"  Worktrees     : {len(report.get('active_worktrees', []))} active")
+	drift = report.get("drift", [])
+	if drift:
+		for d in drift:
+			print(f"  Drift         : {d.get('type')} ({d.get('from')} -> {d.get('to')})")
+	return 0
+
+
+def cmd_loop_report(args: argparse.Namespace) -> int:
+	"""Full loop activity report."""
+	import json
+
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	report = engine.full_report()
+	print(json.dumps(report, indent=2, default=str))
+	return 0
+
+
+def cmd_loop_schedule(args: argparse.Namespace) -> int:
+	"""List scheduled patterns."""
+	from graphsift.loop_engineering import LoopEngine, PatternType, PATTERN_REGISTRY
+
+	engine = LoopEngine(repo_root=args.project_root)
+	sched = engine.full_report().get("scheduler", {})
+	patterns = sched.get("patterns", {})
+
+	if not patterns:
+		print("[graphsift] No patterns registered.")
+		return 0
+
+	print(f"{'Pattern':<25} {'Cadence':<12} {'Maturity':<10} {'Enabled':<10}")
+	print("-" * 60)
+	for name, info in sorted(patterns.items()):
+		registry_info = PATTERN_REGISTRY.get(PatternType(name), {})
+		cadence = registry_info.get("cadence", f"{info.get('cadence_seconds', 0)}s")
+		print(f"{name:<25} {cadence:<12} {info.get('maturity', 'L1'):<10} {str(info.get('enabled', True)):<10}")
+	return 0
+
+
+def cmd_loop_cost(args: argparse.Namespace) -> int:
+	"""Estimate token cost per pattern."""
+	from graphsift.loop_engineering import LoopCostBudgeter, LoopEngine, MaturityLevel, PatternType
+
+	budgeter = LoopCostBudgeter()
+	pattern = PatternType(args.pattern)
+	maturity = MaturityLevel(args.maturity)
+
+	est = budgeter.estimate_cost(pattern, maturity)
+	print(f"[graphsift] Cost estimate for {args.pattern} @ {args.maturity}")
+	print(f"  Estimated tokens per run: {est:,}")
+	print(f"  Daily budget: {budgeter.DEFAULT_DAILY_LIMIT:,}")
+	print(f"  Max runs/day: {budgeter.DEFAULT_DAILY_LIMIT // max(est, 1)}")
+	print(f"  Weekly estimate (daily): {est * 7:,}")
+	return 0
+
+
+def cmd_loop_audit(args: argparse.Namespace) -> int:
+	"""Loop readiness score and suggestions."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	audit = engine.audit_readiness()
+
+	print(f"[graphsift] Loop Readiness Audit")
+	print(f"  Score     : {audit['score']}/{audit['max_score']} ({audit['percentage']}%)")
+	print(f"  Level     : {audit['level']}")
+	print(f"  Badge     : {audit['badge']}")
+	print()
+	if audit['suggestions']:
+		print("  Suggestions to improve:")
+		for s in audit['suggestions']:
+			print(f"    ☐ {s}")
+	else:
+		print("  No suggestions — loop setup looks complete!")
+	return 0
+
+
+def cmd_loop_session_start(args: argparse.Namespace) -> int:
+	"""Run one-shot session start diagnostic. No background loops."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	diag = engine.session_start()
+	print("[graphsift] Session diagnostics complete")
+	print(f"  Summary  : {diag['summary']}")
+	print(f"  Patterns : {len(diag.get('patterns_run', []))}")
+	for p in diag.get('patterns_run', []):
+		print(f"    - {p['pattern']}: {p['status']} ({p['tokens']} tok, {p['duration_ms']:.0f}ms)")
+	print(f"  Total    : {diag.get('total_tokens', 0)} tokens, {diag.get('total_duration_ms', 0):.0f}ms")
+	if diag.get('drift'):
+		for d in diag['drift']:
+			print(f"  Drift    : {d.get('type')}")
+	print()
+	print("  Tip: run 'graphsift loop run <pattern>' for deeper analysis")
+	print("  Tip: run 'graphsift loop diagnose' when you're stuck")
+	return 0
+
+
+def cmd_loop_diagnose(args: argparse.Namespace) -> int:
+	"""Run comprehensive diagnostic — use when struggling with code."""
+	import json
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	result = engine.run_diagnostic()
+	print(f"[graphsift] Diagnostic complete")
+	print(f"  Status   : {result.status.value}")
+	print(f"  Summary  : {result.summary}")
+	print(f"  Duration : {result.duration_ms:.0f}ms")
+	print(f"  Tokens   : {result.tokens_used}")
+	if args.message:
+		struggle = engine.detect_struggle(user_message=args.message)
+		if struggle['triggered']:
+			print(f"  Struggle : {struggle['reason']} (confidence: {struggle['confidence']:.1f})")
+			print(f"  Suggest  : run 'graphsift loop run {struggle['suggested_pattern'].value}'")
+	return 0
+
+
+def cmd_loop_struggle(args: argparse.Namespace) -> int:
+	"""Check for struggle signals in user message or failure patterns."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	result = engine.detect_struggle(user_message=args.message, repeated_failures=args.failures)
+	if result['triggered']:
+		print(f"[graphsift] Struggling detected: {result['reason']}")
+		print(f"  Confidence : {result['confidence']:.1f}")
+		print(f"  Suggested  : graphsift loop run {result['suggested_pattern'].value}")
+		print(f"  Or run     : graphsift loop diagnose")
+	else:
+		print("[graphsift] No struggle signals detected.")
+		print("  If you ARE stuck, try: graphsift loop diagnose")
+	return 0
+
+
+def cmd_loop_reset_breaker(args: argparse.Namespace) -> int:
+	"""Reset circuit breaker for a pattern."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	engine._circuit_breaker.reset(args.pattern)
+	print(f"[graphsift] Circuit breaker reset for pattern: {args.pattern}")
+	return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
     from ._version import __version__  # noqa: PLC0415
+    from .loop_engineering import PatternType
 
     parser = argparse.ArgumentParser(
         prog="graphsift",
@@ -1936,6 +2161,63 @@ def _build_parser() -> argparse.ArgumentParser:
     # evolve clear
     evolve_sub.add_parser("clear", help="Clear all cached evolution results.")
 
+    # -----------------------------------------------------------------------
+    # loop command  (loop-engineering)
+    # -----------------------------------------------------------------------
+    loop_parser = sub.add_parser("loop", help="Loop-engineering: scheduled automation patterns")
+    loop_sub = loop_parser.add_subparsers(dest="loop_action", required=True)
+
+    # loop init
+    p_loop_init = loop_sub.add_parser("init", help="Scaffold loop config for the project")
+    p_loop_init.add_argument("--project-root", default=_cwd())
+
+    # loop run
+    p_loop_run = loop_sub.add_parser("run", help="Run a specific loop pattern")
+    p_loop_run.add_argument("pattern", choices=[p.value for p in PatternType], help="Pattern to run")
+    p_loop_run.add_argument("--project-root", default=_cwd())
+
+    # loop status
+    p_loop_status = loop_sub.add_parser("status", help="Show loop engine status")
+    p_loop_status.add_argument("--project-root", default=_cwd())
+
+    # loop report
+    p_loop_report = loop_sub.add_parser("report", help="Full loop activity report")
+    p_loop_report.add_argument("--project-root", default=_cwd())
+
+    # loop schedule
+    p_loop_sched = loop_sub.add_parser("schedule", help="List scheduled patterns")
+    p_loop_sched.add_argument("--project-root", default=_cwd())
+
+    # loop cost
+    p_loop_cost = loop_sub.add_parser("cost", help="Estimate token cost per pattern")
+    p_loop_cost.add_argument("--pattern", choices=[p.value for p in PatternType], required=True, help="Pattern type")
+    p_loop_cost.add_argument("--maturity", choices=["L1", "L2", "L3"], default="L1", help="Maturity level")
+    p_loop_cost.add_argument("--project-root", default=_cwd())
+
+    # loop audit
+    p_loop_audit = loop_sub.add_parser("audit", help="Loop readiness score and suggestions")
+    p_loop_audit.add_argument("--project-root", default=_cwd())
+
+    # loop start (one-shot session start diagnostic)
+    p_loop_start = loop_sub.add_parser("session-start", help="Run one-shot session start diagnostic (~12K tokens, no background loops)")
+    p_loop_start.add_argument("--project-root", default=_cwd())
+
+    # loop diagnose (run when user is struggling)
+    p_loop_diag = loop_sub.add_parser("diagnose", help="Run comprehensive diagnostic (use when struggling with code)")
+    p_loop_diag.add_argument("--project-root", default=_cwd())
+    p_loop_diag.add_argument("--message", default="", help="User message to analyze for struggle signals")
+
+    # loop struggle (check for struggle signals)
+    p_loop_struggle = loop_sub.add_parser("struggle", help="Check if user is showing struggle signals")
+    p_loop_struggle.add_argument("--message", default="", help="User message to analyze")
+    p_loop_struggle.add_argument("--failures", type=int, default=0, help="Number of repeated failures")
+    p_loop_struggle.add_argument("--project-root", default=_cwd())
+
+    # loop cost
+    p_loop_breaker = loop_sub.add_parser("reset-breaker", help="Reset circuit breaker for a pattern")
+    p_loop_breaker.add_argument("pattern", help="Pattern name to reset")
+    p_loop_breaker.add_argument("--project-root", default=_cwd())
+
     return parser
 
 
@@ -2013,6 +2295,28 @@ def main() -> None:
                 print(f"  {k}: {v}")
 
         return
+
+    # Handle loop command with sub-actions
+    if args.command == "loop":
+        loop_actions = {
+            "init": cmd_loop_init,
+            "run": cmd_loop_run,
+            "status": cmd_loop_status,
+            "report": cmd_loop_report,
+            "schedule": cmd_loop_schedule,
+            "cost": cmd_loop_cost,
+            "audit": cmd_loop_audit,
+            "session-start": cmd_loop_session_start,
+            "diagnose": cmd_loop_diagnose,
+            "struggle": cmd_loop_struggle,
+            "reset-breaker": cmd_loop_reset_breaker,
+        }
+        fn = loop_actions.get(args.loop_action)
+        if fn:
+            sys.exit(fn(args))
+        else:
+            print(f"[graphsift] Unknown loop action: {args.loop_action}")
+            sys.exit(1)
 
     commands = {
         "install": cmd_install,

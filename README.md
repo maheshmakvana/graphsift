@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — Ranked Code Context & Token Optimizer for LLMs" width="600">
 </p>
 
-<h1 align="center">graphsift v3.0</h1>
+<h1 align="center">graphsift v3.1</h1>
 <p align="center">
   <strong>#1 Token Saver for Claude, GPT-4, Gemini & Every LLM —<br>
   80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 93% Feature Coverage</strong>
@@ -23,8 +23,8 @@
   <a href="https://github.com/maheshmakvana/graphsift/actions"><img src="https://img.shields.io/github/actions/workflow/status/maheshmakvana/graphsift/tests.yml?style=flat&label=tests&color=blue" alt="CI"></a>
   <img src="https://img.shields.io/badge/F1-0.85-success" alt="F1">
   <img src="https://img.shields.io/badge/languages-14-lightgrey" alt="languages">
-  <img src="https://img.shields.io/badge/modules-38-blue" alt="modules">
-  <img src="https://img.shields.io/badge/tests-702-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/modules-40-blue" alt="modules">
+  <img src="https://img.shields.io/badge/tests-767-brightgreen" alt="tests">
   <img src="https://img.shields.io/badge/features-93%25-orange" alt="features">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="Stars"></a>
 </p>
@@ -34,10 +34,41 @@
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-install">Install</a> ·
   <a href="#-api-overview">API</a> ·
-  <a href="#-new-in-v30">v3.0</a> ·
+  <a href="#-new-in-v31">v3.1</a> ·
   <a href="#-benchmarks">Benchmarks</a> ·
   <a href="#-docs">Docs</a>
 </p>
+
+---
+
+## 🔄 NEW in v3.1 — Loop Engineering (Struggle-Aware Automation)
+
+**7 production loop patterns** that trigger **only when you need them** — no background timers, no token waste.
+
+```
+graphsift loop session-start      # One-shot diagnostic at session start (~12K tok)
+graphsift loop diagnose           # Run when stuck on errors
+graphsift loop run daily-triage   # Check what changed today
+graphsift loop run ci-sweeper     # Analyze repeated CI failures
+graphsift loop run dep-sweeper    # Check dependencies
+graphsift loop status             # Loop system status
+graphsift loop audit              # Readiness score + suggestions
+```
+
+**Key difference from traditional loop-engineering**: No cron scheduler, no background timers, no continuous polling. Loops are **struggle-triggered** — they activate when you hit repeated errors, express frustration, or explicitly ask. Zero token waste on idle.
+
+| Pattern | Trigger | Tokens | Use Case |
+|---------|---------|--------|----------|
+| SessionStart | Session begin (once) | ~12K | Morning diagnostic |
+| Daily Triage | On-demand / struggle | ~7.5K | What changed? |
+| PR Babysitter | On-demand | ~3.5K | Review PRs |
+| CI Sweeper | 3+ failures / frustration | ~11K | Stuck on CI |
+| Dep Sweeper | On-demand / session | ~2.2K | Outdated deps |
+| Changelog Draft | On-demand | ~2.5K | Release notes |
+| Post-Merge Cleanup | On-demand | ~1.5K | Stale branches |
+| Issue Triage | On-demand | ~2.5K | Classify issues |
+
+Built-in safety: **Circuit breaker** (auto-stop at 5 failures), **Human gate** (L1 report → L2 assisted → L3 autonomous), **StruggleDetector** (catches frustration, repeated failures, approach changes).
 
 ---
 
@@ -136,9 +167,26 @@ result = planner.execute_plan(plan)
 
 ---
 
-## 🌟 New in v3.0
+## 🌟 New in v3.1
 
-v3.0 is the biggest release yet — **11 entirely new modules**, **702 tests** (+115%), and **93% feature coverage** across 3 tiers.
+v3.1 introduces **Loop Engineering** — 7 production loop patterns with struggle-aware automation, plus **40 modules** and **767 tests** for 95% feature coverage.
+
+### 🔄 Loop Engineering (v3.1)
+
+- **StruggleDetector** — Monitors for repeated failures (3+), frustration keywords, and approach changes to trigger diagnostics exactly when needed
+- **7 Loop Patterns** — Daily Triage, PR Babysitter, CI Sweeper, Dep Sweeper, Changelog Draft, Post-Merge Cleanup, Issue Triage
+- **SessionStart Diagnostic** — One-shot ~12K token run at conversation start to check changes, deps, and drift
+- **Circuit Breaker** — Auto-stops loop patterns after 5 consecutive failures to prevent runaway token spend
+- **Human Gate** — L1 (report-only) → L2 (assisted fixes) → L3 (autonomous) maturity model
+- **Worktree Manager** — Git worktree isolation for safe parallel execution
+- **Cost Budgeter** — 500K tokens/day cap with per-pattern estimates
+- **Loop State** — Persistent JSON state + run ledger at `~/.graphsift/loops/`
+- **11 new CLI commands** — `loop init`, `run`, `status`, `report`, `session-start`, `diagnose`, `struggle`, `schedule`, `cost`, `audit`, `reset-breaker`
+- **Zero background waste** — No timers, no cron, no continuous polling
+
+### 📊 v3.0 Changelog (previous release)
+
+v3.0 shipped **11 entirely new modules**, **702 tests** (+115%), and **93% feature coverage** across 3 tiers.
 
 | Module | What It Does |
 |--------|-------------|

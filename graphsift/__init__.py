@@ -212,6 +212,21 @@ from .auto_verify import AutoVerifier, AutoVerifyResult, VerificationIteration, 
 from .conventions import ConventionLearner, Convention, ConventionProfile
 from .explorer import ContextEnricher, EnrichmentResult, Discovery, DiscoveryType
 from .evolve import EvolutionOptimizer, EvolutionResult, ParameterSpace
+from .loop_engineering import (
+    LoopEngine,
+    LoopState,
+    HumanGate,
+    CircuitBreaker,
+    LoopCostBudgeter,
+    LoopRunResult,
+    LoopRunRecord,
+    LoopPatternConfig,
+    MaturityLevel,
+    PatternType,
+    TaskStatus,
+    PATTERN_REGISTRY,
+    StruggleDetector,
+)
 
 __all__ = [
     # Core
@@ -407,6 +422,20 @@ __all__ = [
     "EvolutionOptimizer",
     "EvolutionResult",
     "ParameterSpace",
+    # Loop Engineering
+    "LoopEngine",
+    "LoopState",
+    "HumanGate",
+    "CircuitBreaker",
+    "LoopCostBudgeter",
+    "LoopRunResult",
+    "LoopRunRecord",
+    "LoopPatternConfig",
+    "MaturityLevel",
+    "PatternType",
+    "TaskStatus",
+    "PATTERN_REGISTRY",
+    "StruggleDetector",
     "CompressionLevel",
     "ultra_compress",
     "EnforceMode",
