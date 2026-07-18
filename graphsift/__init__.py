@@ -285,6 +285,11 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "PriorityScorer": (".prioritize", "PriorityScorer"),
     "PrioritizedResult": (".prioritize", "PrioritizedResult"),
     "ScoredFinding": (".prioritize", "ScoredFinding"),
+    # Test-Impact Analysis
+    "TestImpactAnalyzer": (".test_impact", "TestImpactAnalyzer"),
+    "ImpactResult": (".test_impact", "ImpactResult"),
+    "run_full_test": (".test_impact", "run_full_test"),
+    "run_selective_test": (".test_impact", "run_selective_test"),
     # Security
     "CommandSanitizer": (".security", "CommandSanitizer"),
     "DataScrubber": (".security", "DataScrubber"),

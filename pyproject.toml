@@ -197,6 +197,7 @@ dev = [
     "hypothesis>=6.0",
     "pytest-benchmark>=5.0",
     "pytest-timeout>=2.0",
+    "pytest-xdist>=3.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "tokenpruner>=1.0.0",
@@ -238,6 +239,9 @@ version = { attr = "graphsift._version.__version__" }
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+timeout = 120
+timeout_method = "thread"
+addopts = "-n auto --dist loadscope -p no:cacheprovider"
 
 [tool.coverage.run]
 source = ["graphsift"]
