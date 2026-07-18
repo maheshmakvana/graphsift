@@ -20,6 +20,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 
@@ -429,14 +431,14 @@ class WikiGenerator:
             content = _render_wiki_page(comm, members, high_risk, key_symbols)
 
             if page_path.exists() and not force:
-                existing = page_path.read_text(encoding="utf-8")
+                existing = SafeFileIO.read(page_path)
                 if existing == content:
                     unchanged += 1
                     continue
-                page_path.write_text(content, encoding="utf-8")
+                SafeFileIO.write(page_path, content)
                 updated += 1
             else:
-                page_path.write_text(content, encoding="utf-8")
+                SafeFileIO.write(page_path, content)
                 generated += 1
 
         return {"pages_generated": generated, "pages_updated": updated, "pages_unchanged": unchanged}
@@ -455,7 +457,7 @@ class WikiGenerator:
         name_lower = community_name.lower()
         for page in self.output_dir.glob("*.md"):
             if name_lower in page.stem.lower():
-                return page.read_text(encoding="utf-8")
+                return SafeFileIO.read(page)
         return None
 
 
@@ -583,10 +585,10 @@ class RefactorEngine:
                 errors.append(f"File not found: {fp}")
                 continue
             try:
-                content = fp.read_text(encoding="utf-8")
+                content = SafeFileIO.read(fp)
                 new_content = content.replace(edit["old"], edit["new"])
                 if new_content != content:
-                    fp.write_text(new_content, encoding="utf-8")
+                    SafeFileIO.write(fp, new_content)
                     applied += 1
             except OSError as exc:
                 errors.append(f"Error writing {fp}: {exc}")

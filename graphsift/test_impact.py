@@ -23,8 +23,8 @@ import json
 import logging
 import os
 import sqlite3
-import subprocess
 import threading
+from graphsift.executor import ProcessRunner
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -332,6 +332,7 @@ class TestImpactAnalyzer:
     ):
         self.project_root = Path(project_root or ".").resolve()
         self._graph = graph
+        self._runner = ProcessRunner(cwd=str(self.project_root), timeout=300)
 
         # Determine DB path
         if store and hasattr(store, '_db_path'):
@@ -368,18 +369,15 @@ class TestImpactAnalyzer:
         t0 = time.monotonic()
 
         try:
-            import subprocess
-
-            result = subprocess.run(
-                f"pytest {pytest_args} --tb=short -q --no-header 2>&1",
-                capture_output=True, text=True, timeout=timeout,
-                cwd=str(self.project_root), shell=True,
+            result = self._runner.run(
+                f"pytest {pytest_args} --tb=short -q --no-header",
+                timeout=timeout, check=False,
             )
             duration = (time.monotonic() - t0) * 1000
 
             # Parse test counts from output
             tests_run, passed, failed = self._parse_test_counts(result.stdout + result.stderr)
-            passed_flag = result.returncode == 0
+            passed_flag = result.ok()
 
             # Get current commit hash
             commit = self._get_git_hash()
@@ -416,7 +414,7 @@ class TestImpactAnalyzer:
                 message=msg,
             )
 
-        except subprocess.TimeoutExpired:
+        except RuntimeError:
             return ImpactResult(
                 mode="full", status="failed",
                 message=f"Full test timed out after {timeout}s",
@@ -523,17 +521,16 @@ class TestImpactAnalyzer:
             cpu_count = _os.cpu_count() or 4
             workers = max(1, cpu_count - 1)
 
-            result = subprocess.run(
+            result = self._runner.run(
                 f"pytest {test_files_str} -n={workers} "
                 f"--dist=loadscope --timeout=120 --timeout-method=thread "
-                f"{pytest_args} --no-header 2>&1",
-                capture_output=True, text=True, timeout=timeout,
-                cwd=str(self.project_root), shell=True,
+                f"{pytest_args} --no-header",
+                timeout=timeout, check=False,
             )
 
             duration = (time.monotonic() - t0) * 1000
             tests_run, passed, failed = self._parse_test_counts(result.stdout + result.stderr)
-            passed_flag = result.returncode == 0
+            passed_flag = result.ok()
 
             # -- Step 6: Store snapshot ---------------------------------
             commit = self._get_git_hash()
@@ -572,7 +569,7 @@ class TestImpactAnalyzer:
                 ),
             )
 
-        except subprocess.TimeoutExpired:
+        except RuntimeError:
             return ImpactResult(
                 mode="selective", status="failed",
                 changed_files=changed_files,
@@ -717,31 +714,28 @@ class TestImpactAnalyzer:
     def _git_changed_files(self, since_commit: str) -> list[str]:
         """Return list of files changed since *since_commit*."""
         try:
-            result = subprocess.run(
+            result = self._runner.run_simple(
                 ["git", "diff", "--name-only", since_commit, "HEAD"],
-                capture_output=True, text=True, timeout=30,
-                cwd=str(self.project_root),
+                timeout=30,
             )
-            if result.returncode != 0:
+            if not result.ok():
                 # Try with just HEAD~1
-                result = subprocess.run(
+                result = self._runner.run_simple(
                     ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
-                    capture_output=True, text=True, timeout=30,
-                    cwd=str(self.project_root),
+                    timeout=30,
                 )
             files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
             return files
-        except (subprocess.TimeoutExpired, Exception) as exc:
+        except Exception as exc:
             logger.debug("git diff failed: %s", exc)
             return []
 
     def _get_git_hash(self) -> str:
         """Return current git commit hash."""
         try:
-            result = subprocess.run(
+            result = self._runner.run_simple(
                 ["git", "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=10,
-                cwd=str(self.project_root),
+                timeout=10,
             )
             return result.stdout.strip() or "unknown"
         except Exception:
@@ -781,10 +775,9 @@ class TestImpactAnalyzer:
     def _estimate_total_tests(self) -> int:
         """Estimate total tests in the project (for savings calculation)."""
         try:
-            result = subprocess.run(
-                ["pytest", "--collect-only", "-q", "--no-header", "2>&1"],
-                capture_output=True, text=True, timeout=30,
-                cwd=str(self.project_root), shell=True,
+            result = self._runner.run_simple(
+                ["pytest", "--collect-only", "-q", "--no-header"],
+                timeout=30,
             )
             # Last line should have the count
             lines = [l for l in result.stdout.splitlines() if l.strip()]

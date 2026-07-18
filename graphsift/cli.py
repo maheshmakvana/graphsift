@@ -11,6 +11,8 @@ import sys
 
 from pathlib import Path
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +52,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     mcp_config: dict = {}
     if mcp_path.exists():
         try:
-            mcp_config = json.loads(mcp_path.read_text(encoding="utf-8"))
+            mcp_config = SafeFileIO.read_json(mcp_path)
         except Exception:
             mcp_config = {}
 
@@ -61,7 +63,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         "args": ["-m", "graphsift.mcp_server"],
         "env": {},
     }
-    mcp_path.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
+    SafeFileIO.write_json(mcp_path, mcp_config)
     print(f"[graphsift] Wrote {mcp_path}")
 
     # 2. Inject hooks into .claude/settings.json
@@ -70,7 +72,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         settings: dict = {}
         if settings_path.exists():
             try:
-                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                settings = SafeFileIO.read_json(settings_path)
             except Exception:
                 settings = {}
 
@@ -111,7 +113,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                     "type": "command",
                     "command": (
                         f"{_python_executable()} -m graphsift.cli update "
-                        f"--project-root \"{project_root}\" 2>/dev/null || true"
+                        f"--project-root \"{project_root}\" 2>{os.devnull} || true"
                     ),
                 }
             ],
@@ -150,7 +152,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         if not any("graphsift.compress" in h.get("command", "") for entry in settings["hooks"]["PostToolUse"] for h in entry.get("hooks", [])):
             settings["hooks"]["PostToolUse"].append(bash_post_hook)
 
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        SafeFileIO.write_json(settings_path, settings)
         print(f"[graphsift] Wrote hooks -> {settings_path}")
 
     # 3. Write skill files
@@ -164,7 +166,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         wrapper_script = get_bash_wrapper_script(python_path=_python_executable())
 
         # Check if already installed
-        existing = bashrc_path.read_text(encoding="utf-8") if bashrc_path.exists() else ""
+        existing = SafeFileIO.read(bashrc_path) if bashrc_path.exists() else ""
         if "# graphsift: transparent output compression" not in existing:
             with open(bashrc_path, "a", encoding="utf-8") as f:
                 f.write(f"\n# graphsift: transparent output compression\n")
@@ -388,7 +390,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     }
     manifest_path = root / ".graphsift" / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    SafeFileIO.write_json(manifest_path, manifest)
 
     total_ms = (time.monotonic() - _t0) * 1000
 
@@ -435,7 +437,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             return 0
 
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = SafeFileIO.read_json(manifest_path)
         except Exception:
             return 0
 
@@ -462,7 +464,7 @@ def cmd_update(args: argparse.Namespace) -> int:
                 pass
 
         manifest["files_updated"] = changed
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        SafeFileIO.write_json(manifest_path, manifest)
     except Exception:
         pass
     return 0
@@ -483,7 +485,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     if manifest_path.exists():
         try:
-            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            m = SafeFileIO.read_json(manifest_path)
             print(f"  Graph     : built ({m.get('files_indexed', '?')} files, "
                   f"{m.get('symbols_extracted', '?')} symbols, "
                   f"{m.get('edges_created', '?')} edges)")
@@ -528,9 +530,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     mcp_path = _find_mcp_json(project_root)
     if mcp_path.exists():
         try:
-            cfg = json.loads(mcp_path.read_text(encoding="utf-8"))
+            cfg = SafeFileIO.read_json(mcp_path)
             cfg.get("mcpServers", {}).pop("graphsift", None)
-            mcp_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            SafeFileIO.write_json(mcp_path, cfg)
             print(f"[graphsift] Removed MCP entry from {mcp_path}")
         except Exception as exc:
             print(f"[graphsift] Warning: could not update {mcp_path}: {exc}")
@@ -618,13 +620,13 @@ def _write_skills(project_root: Path) -> None:
 def _write_skill(path: Path, title: str, description: str, steps: list[str], example: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     steps_md = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(steps))
-    path.write_text(
+    content = (
         f"# {title}\n\n"
         f"{description}\n\n"
         f"## Steps\n\n{steps_md}\n\n"
-        f"## Example trigger\n\n> {example}\n",
-        encoding="utf-8",
+        f"## Example trigger\n\n> {example}\n"
     )
+    SafeFileIO.write(path, content)
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +639,7 @@ _REGISTRY_PATH = Path.home() / ".graphsift" / "registry.json"
 def _load_registry() -> dict[str, dict]:
     if _REGISTRY_PATH.exists():
         try:
-            return json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
+            return SafeFileIO.read_json(_REGISTRY_PATH)
         except Exception:
             pass
     return {}
@@ -645,7 +647,7 @@ def _load_registry() -> dict[str, dict]:
 
 def _save_registry(registry: dict[str, dict]) -> None:
     _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _REGISTRY_PATH.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+    SafeFileIO.write_json(_REGISTRY_PATH, registry)
 
 
 # ---------------------------------------------------------------------------
@@ -966,7 +968,7 @@ def cmd_visualize(args: argparse.Namespace) -> int:
     ][:1000]
 
     html = _render_graph_html(nodes_js, links_js, str(root))
-    output_path.write_text(html, encoding="utf-8")
+    SafeFileIO.write(output_path, html)
 
     print(f"[graphsift] Graph visualization -> {output_path}")
     if args.serve:
@@ -1653,7 +1655,7 @@ def _detect_build_tools(root: Path) -> dict[str, str]:
     if pkg_json.exists():
         try:
             import json  # noqa: PLC0415
-            pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+            pkg = SafeFileIO.read_json(pkg_json)
             scripts = pkg.get("scripts", {})
             if "test" in scripts:
                 tools["test"] = f"npm test  ({scripts['test']})"
@@ -1680,7 +1682,7 @@ def _detect_build_tools(root: Path) -> dict[str, str]:
     makefile = root / "Makefile"
     if makefile.exists():
         try:
-            content = makefile.read_text(encoding="utf-8")
+            content = SafeFileIO.read(makefile)
             if ".PHONY" in content or ":" in content:
                 tools["has_makefile"] = "make"
                 for target in ("test", "build", "lint", "fmt", "install"):
@@ -1830,7 +1832,7 @@ def cmd_claude_md(args: argparse.Namespace) -> int:
     content = "\n".join(lines)
 
     claude_md_path.parent.mkdir(parents=True, exist_ok=True)
-    claude_md_path.write_text(content, encoding="utf-8")
+    SafeFileIO.write(claude_md_path, content)
 
     print()
     print(f"  Written: {claude_md_path}")
@@ -2458,7 +2460,7 @@ def main() -> None:
                 if "venv" in str(py_file) or ".venv" in str(py_file) or "__pycache__" in str(py_file):
                     continue
                 try:
-                    source_map[str(py_file.relative_to(src_dir))] = py_file.read_text(encoding="utf-8")
+                    source_map[str(py_file.relative_to(src_dir))] = SafeFileIO.read(py_file)
                 except Exception:
                     continue
 

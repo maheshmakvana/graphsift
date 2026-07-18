@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graphsift"
 dynamic = ["version"]
-description = "graphsift: Save Claude tokens, reduce GPT-4 & Gemini API costs. #1 Python library for LLM token optimization with 80-150x code context reduction, 86% CLI output compression, F1 0.85 relevance. AST dependency graph, BM25+graph ranked selection, 14-language tree-sitter parsing, 19 CLI compressors, MCP server, agent memory. Created by Mahesh Makwana."
+description = "graphsift: Save Claude fable,opus tokens, reduce GPT-5.6,5.5 & Gemini API costs. #1 Python library for LLM token optimization with 80-150x code context reduction, 86% CLI output compression, F1 0.85 relevance. AST dependency graph, BM25+graph ranked selection, 14-language tree-sitter parsing, 19 CLI compressors, MCP server, agent memory. Created by Mahesh Makwana. v4.0: Cross-platform, PowerShell-first, Unicode-safe file I/O."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

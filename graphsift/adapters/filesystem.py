@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_EXTENSIONS = {
@@ -68,7 +70,7 @@ def load_source_map(
             logger.debug("graphsift: skipping large file %s", path)
             continue
         try:
-            source_map[str(path)] = path.read_text(encoding=encoding, errors="replace")
+            source_map[str(path)] = SafeFileIO.read(path, encoding=encoding)
         except OSError as exc:
             logger.warning(
                 "graphsift: could not read file",
@@ -129,7 +131,7 @@ def load_changed_files(
     result: dict[str, str] = {}
     for p in changed_paths:
         try:
-            result[p] = Path(p).read_text(encoding=encoding, errors="replace")
+            result[p] = SafeFileIO.read(Path(p), encoding=encoding)
         except OSError as exc:
             logger.warning(
                 "graphsift: could not read changed file",

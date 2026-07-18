@@ -11,6 +11,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1118,7 +1120,7 @@ def _tool_list_repos(params: dict) -> dict:
         return {"status": "ok", "summary": "0 registered repository(ies)", "repos": []}
 
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry = json.loads(SafeFileIO.read(registry_path))
     except Exception:
         registry = {}
 
@@ -1533,7 +1535,7 @@ def _tool_cross_repo_search(params: dict) -> dict:
         return {"error": "No repos registered. Run: graphsift register <path>", "results": []}
 
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry = json.loads(SafeFileIO.read(registry_path))
     except Exception:
         return {"error": "Could not read registry.", "results": []}
 

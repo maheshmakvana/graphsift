@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from graphsift.read_cache import SafeFileIO
+
 # ---------------------------------------------------------------------------
 # Compression level
 # ---------------------------------------------------------------------------
@@ -846,7 +848,7 @@ def tee_save(text: str, label: str = "output") -> Path | None:
         return None
     tee_path = Path(_TEE_DIR) / f"{label}.txt"
     tee_path.parent.mkdir(parents=True, exist_ok=True)
-    tee_path.write_text(text, encoding="utf-8")
+    SafeFileIO.write(tee_path, text)
     return tee_path
 
 

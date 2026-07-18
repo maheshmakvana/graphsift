@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from graphsift.read_cache import SafeFileIO
+
 
 @dataclass
 class TieredMemory:
@@ -60,7 +62,7 @@ class TieredMemory:
         """Load a topic file's content from disk."""
         path = self.topic_files.get(topic)
         if path and Path(path).exists():
-            return Path(path).read_text(encoding="utf-8")
+            return SafeFileIO.read(path)
         return None
 
     def estimate_tokens(self, tier: str) -> int:
@@ -77,5 +79,5 @@ class TieredMemory:
             return []
         rules: list[str] = []
         for f in sorted(rules_path.glob("*.md")):
-            rules.append(f.read_text(encoding="utf-8").strip())
+            rules.append(SafeFileIO.read(f).strip())
         return rules

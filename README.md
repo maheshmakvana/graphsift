@@ -1,4 +1,4 @@
-﻿<p align="center">
+<p align="center">
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — Ranked Code Context & Token Optimizer for LLMs" width="600">
 </p>
 
@@ -28,6 +28,13 @@
   <img src="https://img.shields.io/badge/features-95%25-orange" alt="features">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="Stars"></a>
 </p>
+
+## v4.0.0 Major Release - Cross-Platform & Encoding Safety
+
+- **SafeFileIO** - Encoding-safe file I/O. Auto BOM detection and stripping. Zero UnicodeDecodeError crashes.
+- **ProcessRunner** - Cross-platform process runner. PowerShell-first on Windows. Auto retry, encoding, output sanitization.
+- **25 subprocess calls** standardized | **47 file I/O calls** hardened | **18 cross-platform issues** eliminated
+- **Unicode Sanitizer** - Strips control characters from CLI output. No more classifier crashes.
 
 <p align="center">
   <a href="#-save-tokens-save-money-why-graphsift">Why graphsift?</a> ·

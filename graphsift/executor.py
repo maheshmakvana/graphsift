@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -503,6 +504,319 @@ class CommandExecutor:
         return "\n".join(lines[:max_lines]) + (
             f"\n... (truncated {len(lines) - max_lines} lines)"
         )
+
+
+# ---------------------------------------------------------------------------
+# ProcessRunner — lightweight subprocess runner with encoding safety
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PlatformMap:
+    """Unix-to-Windows command translation map.
+
+    Translates common Unix commands to their Windows equivalents
+    when running on Windows. Used by ``ProcessRunner.translate_command``.
+    """
+    _map: dict[str, str] = field(default_factory=lambda: {
+        "which": "where",
+        "grep": "findstr",
+        "sed": "cmd /c findstr",
+        "cat": "type",
+        "rm": "del",
+        "mv": "move",
+        "cp": "copy",
+        "/dev/null": "NUL",
+        "/tmp": "%TEMP%",
+    })
+
+    def translate(self, cmd_str: str) -> str:
+        """Translate Unix commands to Windows equivalents.
+
+        Args:
+            cmd_str: Command string to translate.
+
+        Returns:
+            Translated command string.
+        """
+        if not _IS_WINDOWS:
+            return cmd_str
+        result = cmd_str
+        for unix, win in self._map.items():
+            result = result.replace(unix, win)
+        return result
+
+
+def _sanitize_output(text: str, max_lines: int = 500) -> str:
+    """Remove control characters and problematic unicode from command output.
+
+    Strips ASCII control chars (except newline/tab), replaces non-printable
+    unicode with safe alternatives, and truncates to *max_lines*.
+
+    Args:
+        text: Raw command output.
+        max_lines: Maximum lines to keep.
+
+    Returns:
+            Sanitized output safe for LLM consumption.
+    """
+    import re  # noqa: PLC0415
+
+    # Remove control characters except \\n, \\r, \\t
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # Remove Unicode control chars (category Cc, Cf) except common ones
+    try:
+        cleaned = "".join(
+            ch for ch in cleaned
+            if unicodedata.category(ch)[0] not in ("C",) or ch in ("\n", "\r", "\t")
+        )
+    except ValueError:
+        # Some characters may not have unicode categories
+        pass
+    # Truncate
+    lines = cleaned.splitlines()
+    if len(lines) > max_lines:
+        cleaned = "\n".join(lines[:max_lines])
+    return cleaned
+
+
+class ProcessRunner:
+    """Cross-platform process runner with encoding safety, retry, and sanitization.
+
+    Features:
+      - **PowerShell-first** on Windows (pwsh > powershell > cmd > bash)
+      - **Never uses shell=True** — always passes ``[exe, flag, cmd]``
+      - **Auto encoding**: ``encoding="utf-8", errors="replace"`` on every call
+      - **Built-in retry**: 3 attempts with exponential backoff
+      - **Command translation**: Unix commands auto-mapped to Windows equivalents
+      - **Output sanitization**: strips control chars and problematic unicode
+
+    Usage::
+
+        from graphsift.executor import ProcessRunner
+
+        runner = ProcessRunner()
+        result = runner.run(["pytest", "-xvs", "tests/"])
+        print(result.stdout)
+
+    Or with a command string::
+
+        runner = ProcessRunner(cwd="/repo")
+        result = runner.run("git status")
+    """
+
+    def __init__(
+        self,
+        cwd: str = "",
+        timeout: int = 300,
+        max_retries: int = 3,
+    ) -> None:
+        """Initialize ProcessRunner.
+
+        Args:
+            cwd: Working directory for commands (default: current).
+            timeout: Max execution time per command in seconds.
+            max_retries: Max retry attempts on transient failures.
+        """
+        self._cwd = cwd or os.getcwd()
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._shell = _detect_shell()
+        self._platform_map = _PlatformMap()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        command: str | list[str],
+        *,
+        capture_output: bool = True,
+        check: bool = True,
+        timeout: int | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        """Execute a command with encoding safety, retry, and sanitization.
+
+        Args:
+            command: Command string (e.g. ``"pytest tests/"``) or list of args.
+            capture_output: If True, capture stdout/stderr.
+            check: If True, raise on non-zero exit.
+            timeout: Override default timeout for this call.
+            cwd: Override working directory for this call.
+            env: Environment variables for the subprocess.
+
+        Returns:
+            ``CommandResult`` with stdout, stderr, exit_code.
+
+        Raises:
+            RuntimeError: If check=True and all retries fail.
+        """
+        cmd_str = self._build_command(command)
+        cmd_str = self._platform_map.translate(cmd_str)
+        resolved_cwd = cwd or self._cwd
+        resolved_timeout = timeout or self._timeout
+
+        # Determine shell and flag
+        shell_cmd, shell_flag = self._resolve_shell()
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                proc = subprocess.run(
+                    [shell_cmd, shell_flag, cmd_str],
+                    capture_output=capture_output,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=resolved_cwd,
+                    timeout=resolved_timeout,
+                    env=env,
+                )
+
+                stdout = _sanitize_output(proc.stdout or "")
+                stderr = _sanitize_output(proc.stderr or "")
+
+                if proc.returncode == 0:
+                    return CommandResult(
+                        stdout=stdout, stderr=stderr,
+                        exit_code=0, command=cmd_str[:200],
+                    )
+
+                # Non-zero exit — retry transient failures
+                if proc.returncode in (127, -1) and attempt < self._max_retries:
+                    logger.warning(
+                        "Command returned %d (attempt %d/%d): %s",
+                        proc.returncode, attempt, self._max_retries,
+                        cmd_str[:100],
+                    )
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+
+                result = CommandResult(
+                    stdout=stdout, stderr=stderr,
+                    exit_code=proc.returncode, command=cmd_str[:200],
+                )
+                if check:
+                    raise RuntimeError(
+                        f"Command failed (exit {proc.returncode}): "
+                        f"{cmd_str[:100]}\\nstderr: {stderr[:500]}"
+                    )
+                return result
+
+            except subprocess.TimeoutExpired:
+                last_exc = RuntimeError(
+                    f"Command timed out after {resolved_timeout}s: {cmd_str[:100]}"
+                )
+                if attempt < self._max_retries:
+                    self._shell = self._fallback_shell_str()
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                break
+
+            except OSError as exc:
+                last_exc = RuntimeError(f"Command failed to start: {exc}")
+                if attempt < self._max_retries:
+                    self._shell = self._fallback_shell_str()
+                    time.sleep(self._retry_delay(attempt))
+                    continue
+                break
+
+        raise last_exc or RuntimeError(
+            f"Command failed after {self._max_retries} attempts: {cmd_str[:100]}"
+        )
+
+    def run_simple(
+        self,
+        cmd: list[str],
+        *,
+        capture_output: bool = True,
+        timeout: int | None = None,
+    ) -> CommandResult:
+        """Run a command as an arg list (no shell wrapper).
+
+        Use this for simple commands where shell parsing is unnecessary.
+        More secure and slightly faster than ``run()``.
+
+        Args:
+            cmd: Command as list of args, e.g. ``["git", "status"]``.
+            capture_output: If True, capture stdout/stderr.
+            timeout: Override default timeout.
+
+        Returns:
+            ``CommandResult``.
+        """
+        resolved_timeout = timeout or self._timeout
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=capture_output,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=self._cwd,
+                timeout=resolved_timeout,
+            )
+            return CommandResult(
+                stdout=_sanitize_output(proc.stdout or ""),
+                stderr=_sanitize_output(proc.stderr or ""),
+                exit_code=proc.returncode,
+                command=" ".join(cmd)[:200],
+            )
+        except subprocess.TimeoutExpired:
+            return CommandResult(
+                stdout="", stderr=f"Timeout after {resolved_timeout}s",
+                exit_code=-1, command=" ".join(cmd)[:200],
+            )
+        except OSError as exc:
+            return CommandResult(
+                stdout="", stderr=str(exc),
+                exit_code=-1, command=" ".join(cmd)[:200],
+            )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_command(self, command: str | list[str]) -> str:
+        """Convert list of args to a shell command string."""
+        if isinstance(command, list):
+            return " ".join(command)
+        return command
+
+    def _resolve_shell(self) -> tuple[str, str]:
+        """Return (shell, flag) for the detected shell.
+
+        Windows priority: pwsh > powershell > cmd
+        Unix priority: bash > sh
+        """
+        if _IS_WINDOWS:
+            shell_lower = self._shell.lower()
+            if "pwsh" in shell_lower or "powershell" in shell_lower:
+                return self._shell, "-Command"
+            return self._shell, "/c"  # cmd.exe
+        return self._shell, "-c"
+
+    def _fallback_shell_str(self) -> str:
+        """Cycle to next available shell on failure."""
+        if _IS_WINDOWS:
+            current = self._shell.lower()
+            if "pwsh" in current or "powershell" in current:
+                return "cmd.exe"
+            elif "cmd" in current:
+                return "powershell.exe"
+            return "cmd.exe"
+        else:
+            if "bash" in self._shell:
+                return "/bin/sh"
+            return "/bin/bash"
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        """Exponential backoff: 1s, 2s, 4s, ..."""
+        return min(1.0 * (2 ** (attempt - 1)), 10.0)
 
 
 # ---------------------------------------------------------------------------
