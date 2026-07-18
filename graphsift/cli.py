@@ -1931,9 +1931,28 @@ def cmd_loop_reset_breaker(args: argparse.Namespace) -> int:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+class _LazyPatternChoices:
+    """Defer PatternType import (and thus loop_engineering module) until arg validation."""
+    _values: list[str] | None = None
+
+    def _load(self) -> list[str]:
+        if self._values is None:
+            from .loop_engineering import PatternType  # noqa: PLC0415
+            _LazyPatternChoices._values = [p.value for p in PatternType]
+        return self._values
+
+    def __iter__(self):
+        return iter(self._load())
+
+    def __contains__(self, item):
+        return item in self._load()
+
+    def __len__(self):
+        return len(self._load())
+
+
 def _build_parser() -> argparse.ArgumentParser:
     from ._version import __version__  # noqa: PLC0415
-    from .loop_engineering import PatternType
 
     parser = argparse.ArgumentParser(
         prog="graphsift",
@@ -2164,6 +2183,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # -----------------------------------------------------------------------
     # loop command  (loop-engineering)
     # -----------------------------------------------------------------------
+    _lazy_pt = _LazyPatternChoices()
     loop_parser = sub.add_parser("loop", help="Loop-engineering: scheduled automation patterns")
     loop_sub = loop_parser.add_subparsers(dest="loop_action", required=True)
 
@@ -2173,7 +2193,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # loop run
     p_loop_run = loop_sub.add_parser("run", help="Run a specific loop pattern")
-    p_loop_run.add_argument("pattern", choices=[p.value for p in PatternType], help="Pattern to run")
+    p_loop_run.add_argument("pattern", choices=_lazy_pt, help="Pattern to run")
     p_loop_run.add_argument("--project-root", default=_cwd())
 
     # loop status
@@ -2190,7 +2210,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # loop cost
     p_loop_cost = loop_sub.add_parser("cost", help="Estimate token cost per pattern")
-    p_loop_cost.add_argument("--pattern", choices=[p.value for p in PatternType], required=True, help="Pattern type")
+    p_loop_cost.add_argument("--pattern", choices=_lazy_pt, required=True, help="Pattern type")
     p_loop_cost.add_argument("--maturity", choices=["L1", "L2", "L3"], default="L1", help="Maturity level")
     p_loop_cost.add_argument("--project-root", default=_cwd())
 
