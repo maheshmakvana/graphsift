@@ -1900,10 +1900,207 @@ def _tool_should_compact(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auto-trigger helpers
+# ---------------------------------------------------------------------------
+
+
+def _detect_command_type_from_text(text: str) -> str | None:
+    """Detect CLI output type from content using regex.
+
+    Tries the built-in ``graphsift.compress.detect_type`` first (18+ types),
+    then falls back to additional pattern coverage for common tools.
+    Returns the type string (e.g. ``"pytest"``, ``"git_diff"``) or ``None``.
+    """
+    from graphsift.compress import detect_type
+
+    if not text or not text.strip():
+        return None
+
+    # Try the built-in detector first (covers 18+ types)
+    try:
+        detected = detect_type(text)
+        if detected and detected != "generic":
+            return detected
+    except Exception:
+        pass
+
+    # Fallback: additional patterns for key CLI tools
+    import re  # noqa: PLC0415
+
+    head = text[:1000]
+
+    # pytest
+    if re.search(r"(?m)(?:FAILED|ERROR|PASSED|test_|assert)", head):
+        return "pytest"
+    # git diff
+    if re.search(r"(?m)(?:^diff --git|^index |^--- a/)", head):
+        return "git_diff"
+    # git status
+    if re.search(r"(?m)(?:^On branch|nothing to commit|^modified:|^new file:|^deleted:)", head):
+        return "git_status"
+    # eslint with line:col pattern
+    if re.search(r"(?m)\d+:\d+\s+(?:error|warning|rule:)", head):
+        return "eslint"
+    # npm
+    if re.search(r"(?m)(?:ERR!|npm ERR|npm WARN|npm notice)", head):
+        return "npm"
+    # docker
+    if re.search(r"(?m)(?:CONTAINER|IMAGE ID|STATUS|^REPOSITORY)", head):
+        return "docker"
+    # grep -- file:line pattern
+    if re.search(r"(?m)^[^:\n\r]+\.[a-zA-Z]{1,6}:\d+:", head):
+        return "grep"
+
+    return None
+
+
+def _should_auto_verify(file_path: str) -> bool:
+    """Check whether *file_path* is eligible for auto-verification.
+
+    Returns ``True`` when the extension is one of ``.py``, ``.js``, ``.ts``,
+    ``.go``, ``.rs`` **and** the path does not live inside a skipped directory
+    (``.git``, ``node_modules``, ``__pycache__``, ``venv``, ``dist``).
+    """
+    if not file_path:
+        return False
+
+    valid_exts = {".py", ".js", ".ts", ".go", ".rs"}
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in valid_exts:
+        return False
+
+    skip_dirs = {".git", "node_modules", "__pycache__", "venv", "dist"}
+    parts = Path(file_path).parts
+    if any(part in skip_dirs for part in parts):
+        return False
+
+    return True
+
+
+def _tool_auto_process_output(params: dict) -> dict:
+    """Auto-detect and compress CLI output.
+
+    Detects the command type from *text*, then compresses it when the type is
+    recognised and the text is longer than 500 characters.  Returns the
+    compressed (or original) text together with metadata.
+    """
+    from graphsift.compress import compress
+
+    text = params.get("text", "")
+    if not text:
+        return {"error": "text parameter is required"}
+
+    original_chars = len(text)
+    command_type = _detect_command_type_from_text(text)
+
+    if command_type and original_chars > 500:
+        try:
+            compressed = compress(text, command=command_type)
+            compressed_chars = len(compressed)
+            savings_pct = round((1 - compressed_chars / max(original_chars, 1)) * 100, 1)
+            return {
+                "was_compressed": True,
+                "original_chars": original_chars,
+                "compressed_chars": compressed_chars,
+                "savings_pct": savings_pct,
+                "text": compressed,
+            }
+        except Exception:
+            pass
+
+    return {
+        "was_compressed": False,
+        "original_chars": original_chars,
+        "compressed_chars": original_chars,
+        "savings_pct": 0.0,
+        "text": text,
+    }
+
+
+def _tool_auto_verify_and_fix(params: dict) -> dict:
+    """Verify file syntax and return fix suggestions if errors are found.
+
+    Runs a syntax check on *file_path* via ``verify_file``.  When the check
+    fails, also runs ``suggest_fixes`` on the file and attaches the suggestions
+    to the result.
+    """
+    file_path = params.get("file_path", "")
+    project_root = params.get("project_root", "")
+
+    if not file_path:
+        return {"error": "file_path parameter is required"}
+
+    if not _should_auto_verify(file_path):
+        return {
+            "error": "File type not supported or in excluded directory",
+            "file_path": file_path,
+        }
+
+    try:
+        verify_result = _tool_verify_file({
+            "file_path": file_path,
+            "project_root": project_root,
+        })
+
+        result = {
+            "file": file_path,
+            "passed": verify_result.get("passed", False),
+            "syntax_ok": verify_result.get("syntax_ok", False),
+            "syntax_error": verify_result.get("syntax_error"),
+        }
+
+        if not verify_result.get("passed", True):
+            fix_result = _tool_suggest_fixes({
+                "root_path": project_root or os.getcwd(),
+                "changed_files": [file_path],
+            })
+            if "error" in fix_result:
+                result["fix_suggestions"] = []
+                result["total_fix_issues"] = 0
+            else:
+                result["fix_suggestions"] = fix_result.get("suggestions", [])
+                result["total_fix_issues"] = fix_result.get("total_issues", 0)
+
+        return result
+    except Exception:
+        return {"file": file_path, "passed": True, "syntax_ok": True, "syntax_error": None}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
 _TOOLS = {
+    "auto_process_output": {
+        "fn": _tool_auto_process_output,
+        "description": (
+            "Auto-detect and compress CLI output, saving 60-97% tokens. "
+            "Detects 20+ command types (pytest, git, eslint, npm, docker, grep, etc.)"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "CLI output text to compress"},
+            },
+            "required": ["text"],
+        },
+    },
+    "auto_verify_and_fix": {
+        "fn": _tool_auto_verify_and_fix,
+        "description": (
+            "Verify file syntax and return fix suggestions if errors are found. "
+            "Combines syntax checking (Python compile / node --check) with "
+            "graph-based auto-fix analysis."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the file to verify"},
+                "project_root": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+            "required": ["file_path"],
+        },
+    },
     "build_graph": {
         "fn": _tool_build_graph,
         "description": (

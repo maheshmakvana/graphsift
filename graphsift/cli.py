@@ -426,44 +426,45 @@ def _db_path_for_root(root: str) -> str:
 # ---------------------------------------------------------------------------
 
 def cmd_update(args: argparse.Namespace) -> int:
-    root = Path(args.project_root).resolve()
-    manifest_path = root / ".graphsift" / "manifest.json"
-
-    if not manifest_path.exists():
-        # Silent - no graph built yet, nothing to update
-        return 0
-
+    """Incremental graph update — called by PostToolUse hook.  Never raises."""
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
+        root = Path(args.project_root).resolve()
+        manifest_path = root / ".graphsift" / "manifest.json"
 
-    # Find files newer than manifest
-    manifest_mtime = manifest_path.stat().st_mtime
-    changed: list[str] = []
-    for file_path in manifest.get("files", []):
-        p = Path(file_path)
-        if p.exists() and p.stat().st_mtime > manifest_mtime:
-            changed.append(str(p))
+        if not manifest_path.exists():
+            return 0
 
-    if not changed:
-        return 0
-
-    from graphsift.adapters.filesystem import load_changed_files
-    from graphsift.core import ContextBuilder
-    from graphsift.models import ContextConfig
-
-    new_sources = load_changed_files(changed)
-    builder = ContextBuilder(ContextConfig())
-    for path, source in new_sources.items():
         try:
-            builder.index_file(path, source)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            return 0
 
-    # Touch manifest to update mtime
-    manifest["files_updated"] = changed
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        manifest_mtime = manifest_path.stat().st_mtime
+        changed: list[str] = []
+        for file_path in manifest.get("files", []):
+            p = Path(file_path)
+            if p.exists() and p.stat().st_mtime > manifest_mtime:
+                changed.append(str(p))
+
+        if not changed:
+            return 0
+
+        from graphsift.adapters.filesystem import load_changed_files
+        from graphsift.core import ContextBuilder
+        from graphsift.models import ContextConfig
+
+        new_sources = load_changed_files(changed)
+        builder = ContextBuilder(ContextConfig())
+        for path, source in new_sources.items():
+            try:
+                builder.index_file(path, source)
+            except Exception:
+                pass
+
+        manifest["files_updated"] = changed
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     return 0
 
 
@@ -746,15 +747,13 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
 # watch command
 # ---------------------------------------------------------------------------
 
-def cmd_watch(args: argparse.Namespace) -> int:
+
+def _watch_loop(root: Path, manifest_path: Path) -> None:
+    """Scan for file changes and update graph, never raises."""
     import time
     from graphsift.adapters.filesystem import load_changed_files
     from graphsift.core import ContextBuilder
     from graphsift.models import ContextConfig
-
-    root = Path(args.project_root).resolve()
-    manifest_path = root / ".graphsift" / "manifest.json"
-    print(f"[graphsift] Watching {root} for changes (Ctrl+C to stop) ...")
 
     last_mtimes: dict[str, float] = {}
 
@@ -770,9 +769,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         pass
         return mtimes
 
-    last_mtimes = _scan_mtimes()
-
     try:
+        last_mtimes = _scan_mtimes()
         while True:
             time.sleep(2)
             current = _scan_mtimes()
@@ -792,8 +790,88 @@ def cmd_watch(args: argparse.Namespace) -> int:
                             pass
                     print(f"[graphsift] Updated {len(changed)} files.")
                 last_mtimes = current
+    except Exception:
+        pass
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    import threading
+
+    root = Path(args.project_root).resolve()
+    manifest_path = root / ".graphsift" / "manifest.json"
+
+    if getattr(args, 'daemon', False):
+        t = threading.Thread(target=_watch_loop, args=(root, manifest_path), daemon=True)
+        t.start()
+        print(f"[graphsift] Watch daemon started for {root}")
+        return 0
+
+    print(f"[graphsift] Watching {root} for changes (Ctrl+C to stop) ...")
+    try:
+        _watch_loop(root, manifest_path)
     except KeyboardInterrupt:
         print("\n[graphsift] Watch stopped.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# auto-guide functions
+# ---------------------------------------------------------------------------
+
+
+def auto_guide(
+    task: str,
+    changed_files: list[str] | None = None,
+    project_root: str = "",
+) -> dict:
+    """Build focused code context for a given task. Never raises.
+
+    Args:
+        task: Free-text description of what you want to review or understand.
+        changed_files: Optional list of changed file paths to anchor context.
+        project_root: Repo root path (default: cwd).
+
+    Returns:
+        Dict with keys ``context`` (str) and ``files_selected`` (int).
+    """
+    try:
+        from graphsift.adapters.filesystem import load_source_map
+        from graphsift.core import ContextBuilder
+        from graphsift.models import ContextConfig, DiffSpec
+
+        root = project_root or os.getcwd()
+        source_map = load_source_map(root)
+        if not source_map:
+            return {"context": "", "files_selected": 0}
+
+        config = ContextConfig(token_budget=40_000)
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(
+            changed_files=changed_files or list(source_map.keys())[:3],
+            query=task,
+        )
+        result = builder.build(diff, source_map=source_map)
+        return {
+            "context": result.rendered_context,
+            "files_selected": result.files_selected,
+        }
+    except Exception:
+        return {"context": "", "files_selected": 0}
+
+
+def cmd_guide(args: argparse.Namespace) -> int:
+    """Print focused context for a task description."""
+    task = " ".join(getattr(args, 'task', [])) or "Understand the codebase"
+    result = auto_guide(
+        task=task,
+        project_root=getattr(args, 'project_root', os.getcwd()),
+    )
+    if result["files_selected"]:
+        print(f"[graphsift] Selected {result['files_selected']} files for context")
+        print()
+    print(result["context"])
     return 0
 
 
@@ -2069,6 +2147,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # watch
     p_watch = sub.add_parser("watch", help="Watch for file changes and auto-update graph")
     p_watch.add_argument("--project-root", default=_cwd())
+    p_watch.add_argument("--daemon", action="store_true", help="Run in background (no blocking)")
+
+    # guide
+    p_guide = sub.add_parser("guide", help="Pre-compute focused code context for agents")
+    p_guide.add_argument("task", nargs="*", help="Task description")
+    p_guide.add_argument("--project-root", default=_cwd())
 
     # claude-md
     p_claude = sub.add_parser("claude-md", help="Auto-generate CLAUDE.md with project topology")
@@ -2465,6 +2549,7 @@ def main() -> None:
         "read-cache": cmd_read_cache,
         "evidence": cmd_evidence,
         "claude-md": cmd_claude_md,
+        "guide": cmd_guide,
     }
 
     # Support func-based dispatch for new-style subcommands

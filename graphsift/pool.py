@@ -181,14 +181,15 @@ class DatabasePool:
         conn = self.acquire()
         try:
             if params is not None:
-                return conn.execute(sql, params)
-            return conn.execute(sql)
+                cursor = conn.execute(sql, params)
+            else:
+                cursor = conn.execute(sql)
         except sqlite3.Error:
-            # Mark connection as suspect but still release it
             self.release(conn)
             raise
         else:
             self.release(conn)
+            return cursor
 
     def executemany(
         self,
@@ -206,12 +207,13 @@ class DatabasePool:
         """
         conn = self.acquire()
         try:
-            return conn.executemany(sql, params_list)
+            cursor = conn.executemany(sql, params_list)
         except sqlite3.Error:
             self.release(conn)
             raise
         else:
             self.release(conn)
+            return cursor
 
     # ------------------------------------------------------------------
     # Internal helpers
