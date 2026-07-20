@@ -1151,11 +1151,16 @@ class DependencyGraph:
     def _resolve_import(imp: str, path_index: dict[str, str]) -> list[str]:
         """Resolve an import string to file paths."""
         results = []
-        # Exact match
+        # Exact match — covers the vast majority of imports
         if imp in path_index:
             results.append(path_index[imp])
+            return results
         # Prefix match (e.g. "mypackage.module" → "mypackage/module.py")
+        # Only scan keys sharing the first character (~95% fewer comparisons)
+        first = imp[0] if imp else ""
         for key, path in path_index.items():
+            if key[:1] != first:
+                continue
             if key.startswith(imp) or imp.startswith(key):
                 if path not in results:
                     results.append(path)
@@ -2708,6 +2713,14 @@ class ContextBuilder:
                 if cached_sha == new_sha:
                     files_skipped += 1
                     continue
+
+            # Already indexed — skip re-parsing but count symbols
+            if path in self._graph._file_nodes:
+                files_indexed += 1
+                existing_fn = self._graph._file_nodes[path]
+                symbols += len(existing_fn.symbols)
+                lang_counts[existing_fn.language.value] += 1
+                continue
 
             try:
                 fn = self.index_file(path, source)

@@ -28,9 +28,10 @@ _DEFAULT_EXTENSIONS = {
 }
 
 _DEFAULT_EXCLUDES = {
-    "venv", ".venv", "node_modules", "dist", "build",
-    "__pycache__", ".git", ".tox", ".mypy_cache",
-    ".pytest_cache", "*.egg-info",
+    # Non-dot dependency dirs (dot dirs like .next, .git are auto-skipped)
+    "node_modules", "vendor", "Pods", "bower_components", "jspm_packages",
+    "dist", "build", "target", "out", "cdk.out",
+    "__pycache__", "*.egg-info", "coverage", "htmlcov",
 }
 
 
@@ -61,7 +62,10 @@ def load_source_map(
     for path in root_path.rglob("*"):
         if not path.is_file():
             continue
-        # Skip excluded directories
+        # Skip hidden directories (.*) — they are tooling/build output, never source
+        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
+            continue
+        # Skip explicitly excluded directories
         if any(part in excl for part in path.parts):
             continue
         if path.suffix.lower() not in exts:

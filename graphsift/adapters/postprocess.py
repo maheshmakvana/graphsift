@@ -213,9 +213,8 @@ class CommunityDetector:
                 if not neighbors:
                     continue
                 neighbor_labels = [label[j] for j in neighbors]
-                # Most common neighbor label
-                from collections import Counter
-                most_common = Counter(neighbor_labels).most_common(1)[0][0]
+                # Most common neighbor label (avoid Counter overhead in hot loop)
+                most_common = max(set(neighbor_labels), key=neighbor_labels.count)
                 if most_common != label[i]:
                     label[i] = most_common
                     changed = True
@@ -269,11 +268,14 @@ class CommunityDetector:
 
             # Assign community_id to nodes in these files
             try:
+                batch = []
                 for p in member_paths:
                     fn = file_nodes[p]
                     for sym in fn.symbols:
                         nid = sym.node_id if hasattr(sym, "node_id") else f"{p}::{sym}"
-                        store.assign_community(nid, community_id)
+                        batch.append((nid, community_id))
+                if batch:
+                    store.assign_communities_bulk(batch)
             except Exception as exc:
                 logger.warning("CommunityDetector: assign_community failed: %s", exc)
 
@@ -338,6 +340,7 @@ class RiskScorer:
             nodes = dict(graph._nodes)
 
         results = []
+        risk_batch: list[tuple[str, float, list[str], dict[str, Any] | None]] = []
         for fp, fn in file_nodes.items():
             reasons: list[str] = []
 
@@ -374,10 +377,13 @@ class RiskScorer:
                 "reasons": reasons,
             })
 
-            try:
-                store.upsert_risk(fp, risk, reasons)
-            except Exception as exc:
-                logger.warning("RiskScorer: upsert_risk failed for %s: %s", fp, exc)
+            risk_batch.append((fp, risk, reasons, None))
+
+        # Bulk persist all risk scores in a single transaction
+        try:
+            store.upsert_risks_bulk(risk_batch)
+        except Exception as exc:
+            logger.warning("RiskScorer: bulk upsert failed: %s", exc)
 
         results.sort(key=lambda x: -x["risk_score"])
         logger.info("INFO: Risk scores computed: %d files", len(results))
@@ -710,9 +716,7 @@ class Postprocessor:
         if fts:
             logger.info("INFO: Rebuilding FTS index ...")
             try:
-                store._conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
-                store._conn.commit()
-                row_count = store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+                row_count = store.rebuild_fts()
                 result["fts_indexed"] = row_count
                 logger.info("INFO: FTS index rebuilt: %d rows indexed", row_count)
             except Exception as exc:

@@ -211,8 +211,11 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
     }
     exclude_dirs = set(args.exclude_dirs) if args.exclude_dirs else {
-        "venv", ".venv", "node_modules", ".git", "__pycache__",
-        "dist", "build", ".mypy_cache", ".pytest_cache",
+        # Dot dirs (.*) are auto-skipped in load_source_map
+        # Keep only explicit non-dot build/dep dirs
+        "node_modules", "vendor", "Pods", "bower_components", "jspm_packages",
+        "dist", "build", "target", "out", "cdk.out",
+        "__pycache__", "*.egg-info", "coverage", "htmlcov",
     }
     progress_interval = int(getattr(args, "progress_interval", 200))
 
@@ -225,6 +228,9 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Step 1: Open / migrate SQLite DB ─────────────────────────────────────
     print("  [1/5] Opening database ...")
     db_path = _db_path_for_root(str(root))
+    from graphsift.sha_cache import load_sha_cache, save_sha_cache, has_changed
+    sha_cache = load_sha_cache(str(root))
+    incremental = bool(sha_cache) and not getattr(args, "force", False)
     _t0 = time.monotonic()
 
     class _MigrationPrinter:
@@ -263,39 +269,80 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         print(f"          {ext or '(no ext)':10s}  {cnt}")
     print()
 
+    # ── Purge stale files (excluded dirs, deleted files) ──────────────
+    purged = store.purge_stale_files(set(source_map.keys()))
+    if purged:
+        print(f"        purged {purged} stale files (excluded/deleted)")
+        print()
+
     # ── Step 3: Parse & index ─────────────────────────────────────────────────
     print(f"  [3/5] Parsing {total_files} files ...")
     from graphsift.models import DepthTier  # noqa: PLC0415
     depth_tier_val = DepthTier(getattr(args, 'depth', 'execution'))
     builder = ContextBuilder(ContextConfig(depth_tier=depth_tier_val))
+    if incremental:
+        builder._sha_cache = sha_cache
     all_paths = list(source_map.keys())
     skipped = 0
+    unchanged = 0
+    changed = 0  # tracks files that were actually re-parsed
+
+    # Check if tqdm is available for a proper progress bar
+    try:
+        from tqdm import tqdm  # noqa: PLC0415
+        _HAS_TQDM = True
+    except ImportError:
+        _HAS_TQDM = False
+
     t_parse_start = time.monotonic()
 
-    for i, path in enumerate(all_paths, 1):
-        try:
-            builder.index_file(path, source_map[path])
-        except Exception:
-            skipped += 1
-        if progress_interval > 0 and i % progress_interval == 0:
-            elapsed = time.monotonic() - t_parse_start
-            rate = i / elapsed if elapsed > 0 else 0
-            pct = i * 100 // total_files
-            print(f"        Progress: {i:>6}/{total_files}  [{pct:>3}%]  {rate:.0f} files/s")
+    if _HAS_TQDM:
+        pbar = tqdm(all_paths, desc="        Parsing", unit="files", ncols=80)
+        for path in pbar:
+            if incremental and not has_changed(path, source_map[path], sha_cache):
+                unchanged += 1
+                continue
+            try:
+                builder.index_file(path, source_map[path])
+                changed += 1
+            except Exception:
+                skipped += 1
+        pbar.close()
+    else:
+        for i, path in enumerate(all_paths, 1):
+            if incremental and not has_changed(path, source_map[path], sha_cache):
+                unchanged += 1
+                continue
+            try:
+                builder.index_file(path, source_map[path])
+                changed += 1
+            except Exception:
+                skipped += 1
+            if progress_interval > 0 and i % progress_interval == 0:
+                elapsed = time.monotonic() - t_parse_start
+                rate = i / elapsed if elapsed > 0 else 0
+                remaining = (total_files - i) / rate if rate > 0 else 0
+                pct = i * 100 // total_files
+                bar_len = 20
+                filled = int(bar_len * i / total_files)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                print(f"        [{bar}] {pct:>3}% | Processing file {i:>6}/{total_files} | ETA: {remaining:>5.0f}s")
 
-    if total_files % progress_interval != 0 or total_files == 0:
-        elapsed = time.monotonic() - t_parse_start
-        rate = total_files / elapsed if elapsed > 0 else 0
-        print(f"        Progress: {total_files:>6}/{total_files}  [100%]  {rate:.0f} files/s")
+        if total_files == 0 or total_files % progress_interval != 0:
+            elapsed = time.monotonic() - t_parse_start
+            rate = total_files / elapsed if elapsed > 0 else 0
+            bar_len = 20
+            bar = "█" * bar_len
+            print(f"        [{bar}] 100% | Processing file {total_files:>6}/{total_files} | {rate:.0f} files/s")
 
     parse_ms = (time.monotonic() - t_parse_start) * 1000
-    print(f"        done in {parse_ms:.0f} ms  ({skipped} skipped)")
+    print(f"        done in {parse_ms:.0f} ms  ({skipped} failed, {unchanged} unchanged)")
     print()
 
     # ── Step 4: Build final graph stats ──────────────────────────────────────
     print("  [4/5] Building dependency graph ...")
     t_graph = time.monotonic()
-    stats = builder.index_files(source_map)
+    stats = builder.index_files_incremental(source_map) if incremental else builder.index_files(source_map)
     graph_ms = (time.monotonic() - t_graph) * 1000
 
     # Language breakdown from stats
@@ -352,32 +399,36 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Step 6: Post-processing (flows, communities, risk, FTS) ───────────────
     pp_result: dict = {}
     if not getattr(args, "skip_postprocess", False):
-        print("  [6/6] Post-processing (flows, communities, risk, FTS) ...")
-        t_pp = time.monotonic()
-        from graphsift.adapters.postprocess import Postprocessor
+        if incremental and changed == 0:
+            print("  [6/6] No changes detected — skipping post-processing")
+            print()
+        else:
+            print("  [6/6] Post-processing (flows, communities, risk, FTS) ...")
+            t_pp = time.monotonic()
+            from graphsift.adapters.postprocess import Postprocessor
 
-        class _PPPrinter:
-            def write(self, msg: str) -> None:
-                msg = msg.strip()
-                if msg:
-                    print(f"        {msg}")
-            def flush(self) -> None:
-                pass
+            class _PPPrinter:
+                def write(self, msg: str) -> None:
+                    msg = msg.strip()
+                    if msg:
+                        print(f"        {msg}")
+                def flush(self) -> None:
+                    pass
 
-        import logging as _logging
-        _pp_handler = _logging.StreamHandler(_PPPrinter())  # type: ignore[arg-type]
-        _pp_handler.setFormatter(_logging.Formatter("%(message)s"))
-        _pp_logger = _logging.getLogger("graphsift.adapters.postprocess")
-        _pp_logger.setLevel(_logging.INFO)
-        _pp_logger.addHandler(_pp_handler)
-        _pp_logger.propagate = False
+            import logging as _logging
+            _pp_handler = _logging.StreamHandler(_PPPrinter())  # type: ignore[arg-type]
+            _pp_handler.setFormatter(_logging.Formatter("%(message)s"))
+            _pp_logger = _logging.getLogger("graphsift.adapters.postprocess")
+            _pp_logger.setLevel(_logging.INFO)
+            _pp_logger.addHandler(_pp_handler)
+            _pp_logger.propagate = False
 
-        if graph_obj is not None:
-            pp = Postprocessor()
-            pp_result = pp.run(graph_obj, store, source_map)
-        pp_ms = (time.monotonic() - t_pp) * 1000
-        print(f"        time           : {pp_ms:.0f} ms")
-        print()
+            if graph_obj is not None:
+                pp = Postprocessor()
+                pp_result = pp.run(graph_obj, store, source_map)
+            pp_ms = (time.monotonic() - t_pp) * 1000
+            print(f"        time           : {pp_ms:.0f} ms")
+            print()
 
     # ── Manifest ──────────────────────────────────────────────────────────────
     manifest = {
@@ -391,6 +442,13 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     manifest_path = root / ".graphsift" / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     SafeFileIO.write_json(manifest_path, manifest)
+
+    # ── Save SHA cache for next incremental build ──
+    if graph_obj is not None:
+        for file_node in graph_obj.all_files():
+            if hasattr(file_node, "sha256") and file_node.sha256:
+                sha_cache[file_node.path] = file_node.sha256
+        save_sha_cache(str(root), sha_cache)
 
     total_ms = (time.monotonic() - _t0) * 1000
 
@@ -1734,8 +1792,10 @@ def cmd_claude_md(args: argparse.Namespace) -> int:
     print(f"[graphsift] Scanning {root} for CLAUDE.md generation ...")
 
     exclude_dirs: set[str] = {
-        "venv", ".venv", "node_modules", ".git", "__pycache__",
-        "dist", "build", ".mypy_cache", ".pytest_cache",
+        # Dot dirs (.*) auto-skipped; list non-dot dirs only
+        "node_modules", "vendor", "Pods", "bower_components", "jspm_packages",
+        "dist", "build", "target", "out", "cdk.out",
+        "__pycache__", "*.egg-info", "coverage", "htmlcov",
     }
 
     # Detect project name
@@ -2129,6 +2189,8 @@ def _build_parser() -> argparse.ArgumentParser:
                          default="execution", help="Context depth tier (default: execution)")
     p_build.add_argument("--skip-postprocess", action="store_true",
                          help="Skip flow/community/risk/FTS post-processing after indexing")
+    p_build.add_argument("--force", action="store_true",
+                         help="Force full rebuild (ignore SHA cache)")
 
     # update
     p_update = sub.add_parser("update", help="Incrementally update graph (changed files only)")
