@@ -271,6 +271,106 @@ class StaleRefScanner:
         # 4. Build report
         return self._build_report(findings, dry_run=True)
 
+    def scan_after_modification(
+        self,
+        modified_paths: list[str],
+        source_map: dict[str, str] | None = None,
+    ) -> StaleRefReport:
+        """Scan for stale references to symbols that were REMOVED from modified files.
+
+        When a file is modified, some of its exported symbols may have been
+        deleted.  Other files that ``import`` or reference those symbols will
+        break.  This method detects those cases by comparing the file's
+        *previous* exports (from the graph DB) against its *current* exports
+        (from the source map).
+
+        Args:
+            modified_paths: Absolute paths of files that were modified.
+            source_map: Dict of remaining file path -> source text.
+                If ``None``, the scanner walks ``self.project_root``.
+
+        Returns:
+            StaleRefReport with findings for removed exports.
+        """
+        modified_paths = [os.path.abspath(p) for p in modified_paths]
+
+        # 1. Determine which exports were REMOVED from each modified file
+        removed_exports: dict[str, set[str]] = {}  # file_path -> symbols removed
+        deleted_modules: set[str] = set()
+
+        for mpath in modified_paths:
+            # Get NEW exports (current source)
+            try:
+                new_source = source_map.get(mpath, "") if source_map else ""
+                if not new_source:
+                    try:
+                        new_source = SafeFileIO.read(Path(mpath))
+                    except OSError:
+                        continue
+            except Exception:
+                continue
+
+            new_symbols = self._parse_exported_symbols(mpath, new_source)
+
+            # Get OLD exports from graph DB
+            old_symbols: set[str] = set()
+            try:
+                from graphsift.adapters.storage import GraphStore  # noqa: PLC0415
+                from graphsift.cli import _db_path_for_root  # noqa: PLC0415
+                store = GraphStore(_db_path_for_root(self.project_root))
+                nodes = store._execute(
+                    "SELECT name FROM nodes WHERE file_path = ?",
+                    (mpath,),
+                ).fetchall()
+                for row in nodes:
+                    name = row["name"]
+                    # Skip module-level nodes (__module__)
+                    if name and not name.startswith("__"):
+                        old_symbols.add(name)
+            except Exception:
+                # If no DB available, we can't detect removals
+                logger.debug("scan_after_modification: cannot query graph DB for %s", mpath)
+                continue
+
+            # Find symbols that were in old but not in new
+            removed = old_symbols - new_symbols
+            if removed:
+                removed_exports[mpath] = removed
+                modname = self._module_name_from_path(mpath)
+                deleted_modules.add(modname)
+
+        if not removed_exports:
+            return StaleRefReport(findings=[], total=0, by_severity={}, by_kind={}, auto_fixable=0, dry_run=True)
+
+        # 2. Scan remaining files
+        if source_map is None:
+            source_map = self._load_remaining_source_map([])
+
+        all_removed: set[str] = set()
+        for syms in removed_exports.values():
+            all_removed.update(syms)
+
+        findings: list[ScanResult] = []
+        stems = {Path(p).stem for p in modified_paths}
+        basenames = {os.path.basename(p) for p in modified_paths}
+
+        for file_path, source in source_map.items():
+            file_path = os.path.abspath(file_path)
+            if file_path in modified_paths:
+                continue
+            findings.extend(
+                self._scan_file(
+                    file_path=file_path,
+                    source=source,
+                    deleted_modules=deleted_modules,
+                    deleted_exports=all_removed,
+                    deleted_stems=stems,
+                    deleted_basenames=basenames,
+                )
+            )
+
+        return self._build_report(findings, dry_run=True)
+
     def apply_fixes(
         self,
         report: StaleRefReport,

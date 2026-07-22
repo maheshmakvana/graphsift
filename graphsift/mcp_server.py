@@ -335,11 +335,24 @@ def _tool_update_graph(params: dict) -> dict:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("update_graph: skipped %s: %s", path, exc)
 
+    # Auto-scan modified files for removed exports (gated)
+    stale_mod_findings = 0
+    if changed and _mcp_should_auto_scan(root, len(changed), len(candidates)):
+        try:
+            from graphsift.cleanup import StaleRefScanner
+            scanner = StaleRefScanner(project_root=root)
+            report = scanner.scan_after_modification(changed, source_map=new_sources)
+            stale_mod_findings = report.total
+        except Exception:
+            pass
+
     result: dict = {"status": "updated", "files_updated": len(new_sources)}
     if deleted_count:
         result["files_deleted"] = deleted_count
     if stale_findings:
         result["stale_references"] = stale_findings
+    if stale_mod_findings:
+        result["stale_references"] = result.get("stale_references", 0) + stale_mod_findings
     return result
 
 

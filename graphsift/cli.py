@@ -248,12 +248,98 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     print("[graphsift] Installation complete.")
     print()
-    print("  Next steps:")
-    print("  1. Restart Claude Code (to load the MCP server)")
-    print("  2. Ask Claude: 'Build the graphsift graph for this repo'")
-    print("     or run:  graphsift build")
-    print()
+    _print_cli_instructions(args, project_root)
     return 0
+
+
+def _print_cli_instructions(args: argparse.Namespace, project_root: Path) -> None:
+    """Print per-CLI instructions based on install flags."""
+    install_all = getattr(args, 'all', False)
+    targets = []
+    if install_all:
+        targets = ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]
+    else:
+        for name in ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]:
+            if getattr(args, name.replace("-", "_"), False):
+                targets.append(name)
+    if not targets:
+        # Default: show all
+        targets = ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]
+
+    mcp_path = _find_mcp_json(project_root)
+
+    instructions = {
+        "claude-code": (
+            "  Claude Code:  ✅ Auto (MCP + hooks already installed)\n"
+            f"                MCP config: {mcp_path}\n"
+            "                PostToolUse hooks auto-fire on every file change."
+        ),
+        "claude-desktop": (
+            "  Claude Desktop:  ⚠️  Manual setup needed\n"
+            "                 1. Open Claude Desktop → Settings → Developer → Edit Config\n"
+            "                 2. Add to claude_desktop_config.json:\n"
+            '                   { "mcpServers": { "graphsift": {'
+            f' "command": "{_python_executable()}",'
+            ' "args": ["-m", "graphsift.mcp_server"] } } }\n'
+            "                 3. Restart Claude Desktop\n"
+            "                 4. No auto-hooks — run manually:\n"
+            "                    'Build the graphsift graph' then use prune_refs tool"
+        ),
+        "cursor": (
+            "  Cursor:  ✅ MCP auto-detected\n"
+            f"          graphsift MCP server registered in {mcp_path}\n"
+            "          Cursor reads .mcp.json automatically.\n"
+            "          For auto-cleanup on file changes, run:\n"
+            f"          graphsift watch --daemon --project-root {project_root}"
+        ),
+        "windsurf": (
+            "  Windsurf:  ✅ MCP auto-detected (same .mcp.json)\n"
+            f"            Config: {mcp_path}\n"
+            "            For auto-cleanup, run:\n"
+            f"            graphsift watch --daemon --project-root {project_root}"
+        ),
+        "continue": (
+            "  Continue.dev:  ✅ MCP auto-detected\n"
+            f"                Config: {mcp_path}\n"
+            "                Continue reads .mcp.json automatically.\n"
+            "                For auto-cleanup, run:\n"
+            f"                graphsift watch --daemon --project-root {project_root}"
+        ),
+        "codex": (
+            "  Codex CLI (OpenAI):  ⚠️  No MCP support\n"
+            "                      Use pipe syntax:\n"
+            "                        graphsift build\n"
+            "                        pytest -v | graphsift compress\n"
+            "                        graphsift prune-refs\n"
+            "                      For auto-cleanup, run:\n"
+            f"                        graphsift watch --daemon --project-root {project_root}"
+        ),
+        "copilot": (
+            "  GitHub Copilot CLI:  ⚠️  No MCP support\n"
+            "                      Use CLI commands directly:\n"
+            "                        graphsift build\n"
+            "                        graphsift prune-refs [--fix]\n"
+            "                      For auto-cleanup, run:\n"
+            f"                        graphsift watch --daemon --project-root {project_root}"
+        ),
+    }
+
+    print("  Supported CLI / Agent integration:")
+    print()
+    for t in targets:
+        if t in instructions:
+            print(instructions[t])
+            print()
+    if any(t in targets for t in ["cursor", "windsurf", "continue", "codex", "copilot"]):
+        print("  NOTE: For CLIs without PostToolUse hooks, the watch daemon")
+        print("  provides the same auto-cleanup on file changes (2s poll).")
+        print()
+    print("  Next steps:")
+    print("  1. Build the graph:              graphsift build")
+    print("  2. Start auto-watch (optional):   graphsift watch --daemon")
+    print("  3. Scan for stale refs:           graphsift prune-refs")
+    print("  4. Fix stale refs (with backup):  graphsift prune-refs --fix")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +755,27 @@ def cmd_update(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
 
-        # ── 4. Update manifest ───────────────────────────────────────────────
+        # ── 5. Auto-scan modified files for removed exports ─────────────────
+        if changed and _should_auto_scan(str(root), len(changed), len(manifest_files)):
+            try:
+                from graphsift.cleanup import StaleRefScanner
+                from graphsift.adapters.filesystem import load_source_map
+                source_map = load_source_map(str(root))
+                scanner = StaleRefScanner(project_root=str(root))
+                report = scanner.scan_after_modification(changed, source_map=source_map)
+                if report.findings:
+                    high = report.by_severity.get("HIGH", 0)
+                    med = report.by_severity.get("MEDIUM", 0)
+                    logger.warning(
+                        "graphsift: %d modified file(s) had %d symbol(s) removed "
+                        "(%d HIGH, %d MEDIUM) that may break dependents. "
+                        "Run 'graphsift prune-refs' to inspect.",
+                        len(changed), report.total, high, med,
+                    )
+            except Exception:
+                pass
+
+        # ── 6. Update manifest ───────────────────────────────────────────────
         if deleted or changed:
             manifest["files"] = [f for f in manifest_files if f not in deleted]
             if changed:
@@ -963,7 +1069,12 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
 
 
 def _watch_loop(root: Path, manifest_path: Path) -> None:
-    """Scan for file changes and update graph, never raises."""
+    """Scan for file changes, update graph, auto-clean deleted files, scan stale refs.
+
+    Designed for CLIs without PostToolUse hooks (Cursor, Windsurf, Continue.dev,
+    Claude Desktop, Codex CLI, Copilot CLI).  Runs a 2-second poll loop.
+    Never raises.
+    """
     import time
     from graphsift.adapters.filesystem import load_changed_files
     from graphsift.core import ContextBuilder
@@ -994,6 +1105,32 @@ def _watch_loop(root: Path, manifest_path: Path) -> None:
 
             if changed or removed:
                 print(f"[graphsift] {len(changed)} changed, {len(removed)} removed — updating graph ...")
+
+                # Handle deleted files: DB cleanup + stale ref scan
+                if removed and _should_auto_scan(str(root), len(removed), len(current)):
+                    try:
+                        db_path = _db_path_for_root(str(root))
+                        from graphsift.adapters.storage import GraphStore
+                        store = GraphStore(db_path)
+                        for fp in removed:
+                            try:
+                                store.delete_file_completely(fp)
+                            except Exception:
+                                pass
+                        # Scan for stale references
+                        from graphsift.cleanup import StaleRefScanner
+                        from graphsift.adapters.filesystem import load_source_map
+                        source_map = load_source_map(str(root))
+                        scanner = StaleRefScanner(project_root=str(root))
+                        report = scanner.scan_after_deletion(removed, source_map=source_map)
+                        if report.findings:
+                            print(f"[graphsift] WARNING: {report.total} stale reference(s) found "
+                                  f"({report.by_severity.get('HIGH', 0)} HIGH). "
+                                  f"Run: graphsift prune-refs --fix")
+                    except Exception:
+                        pass
+
+                # Handle changed files: re-index + scan for removed exports
                 if changed:
                     new_sources = load_changed_files(changed)
                     builder = ContextBuilder(ContextConfig())
@@ -1003,6 +1140,20 @@ def _watch_loop(root: Path, manifest_path: Path) -> None:
                         except Exception:
                             pass
                     print(f"[graphsift] Updated {len(changed)} files.")
+                    # Scan for symbols removed from modified files
+                    if _should_auto_scan(str(root), len(changed), len(current)):
+                        try:
+                            from graphsift.cleanup import StaleRefScanner
+                            from graphsift.adapters.filesystem import load_source_map
+                            source_map = load_source_map(str(root))
+                            scanner = StaleRefScanner(project_root=str(root))
+                            report = scanner.scan_after_modification(changed, source_map=source_map)
+                            if report.findings:
+                                print(f"[graphsift] WARNING: {report.total} removed symbol reference(s) "
+                                      f"found in modified files. Run: graphsift prune-refs")
+                        except Exception:
+                            pass
+
                 last_mtimes = current
     except Exception:
         pass
@@ -2434,6 +2585,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--no-hooks", action="store_true", help="Skip hook injection")
     p_install.add_argument("--no-skills", action="store_true", help="Skip skill file creation")
     p_install.add_argument("--bash-wrapper", action="store_true", help="Install transparent bash command compression")
+    p_install.add_argument("--all", action="store_true", help="Show instructions for all supported CLIs")
+    p_install.add_argument("--claude-code", action="store_true", help="Show Claude Code instructions (default)")
+    p_install.add_argument("--claude-desktop", action="store_true", help="Show Claude Desktop instructions")
+    p_install.add_argument("--cursor", action="store_true", help="Show Cursor instructions")
+    p_install.add_argument("--windsurf", action="store_true", help="Show Windsurf instructions")
+    p_install.add_argument("--continue", dest="continue_", action="store_true", help="Show Continue.dev instructions")
+    p_install.add_argument("--codex", action="store_true", help="Show Codex CLI (OpenAI) instructions")
+    p_install.add_argument("--copilot", action="store_true", help="Show Copilot CLI instructions")
 
     # serve
     sub.add_parser("serve", help="Start MCP stdio server (used by Claude Code)")

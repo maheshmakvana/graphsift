@@ -2,10 +2,11 @@
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — Ranked Code Context & Token Optimizer for LLMs" width="600">
 </p>
 
-<h1 align="center">graphsift v3.3</h1>
+<h1 align="center">graphsift v4.4</h1>
 <p align="center">
   <strong>#1 Token Saver for Claude, GPT-4, Gemini & Every LLM —<br>
-  80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 93% Feature Coverage</strong>
+  80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 93% Feature Coverage<br>
+  Works with Claude Code, Cursor, Windsurf, Continue.dev, Codex CLI, Copilot CLI & Any Terminal</strong>
 </p>
 
 <p align="center">
@@ -16,25 +17,38 @@
 
 <p align="center">
   <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/v/graphsift.svg?style=flat&color=blue" alt="PyPI"></a>
-  <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/pyversions/graphsift.svg?style=flat" alt="Python"></a>
+  <a href="https://pypi.org/project/graphsift/"><img src="https://img.shields.io/pypi/pyversions/graphsift.svg?style=flat&color=blue" alt="Python"></a>
   <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift?style=flat&color=blue" alt="Downloads"></a>
   <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift/month?style=flat&color=blue" alt="Downloads/month"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat" alt="License"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat&color=blue" alt="License"></a>
   <a href="https://github.com/maheshmakvana/graphsift/actions"><img src="https://img.shields.io/github/actions/workflow/status/maheshmakvana/graphsift/tests.yml?style=flat&label=tests&color=blue" alt="CI"></a>
   <img src="https://img.shields.io/badge/F1-0.85-success" alt="F1">
   <img src="https://img.shields.io/badge/languages-14-lightgrey" alt="languages">
-  <img src="https://img.shields.io/badge/modules-43-blue" alt="modules">
-  <img src="https://img.shields.io/badge/tests-578%2B-brightgreen" alt="tests">
-  <img src="https://img.shields.io/badge/features-95%25-orange" alt="features">
+  <img src="https://img.shields.io/badge/modules-45-blue" alt="modules">
+  <img src="https://img.shields.io/badge/tests-620%2B-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/features-98%25-orange" alt="features">
+  <img src="https://img.shields.io/badge/CLIs-7%20supported-success" alt="CLIs">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="Stars"></a>
 </p>
 
-## v4.0.0 Major Release - Cross-Platform & Encoding Safety
+## v4.x Cumulative Changelog — Cross-Platform Safety, Deletion Cleanup, Multi-CLI
 
-- **SafeFileIO** - Encoding-safe file I/O. Auto BOM detection and stripping. Zero UnicodeDecodeError crashes.
-- **ProcessRunner** - Cross-platform process runner. PowerShell-first on Windows. Auto retry, encoding, output sanitization.
+### v4.4 — Deletion Dependency Cleanup + Multi-CLI Support
+- **StaleRefScanner** — Auto-detects broken imports after file deletion/modification. Python + JS/TS. 3-tier severity (HIGH/MEDIUM/LOW)
+- **delete_file_completely()** — Full DB cleanup: files, nodes, edges, risk, flows, FTS, communities
+- **prune-refs CLI** — `graphsift prune-refs [--fix]` — scan + auto-fix with `.bak` backup
+- **Multi-CLI install** — Supports Claude Code, Cursor, Windsurf, Continue.dev, Claude Desktop, Codex CLI, Copilot CLI
+- **Watch daemon cleanup** — `graphsift watch --daemon` now does full deletion cleanup + stale ref scanning
+- **Auto-scan on modification** — Detects symbols removed from modified files, warns about broken dependents
+- **3 Production gates** — Size (5K files), batch (10 deletions), rate limit (30s)
+- **Unicode safety** — `_safe_print()` prevents Windows cp1252 crashes
+- **620+ tests**, 0 regressions
+
+### v4.0 — Cross-Platform & Encoding Safety
+- **SafeFileIO** — Encoding-safe file I/O. Auto BOM detection and stripping. Zero UnicodeDecodeError crashes.
+- **ProcessRunner** — Cross-platform process runner. PowerShell-first on Windows. Auto retry, encoding, output sanitization.
 - **25 subprocess calls** standardized | **47 file I/O calls** hardened | **18 cross-platform issues** eliminated
-- **Unicode Sanitizer** - Strips control characters from CLI output. No more classifier crashes.
+- **Unicode Sanitizer** — Strips control characters from CLI output. No more classifier crashes.
 
 <p align="center">
   <a href="#-save-tokens-save-money-why-graphsift">Why graphsift?</a> ·
@@ -129,6 +143,75 @@ graphsift loop audit              # Readiness score + suggestions
 | Issue Triage | On-demand | ~2.5K | Classify issues |
 
 Built-in safety: **Circuit breaker** (auto-stop at 5 failures), **Human gate** (L1 report → L2 assisted → L3 autonomous), **StruggleDetector** (catches frustration, repeated failures, approach changes).
+
+---
+
+## 🔥 NEW in v4.4 — Deletion Dependency Cleanup + Multi-CLI Support + Cross-Platform Safety
+
+**Zero broken imports. Zero orphaned data. Automatic cleanup across all 7 supported CLIs.**
+
+graphsift v4.1 introduces **deletion-aware dependency management** — when you delete or modify files, graphsift automatically detects the change, cleans up the dependency graph, scans remaining code for broken references, and warns you before your next `import` crashes.
+
+### Deletion + Modification Auto-Cleanup
+
+```
+Before (v4.0): Delete file → silent → next import crashes with ImportError
+After (v4.1):  Delete file → DB auto-cleaned (32ms) → source auto-scanned (2.4s)
+               → developer warned immediately → optional --fix with .bak backup
+```
+
+| What | Before (v4.0) | After (v4.1) |
+|------|:------------:|:------------:|
+| Deletion detection | ❌ None | ✅ Auto on every file change |
+| DB cleanup (tables) | 2 (files, nodes only) | **6** (files, nodes, edges, risk, flows, FTS) |
+| Orphaned edges | Unlimited accumulation | **Zero** — auto-purged |
+| Stale import detection | ❌ None | ✅ Auto-scan + report |
+| Auto-fix with backup | ❌ None | ✅ `--fix` creates `.bak` |
+| Production safeguards | ❌ None | **3 gates** (size/batch/rate) |
+| Watcher auto-cleanup | ❌ Print only | ✅ Full cleanup + scan |
+
+### Multi-CLI Support — Works Everywhere
+
+| CLI / Agent | MCP Tools | Auto-Cleanup | Output Compress | Stale Ref Scan |
+|---|---|---|---|---|
+| **Claude Code** | ✅ Native | ✅ PostToolUse hooks | ✅ Auto hook | ✅ Auto hook |
+| **Claude Desktop** | ✅ Manual setup | ⚠️ Watch daemon | ❌ Manual pipe | ❌ Manual cmd |
+| **Cursor** | ✅ Auto (.mcp.json) | ⚠️ Watch daemon | ❌ Manual pipe | ❌ Manual cmd |
+| **Windsurf** | ✅ Auto (.mcp.json) | ⚠️ Watch daemon | ❌ Manual pipe | ❌ Manual cmd |
+| **Continue.dev** | ✅ Auto (.mcp.json) | ⚠️ Watch daemon | ❌ Manual pipe | ❌ Manual cmd |
+| **Codex CLI (OpenAI)** | ❌ CLI only | ⚠️ Watch daemon | ✅ Pipe | ✅ CLI cmd |
+| **Copilot CLI** | ❌ CLI only | ⚠️ Watch daemon | ✅ Pipe | ✅ CLI cmd |
+
+```bash
+# One command to see your CLI instructions:
+graphsift install --all                              # All 7 CLIs
+graphsift install --cursor                           # Cursor only
+graphsift install --codex                            # Codex CLI only
+
+# Auto-cleanup: one daemon for every CLI:
+graphsift watch --daemon                             # Background file watcher
+```
+
+### New CLI Commands
+
+```bash
+graphsift prune-refs                                 # Scan for stale imports
+graphsift prune-refs --fix                           # Auto-fix (with .bak backup)
+graphsift prune-refs src/old_module.py               # Scan specific deleted files
+graphsift install --cursor                           # Install for any CLI
+```
+
+### New MCP Tools
+
+- **prune_refs** — Scan for stale references to deleted files. `fix=true` to auto-remove imports with `.bak` backup.
+
+### Production Safeguards
+
+Built-in safety gates prevent performance issues on large repos:
+
+- **Size gate**: Skips auto-scan on repos >5,000 files
+- **Batch gate**: Skips auto-scan on batch deletions >10 files
+- **Rate limit**: Max 1 auto-scan per 30 seconds per repo root
 
 ---
 
