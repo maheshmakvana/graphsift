@@ -228,7 +228,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Step 1: Open / migrate SQLite DB ─────────────────────────────────────
     print("  [1/5] Opening database ...")
     db_path = _db_path_for_root(str(root))
-    from graphsift.sha_cache import load_sha_cache, save_sha_cache, has_changed
+    from graphsift.sha_cache import load_sha_cache, save_sha_cache
     sha_cache = load_sha_cache(str(root))
     incremental = bool(sha_cache) and not getattr(args, "force", False)
     _t0 = time.monotonic()
@@ -258,19 +258,50 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     # ── Step 2: Discover files ────────────────────────────────────────────────
     print("  [2/5] Scanning files ...")
-    source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
-    total_files = len(source_map)
 
-    # Count by extension
-    from collections import Counter
-    ext_counts: Counter = Counter(Path(p).suffix.lower() for p in source_map)
-    print(f"        found {total_files} files")
-    for ext, cnt in ext_counts.most_common(8):
-        print(f"          {ext or '(no ext)':10s}  {cnt}")
-    print()
+    if incremental:
+        # ── Fast incremental path: walk paths, stat-check, only read changed ──
+        from graphsift.adapters.filesystem import walk_repo
+        from graphsift.sha_cache import stat_match
+        walk_paths = walk_repo(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
+        total_files = len(walk_paths)
+        all_paths = walk_paths  # full file list for progress & manifest
+
+        from collections import Counter
+        ext_counts = Counter(Path(p).suffix.lower() for p in all_paths)
+        print(f"        found {total_files} files")
+        for ext, cnt in ext_counts.most_common(8):
+            print(f"          {ext or '(no ext)':10s}  {cnt}")
+        print()
+
+        # Stat-check every file against cache — zero content reads for unchanged
+        source_map = {}
+        for p in all_paths:
+            if not stat_match(p, sha_cache):
+                try:
+                    source_map[p] = SafeFileIO.read(p)
+                except OSError:
+                    pass
+
+        fast_unchanged = total_files - len(source_map)
+        if fast_unchanged:
+            print(f"        {fast_unchanged} files unchanged (mtime+size match) — content read skipped")
+            print()
+    else:
+        # ── Full scan: read everything into memory ──
+        source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
+        total_files = len(source_map)
+        all_paths = list(source_map.keys())
+
+        from collections import Counter
+        ext_counts = Counter(Path(p).suffix.lower() for p in source_map)
+        print(f"        found {total_files} files")
+        for ext, cnt in ext_counts.most_common(8):
+            print(f"          {ext or '(no ext)':10s}  {cnt}")
+        print()
 
     # ── Purge stale files (excluded dirs, deleted files) ──────────────
-    purged = store.purge_stale_files(set(source_map.keys()))
+    purged = store.purge_stale_files(set(all_paths))
     if purged:
         print(f"        purged {purged} stale files (excluded/deleted)")
         print()
@@ -282,7 +313,6 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     builder = ContextBuilder(ContextConfig(depth_tier=depth_tier_val))
     if incremental:
         builder._sha_cache = sha_cache
-    all_paths = list(source_map.keys())
     skipped = 0
     unchanged = 0
     changed = 0  # tracks files that were actually re-parsed
@@ -299,7 +329,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     if _HAS_TQDM:
         pbar = tqdm(all_paths, desc="        Parsing", unit="files", ncols=80)
         for path in pbar:
-            if incremental and not has_changed(path, source_map[path], sha_cache):
+            if path not in source_map:
                 unchanged += 1
                 continue
             try:
@@ -310,7 +340,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         pbar.close()
     else:
         for i, path in enumerate(all_paths, 1):
-            if incremental and not has_changed(path, source_map[path], sha_cache):
+            if path not in source_map:
                 unchanged += 1
                 continue
             try:
@@ -398,7 +428,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     # ── Step 6: Post-processing (flows, communities, risk, FTS) ───────────────
     pp_result: dict = {}
-    if not getattr(args, "skip_postprocess", False):
+    if getattr(args, "postprocess", False):
         if incremental and changed == 0:
             print("  [6/6] No changes detected — skipping post-processing")
             print()
@@ -429,6 +459,9 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
             pp_ms = (time.monotonic() - t_pp) * 1000
             print(f"        time           : {pp_ms:.0f} ms")
             print()
+    else:
+        print("  [6/6] Post-processing skipped (use --postprocess to enable)")
+        print()
 
     # ── Manifest ──────────────────────────────────────────────────────────────
     manifest = {
@@ -437,7 +470,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         "symbols_extracted": stats.symbols_extracted,
         "edges_created": stats.edges_created,
         "duration_ms": stats.duration_ms,
-        "files": [str(p) for p in source_map.keys()],
+        "files": [str(p) for p in all_paths],
     }
     manifest_path = root / ".graphsift" / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,7 +480,15 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     if graph_obj is not None:
         for file_node in graph_obj.all_files():
             if hasattr(file_node, "sha256") and file_node.sha256:
-                sha_cache[file_node.path] = file_node.sha256
+                try:
+                    st = os.stat(file_node.path)
+                    sha_cache[file_node.path] = {
+                        "sha": file_node.sha256,
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                    }
+                except OSError:
+                    sha_cache[file_node.path] = file_node.sha256  # plain str fallback
         save_sha_cache(str(root), sha_cache)
 
     total_ms = (time.monotonic() - _t0) * 1000
@@ -2187,8 +2228,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Log progress every N files (default 200, 0=disable)")
     p_build.add_argument("--depth", choices=["planning", "exploration", "execution"],
                          default="execution", help="Context depth tier (default: execution)")
+    p_build.add_argument("--postprocess", action="store_true",
+                         help="Run flow/community/risk/FTS post-processing (off by default for speed)")
     p_build.add_argument("--skip-postprocess", action="store_true",
-                         help="Skip flow/community/risk/FTS post-processing after indexing")
+                         help=argparse.SUPPRESS)  # deprecated no-op, kept for compat
     p_build.add_argument("--force", action="store_true",
                          help="Force full rebuild (ignore SHA cache)")
 

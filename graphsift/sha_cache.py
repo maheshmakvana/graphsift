@@ -1,8 +1,15 @@
 """SHA-256 cache for incremental graph builds.
 
-Persists file content hashes between builds so unchanged files can be
-skipped during re-parsing. The cache is stored alongside the SQLite DB
-in ``~/.graphsift/<repo-hash>/sha_cache.json``.
+Persists file content hashes + stat metadata between builds so
+unchanged files can be skipped during re-parsing without re-reading
+content from disk.
+
+Cache entry format::
+
+    {"sha": "<sha256 hex>", "mtime": 1234567890.0, "size": 1234}
+
+The cache is stored alongside the SQLite DB in
+``~/.graphsift/<repo-hash>/sha_cache.json``.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ def sha_cache_path(root: str) -> str:
     return str(cache_dir / "sha_cache.json")
 
 
-def load_sha_cache(root: str) -> dict[str, str]:
+def load_sha_cache(root: str) -> dict[str, Any]:
     """Load the SHA cache from disk.
 
     Args:
@@ -57,12 +64,13 @@ def load_sha_cache(root: str) -> dict[str, str]:
         return {}
 
 
-def save_sha_cache(root: str, cache: dict[str, str]) -> None:
+def save_sha_cache(root: str, cache: dict[str, Any]) -> None:
     """Save the SHA cache to disk.
 
     Args:
         root: Repo root path.
-        cache: Dict mapping file path → SHA-256 hex digest.
+        cache: Dict mapping file path → SHA-256 hex digest (str v1) or
+               dict with sha/mtime/size (v2).
     """
     path = sha_cache_path(root)
     try:
@@ -85,8 +93,53 @@ def compute_sha(source: str) -> str:
     return hashlib.sha256(source.encode(errors="replace")).hexdigest()
 
 
-def has_changed(path: str, source: str, cache: dict[str, str]) -> bool:
+def stat_match(path: str, cache: dict[str, Any]) -> bool:
+    """Fast check if a file is unchanged using mtime + size (no content read).
+
+    Only works with the dict-based cache format (v2+).  Returns False
+    for entries in the legacy str-only format so callers fall back to
+    content-hash checking.
+
+    Args:
+        path: Absolute file path.
+        cache: Loaded SHA cache dict.
+
+    Returns:
+        True if the file's mtime and size match the cached values.
+    """
+    entry = cache.get(path)
+    if not entry or not isinstance(entry, dict):
+        return False
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return entry.get("mtime") == st.st_mtime and entry.get("size") == st.st_size
+
+
+def make_cache_entry(path: str, source: str) -> dict[str, Any]:
+    """Build a cache dict entry with SHA-256, mtime, and file size.
+
+    Args:
+        path: Absolute file path.
+        source: File source text.
+
+    Returns:
+        Dict with keys ``sha``, ``mtime``, ``size``.
+    """
+    st = os.stat(path)
+    return {
+        "sha": compute_sha(source),
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+    }
+
+
+def has_changed(path: str, source: str, cache: dict[str, Any]) -> bool:
     """Check if a file has changed since it was cached.
+
+    Handles both the legacy str-only format (v1) and the current
+    dict-with-metadata format (v2).
 
     Args:
         path: File path (cache key).
@@ -96,7 +149,10 @@ def has_changed(path: str, source: str, cache: dict[str, str]) -> bool:
     Returns:
         True if the file is new or modified; False if unchanged.
     """
-    cached = cache.get(path)
-    if cached is None:
+    entry = cache.get(path)
+    if entry is None:
         return True  # new file
-    return compute_sha(source) != cached
+    sha = compute_sha(source)
+    if isinstance(entry, dict):
+        return sha != entry.get("sha")
+    return sha != entry  # legacy str format

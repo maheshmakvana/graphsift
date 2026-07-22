@@ -108,9 +108,10 @@ def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
 
 def _tool_build_graph(params: dict) -> dict:
     """Index all source files under root_path and build the dependency graph."""
-    from graphsift.adapters.filesystem import load_source_map
-    from graphsift.core import ContextBuilder, estimate_tokens
-    from graphsift.models import ContextConfig, FileNode, GraphEdge, GraphNode
+    from graphsift.adapters.filesystem import walk_repo
+    from graphsift.core import ContextBuilder
+    from graphsift.models import FileNode, GraphEdge, GraphNode
+    from graphsift.sha_cache import load_sha_cache, save_sha_cache, stat_match
 
     root = params.get("root_path", os.getcwd())
     extensions_raw = params.get("extensions")
@@ -123,11 +124,29 @@ def _tool_build_graph(params: dict) -> dict:
     ]))
     progress_interval = int(params.get("progress_interval", 200))
 
-    # -- Ensure SQLite DB is open and migrated (logs migration steps to stderr)
+    # -- Ensure SQLite DB is open and migrated
     store = _get_store(root)
 
-    source_map = load_source_map(root, extensions=extensions, exclude_dirs=exclude_dirs)
-    total_files = len(source_map)
+    # -- Walk paths, stat-check unchanged, read all content for source_map
+    sha_cache = load_sha_cache(root)
+    walk_paths = walk_repo(root, extensions=extensions, exclude_dirs=exclude_dirs)
+    total_files = len(walk_paths)
+    source_map: dict[str, str] = {}
+    needs_index: set[str] = set()
+
+    for p in walk_paths:
+        if sha_cache and stat_match(p, sha_cache):
+            pass  # unchanged — skip indexing, but still read for source_map
+        else:
+            needs_index.add(p)
+        try:
+            source_map[p] = SafeFileIO.read(p)
+        except OSError:
+            pass
+
+    fast_unchanged = total_files - len(needs_index)
+    if fast_unchanged:
+        logger.info("INFO: %d files unchanged (stat-match) — skip re-index", fast_unchanged)
 
     with _lock:
         from graphsift.models import ContextConfig
@@ -135,15 +154,19 @@ def _tool_build_graph(params: dict) -> dict:
         builder = _builders[root]
         _source_maps[root] = source_map
 
-    # -- Index with per-file progress logging
-    all_paths = list(source_map.keys())
+    # -- Index only changed/new files
     parsed_count = 0
     all_nodes: list[GraphNode] = []
     all_edges: list[GraphEdge] = []
     all_file_nodes: list[FileNode] = []
 
-    for path in all_paths:
-        source = source_map[path]
+    for path in walk_paths:
+        source = source_map.get(path)
+        if source is None or path not in needs_index:
+            parsed_count += 1
+            if progress_interval > 0 and parsed_count % progress_interval == 0:
+                logger.info("INFO: Progress: %d/%d files", parsed_count, total_files)
+            continue
         try:
             with _lock:
                 builder.index_file(path, source)
@@ -152,11 +175,9 @@ def _tool_build_graph(params: dict) -> dict:
 
         parsed_count += 1
         if progress_interval > 0 and parsed_count % progress_interval == 0:
-            logger.info(
-                "INFO: Progress: %d/%d files parsed", parsed_count, total_files
-            )
+            logger.info("INFO: Progress: %d/%d files", parsed_count, total_files)
 
-    logger.info("INFO: Progress: %d/%d files parsed", total_files, total_files)
+    logger.info("INFO: Progress: %d/%d files", total_files, total_files)
 
     # -- Gather stats from builder graph
     with _lock:
@@ -166,7 +187,6 @@ def _tool_build_graph(params: dict) -> dict:
     # -- Persist nodes + edges + files to SQLite
     if graph is not None:
         try:
-            # Collect nodes
             from graphsift.models import NodeKind as _NodeKind
             for file_node in graph.all_files():
                 all_file_nodes.append(file_node)
@@ -186,12 +206,24 @@ def _tool_build_graph(params: dict) -> dict:
                         )
             store.save_nodes(all_nodes)
             store.save_files(all_file_nodes)
-            logger.info(
-                "INFO: Persisted %d nodes, %d files to SQLite",
-                len(all_nodes), len(all_file_nodes),
-            )
+            logger.info("INFO: Persisted %d nodes, %d files to SQLite", len(all_nodes), len(all_file_nodes))
         except Exception as exc:  # noqa: BLE001
             logger.warning("build_graph: SQLite persist failed: %s", exc)
+
+    # -- Save SHA cache with mtime+size for future incremental builds
+    if graph is not None:
+        for file_node in graph.all_files():
+            if hasattr(file_node, "sha256") and file_node.sha256:
+                try:
+                    st = os.stat(file_node.path)
+                    sha_cache[file_node.path] = {
+                        "sha": file_node.sha256,
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                    }
+                except OSError:
+                    sha_cache[file_node.path] = file_node.sha256  # plain str fallback
+        save_sha_cache(root, sha_cache)
 
     return {
         "status": "indexed",

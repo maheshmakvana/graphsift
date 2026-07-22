@@ -111,6 +111,9 @@ def walk_repo(
     for path in root_path.rglob("*"):
         if not path.is_file():
             continue
+        # Skip hidden directories (.*) — they are tooling/build output, never source
+        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
+            continue
         if any(part in excl for part in path.parts):
             continue
         if path.suffix.lower() in exts:
