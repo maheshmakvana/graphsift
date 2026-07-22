@@ -1217,17 +1217,20 @@ class GraphStore:
     # Stats / schema
     # ------------------------------------------------------------------
 
-    def purge_stale_files(self, valid_paths: set[str]) -> int:
+    def purge_stale_files(self, valid_paths: set[str]) -> dict[str, int]:
         """Remove from the DB any files that are no longer in the source map.
 
-        This handles the case where exclude dirs change — files from now-excluded
-        directories are purged along with their nodes and any orphaned edges.
+        Handles the case where exclude dirs change or files are deleted —
+        purges files, nodes, edges, risk scores, flow snapshots, and FTS
+        entries belonging to stale paths. Community node counts are
+        recalculated after removal.
 
         Args:
             valid_paths: Set of file paths that are still valid (current source map).
 
         Returns:
-            Number of stale file records purged.
+            Dict with counts of purged records per table:
+            ``{"files": N, "nodes": N, "edges": N, "risk": N, "flows": N}``.
         """
         conn = self._pool.acquire()
         try:
@@ -1238,20 +1241,105 @@ class GraphStore:
             }
             stale = db_paths - valid_paths
             if not stale:
-                return 0
+                return {"files": 0, "nodes": 0, "edges": 0, "risk": 0, "flows": 0}
 
             logger.info(
                 "graphsift: purging %d stale files from DB",
                 len(stale),
             )
 
-            # Delete matching nodes (by file_path)
-            for fp in stale:
-                conn.execute("DELETE FROM nodes WHERE file_path = ?", (fp,))
-                conn.execute("DELETE FROM files WHERE path = ?", (fp,))
+            counts: dict[str, int] = {"files": 0, "nodes": 0, "edges": 0, "risk": 0, "flows": 0}
 
-            # Edges referencing purged nodes will be rebuilt when
-            # build_import_edges() / build_inheritance_edges() run in step 4.
+            for fp in stale:
+                # Delete edges referencing this file's nodes
+                pattern = f"{fp}::%"
+                cur = conn.execute(
+                    "DELETE FROM edges WHERE source_id LIKE ? OR target_id LIKE ?",
+                    (pattern, pattern),
+                )
+                counts["edges"] += cur.rowcount
+
+                # Delete nodes belonging to this file
+                cur = conn.execute("DELETE FROM nodes WHERE file_path = ?", (fp,))
+                counts["nodes"] += cur.rowcount
+
+                # Delete risk index entry
+                cur = conn.execute("DELETE FROM risk_index WHERE file_path = ?", (fp,))
+                counts["risk"] += cur.rowcount
+
+                # Delete file record
+                cur = conn.execute("DELETE FROM files WHERE path = ?", (fp,))
+                counts["files"] += cur.rowcount
+
+            # Flow snapshots may reference purged nodes — clear and flag rebuild
+            cur = conn.execute("DELETE FROM flow_snapshots")
+            counts["flows"] = cur.rowcount
+
+            # Recalculate community node counts
+            conn.execute(
+                """UPDATE communities SET node_count = (
+                    SELECT COUNT(*) FROM nodes WHERE nodes.community_id = communities.community_id
+                )"""
+            )
+
+            conn.commit()
+
+            # Rebuild FTS index
+            try:
+                conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            logger.info(
+                "graphsift: purge complete — files=%d nodes=%d edges=%d risk=%d flows=%d",
+                counts["files"], counts["nodes"], counts["edges"],
+                counts["risk"], counts["flows"],
+            )
+            return counts
+        finally:
+            self._pool.release(conn)
+
+    def delete_file_completely(self, file_path: str) -> dict[str, int]:
+        """Remove ALL traces of a single file from the graph database.
+
+        Purges edges, nodes, files records, and risk scores for the given
+        file. Rebuilds FTS and recalculates community node counts.
+
+        Args:
+            file_path: Absolute or repo-relative path of the deleted file.
+
+        Returns:
+            Dict with counts of removed records per table.
+        """
+        conn = self._pool.acquire()
+        try:
+            counts: dict[str, int] = {"files": 0, "nodes": 0, "edges": 0, "risk": 0, "flows": 0}
+
+            pattern = f"{file_path}::%"
+
+            cur = conn.execute(
+                "DELETE FROM edges WHERE source_id LIKE ? OR target_id LIKE ?",
+                (pattern, pattern),
+            )
+            counts["edges"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+            counts["nodes"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM risk_index WHERE file_path = ?", (file_path,))
+            counts["risk"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM files WHERE path = ?", (file_path,))
+            counts["files"] = cur.rowcount
+
+            # Recalculate community node counts
+            conn.execute(
+                """UPDATE communities SET node_count = (
+                    SELECT COUNT(*) FROM nodes WHERE nodes.community_id = communities.community_id
+                )"""
+            )
+
             conn.commit()
 
             # Rebuild FTS
@@ -1261,7 +1349,12 @@ class GraphStore:
             except sqlite3.OperationalError:
                 pass
 
-            return len(stale)
+            logger.info(
+                "graphsift: deleted file %s — edges=%d nodes=%d risk=%d files=%d",
+                file_path, counts["edges"], counts["nodes"],
+                counts["risk"], counts["files"],
+            )
+            return counts
         finally:
             self._pool.release(conn)
 

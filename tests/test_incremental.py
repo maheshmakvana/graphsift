@@ -144,20 +144,25 @@ class TestPurgeStaleFiles:
     def _count_nodes(self) -> int:
         return self.store._execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
 
+    def _assert_purged(self, result: dict, **expected: int) -> None:
+        """Helper: assert purge result dict matches expected counts."""
+        for key, val in expected.items():
+            assert result.get(key, 0) == val, f"Expected {key}={val}, got {result}"
+
     def test_purge_no_stale(self):
         """When all DB files are in valid_paths, nothing should be purged."""
         self._add_file("src/main.py")
         self._add_file("src/utils.py")
-        n = self.store.purge_stale_files({"src/main.py", "src/utils.py"})
-        assert n == 0
+        r = self.store.purge_stale_files({"src/main.py", "src/utils.py"})
+        self._assert_purged(r, files=0, nodes=0, edges=0, risk=0)
         assert self._count_files() == 2
 
     def test_purge_some_stale(self):
         """Files in DB but not in valid_paths should be purged."""
         self._add_file("src/main.py")
         self._add_file("src/old.py")
-        n = self.store.purge_stale_files({"src/main.py"})
-        assert n == 1
+        r = self.store.purge_stale_files({"src/main.py"})
+        self._assert_purged(r, files=1)
         assert self._count_files() == 1
 
     def test_purge_nodes_with_stale_files(self):
@@ -166,8 +171,8 @@ class TestPurgeStaleFiles:
         self._add_file("src/old.py")
         self._add_node("src/old.py::func1", "src/old.py")
         self._add_node("src/old.py::func2", "src/old.py")
-        n = self.store.purge_stale_files({"src/main.py"})
-        assert n == 1
+        r = self.store.purge_stale_files({"src/main.py"})
+        self._assert_purged(r, files=1, nodes=2)
         assert self._count_files() == 1
         assert self._count_nodes() == 0
 
@@ -176,8 +181,8 @@ class TestPurgeStaleFiles:
         self._add_file("a.py")
         self._add_file("b.py")
         self._add_node("a.py::f1", "a.py")
-        n = self.store.purge_stale_files(set())
-        assert n == 2
+        r = self.store.purge_stale_files(set())
+        self._assert_purged(r, files=2, nodes=1)
         assert self._count_files() == 0
         assert self._count_nodes() == 0
 
@@ -185,16 +190,16 @@ class TestPurgeStaleFiles:
         """Running purge twice should be safe (no-op on second run)."""
         self._add_file("keep.py")
         self._add_file("remove.py")
-        n1 = self.store.purge_stale_files({"keep.py"})
-        assert n1 == 1
-        n2 = self.store.purge_stale_files({"keep.py"})
-        assert n2 == 0
+        r1 = self.store.purge_stale_files({"keep.py"})
+        self._assert_purged(r1, files=1)
+        r2 = self.store.purge_stale_files({"keep.py"})
+        self._assert_purged(r2, files=0)
         assert self._count_files() == 1
 
     def test_purge_empty_db(self):
         """Purging an empty DB should return 0."""
-        n = self.store.purge_stale_files({"a.py"})
-        assert n == 0
+        r = self.store.purge_stale_files({"a.py"})
+        self._assert_purged(r, files=0, nodes=0, edges=0, risk=0)
 
     def test_purge_preserves_valid_edges(self):
         """Edges referencing valid files should survive purge."""
@@ -205,8 +210,8 @@ class TestPurgeStaleFiles:
         self.store._execute(
             "INSERT INTO edges (source_id, target_id, kind) VALUES ('a.py::mod', 'b.py::mod', 'imports')",
         )
-        n = self.store.purge_stale_files({"a.py", "b.py"})
-        assert n == 0
+        r = self.store.purge_stale_files({"a.py", "b.py"})
+        self._assert_purged(r, files=0, edges=0)
         edge_count = self.store._execute("SELECT COUNT(*) FROM edges").fetchone()[0]
         assert edge_count == 1
 
@@ -330,7 +335,7 @@ class TestBuildPersistence:
         finally:
             store._pool.release(conn)
         n = store.purge_stale_files(set())
-        assert n == 1
+        assert n["files"] == 1
         assert store._execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
 
         # Add it back — should work cleanly

@@ -16,6 +16,34 @@ from graphsift.read_cache import SafeFileIO
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Production safeguards for auto-scan (mirrors cli.py constants)
+# ---------------------------------------------------------------------------
+_MAX_AUTO_SCAN_FILES = 5000        # skip if repo is larger
+_MAX_AUTO_SCAN_DELETIONS = 10      # skip if batch delete is too large
+_MIN_SCAN_INTERVAL_S = 30.0        # rate limit across MCP calls
+_last_scan_times: dict[str, float] = {}  # root -> last scan timestamp
+
+
+def _mcp_should_auto_scan(root: str, deleted_count: int, total_files_estimate: int) -> bool:
+    """Production gates for auto-scan in the MCP server path."""
+    import time as _time
+    now = _time.monotonic()
+
+    if total_files_estimate > _MAX_AUTO_SCAN_FILES:
+        logger.debug("mcp auto-scan skipped: %d files > %d limit", total_files_estimate, _MAX_AUTO_SCAN_FILES)
+        return False
+    if deleted_count > _MAX_AUTO_SCAN_DELETIONS:
+        logger.debug("mcp auto-scan skipped: %d deletions > %d batch limit", deleted_count, _MAX_AUTO_SCAN_DELETIONS)
+        return False
+    last = _last_scan_times.get(root, 0.0)
+    if now - last < _MIN_SCAN_INTERVAL_S:
+        logger.debug("mcp auto-scan skipped: rate-limited (%.1fs ago)", now - last)
+        return False
+    _last_scan_times[root] = now
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Minimal MCP stdio server (no external dep — pure stdlib)
 # Protocol: https://spec.modelcontextprotocol.io/specification/
 # ---------------------------------------------------------------------------
@@ -238,14 +266,63 @@ def _tool_build_graph(params: dict) -> dict:
 
 
 def _tool_update_graph(params: dict) -> dict:
-    """Incrementally update the graph with changed files only."""
+    """Incrementally update the graph with changed files only.
+
+    Detects both modified and deleted files.  Deleted files are
+    purged from the graph database automatically.
+    """
     from graphsift.adapters.filesystem import load_changed_files
 
     root = params.get("root_path", os.getcwd())
-    changed = params.get("changed_files", [])
+    candidates = params.get("changed_files", [])
+
+    if not candidates:
+        return {"status": "no_changes", "files_updated": 0}
+
+    # Separate candidates into modified (still exist) and deleted
+    changed = [f for f in candidates if os.path.isfile(f)]
+    deleted = [f for f in candidates if not os.path.isfile(f)]
+
+    # Handle deletions from graph DB
+    deleted_count = 0
+    stale_findings = 0
+    if deleted:
+        try:
+            from graphsift.adapters.storage import GraphStore
+            store = GraphStore(_db_path_for(root))
+            for fp in deleted:
+                try:
+                    store.delete_file_completely(fp)
+                    deleted_count += 1
+                except Exception as exc:
+                    logger.warning("update_graph: delete failed for %s: %s", fp, exc)
+        except Exception as exc:
+            logger.warning("update_graph: could not open store for cleanup: %s", exc)
+
+        # Auto-scan for stale source-code references (gated)
+        total_files_estimate = len(candidates)  # rough proxy for size gate
+        if _mcp_should_auto_scan(root, len(deleted), total_files_estimate):
+            try:
+                from graphsift.cleanup import StaleRefScanner
+                from graphsift.adapters.filesystem import load_source_map
+                source_map = load_source_map(root)
+                scanner = StaleRefScanner(project_root=root)
+                report = scanner.scan_after_deletion(deleted, source_map=source_map)
+                stale_findings = report.total
+                if stale_findings:
+                    logger.warning(
+                        "update_graph: %d stale reference(s) found for deleted file(s). "
+                        "Use the prune_refs tool to inspect or fix.",
+                        stale_findings,
+                    )
+            except Exception:
+                pass
 
     if not changed:
-        return {"status": "no_changes", "files_updated": 0}
+        result: dict = {"status": "cleaned", "files_updated": 0, "files_deleted": deleted_count}
+        if stale_findings:
+            result["stale_references"] = stale_findings
+        return result
 
     builder, source_map = _get_builder(root)
     new_sources = load_changed_files(changed)
@@ -258,7 +335,37 @@ def _tool_update_graph(params: dict) -> dict:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("update_graph: skipped %s: %s", path, exc)
 
-    return {"status": "updated", "files_updated": len(new_sources)}
+    result: dict = {"status": "updated", "files_updated": len(new_sources)}
+    if deleted_count:
+        result["files_deleted"] = deleted_count
+    if stale_findings:
+        result["stale_references"] = stale_findings
+    return result
+
+
+def _tool_prune_refs(params: dict) -> dict:
+    """Scan for stale references to deleted files and optionally auto-fix."""
+    project_root = params.get("project_root", os.getcwd())
+    deleted_paths = params.get("deleted_paths", [])
+    fix = params.get("fix", False)
+
+    from graphsift.adapters.filesystem import load_source_map
+    try:
+        from graphsift.cleanup import StaleRefScanner
+    except ImportError:
+        return {"error": "cleanup module not available", "findings": [], "total": 0}
+
+    source_map = load_source_map(project_root)
+    scanner = StaleRefScanner(project_root=project_root)
+    report = scanner.scan_after_deletion(deleted_paths, source_map=source_map)
+    if not report.findings:
+        return {"findings": [], "total": 0, "message": "No stale references found"}
+
+    result = report.model_dump()
+    if fix:
+        fix_result = scanner.apply_fixes(report, dry_run=False)
+        result["fix_applied"] = fix_result
+    return result
 
 
 def _tool_get_context(params: dict) -> dict:
@@ -2163,6 +2270,24 @@ _TOOLS = {
                 "root_path": {"type": "string"},
                 "changed_files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths of changed files"},
             },
+        },
+    },
+    "prune_refs": {
+        "fn": _tool_prune_refs,
+        "description": (
+            "Scan for stale references to deleted files and optionally auto-fix. "
+            "After files are deleted, detects import statements, symbol references, "
+            "and path references in remaining source files that point to deleted components. "
+            "Use fix=true to auto-remove stale import lines (creates .bak backups)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_root": {"type": "string", "description": "Repo root directory (default: cwd)"},
+                "deleted_paths": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths of deleted files"},
+                "fix": {"type": "boolean", "description": "Auto-remove stale import lines (default false)"},
+            },
+            "required": ["deleted_paths"],
         },
     },
     "get_context": {

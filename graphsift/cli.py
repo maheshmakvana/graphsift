@@ -17,11 +17,82 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Production safeguards for auto-scan
+# ---------------------------------------------------------------------------
+
+# Size gate: skip auto-scan on repos larger than this (load_source_map is O(n))
+_MAX_AUTO_SCAN_FILES = 5000
+
+# Batch gate: skip auto-scan when more than this many files are deleted at once
+# to avoid scanning after bulk operations like rm -rf src/
+_MAX_AUTO_SCAN_DELETIONS = 10
+
+# Rate limit: minimum seconds between auto-scans for the same repo root
+_MIN_SCAN_INTERVAL_S = 30.0
+
+# Track last scan time per project root (module-level) for rate limiting
+_last_scan_times: dict[str, float] = {}
+
+
+def _should_auto_scan(root: str, deleted_count: int, total_files: int) -> bool:
+    """Check all production safeguards before running an auto-scan.
+
+    Returns False when any gate is triggered, with a debug log explaining why.
+    """
+    import time as _time
+    now = _time.monotonic()
+
+    # Size gate
+    if total_files > _MAX_AUTO_SCAN_FILES:
+        logger.debug(
+            "graphsift: auto-scan skipped — repo has %d files (max %d)",
+            total_files, _MAX_AUTO_SCAN_FILES,
+        )
+        return False
+
+    # Batch gate
+    if deleted_count > _MAX_AUTO_SCAN_DELETIONS:
+        logger.debug(
+            "graphsift: auto-scan skipped — %d files deleted in batch (max %d)",
+            deleted_count, _MAX_AUTO_SCAN_DELETIONS,
+        )
+        return False
+
+    # Rate limit gate
+    last = _last_scan_times.get(root, 0.0)
+    elapsed = now - last
+    if elapsed < _MIN_SCAN_INTERVAL_S:
+        logger.debug(
+            "graphsift: auto-scan skipped — last scan %.1fs ago (min %.0fs)",
+            elapsed, _MIN_SCAN_INTERVAL_S,
+        )
+        return False
+
+    _last_scan_times[root] = now
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _cwd() -> str:
     return os.getcwd()
+
+
+def _safe_print(*args, **kwargs) -> None:
+    """Print with Unicode fallback for terminals that don't support it (Windows)."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        # Replace non-ASCII characters with ASCII equivalents
+        sanitized = []
+        for a in args:
+            if isinstance(a, str):
+                sanitized.append(a.encode("ascii", errors="replace").decode("ascii"))
+            else:
+                sanitized.append(str(a))
+        print(*sanitized, **kwargs)
 
 
 def _find_claude_settings(project_root: Path) -> Path:
@@ -302,8 +373,8 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     # ── Purge stale files (excluded dirs, deleted files) ──────────────
     purged = store.purge_stale_files(set(all_paths))
-    if purged:
-        print(f"        purged {purged} stale files (excluded/deleted)")
+    if purged["files"]:
+        print(f"        purged {purged['files']} stale files ({purged['nodes']} nodes, {purged['edges']} edges, {purged['risk']} risk)")
         print()
 
     # ── Step 3: Parse & index ─────────────────────────────────────────────────
@@ -540,30 +611,72 @@ def cmd_update(args: argparse.Namespace) -> int:
         except Exception:
             return 0
 
+        manifest_files: list[str] = manifest.get("files", [])
         manifest_mtime = manifest_path.stat().st_mtime
+
+        # ── 1. Detect deleted files ──────────────────────────────────────────
+        deleted: list[str] = []
         changed: list[str] = []
-        for file_path in manifest.get("files", []):
+        for file_path in manifest_files:
             p = Path(file_path)
-            if p.exists() and p.stat().st_mtime > manifest_mtime:
+            if not p.exists():
+                deleted.append(str(p))
+            elif p.stat().st_mtime > manifest_mtime:
                 changed.append(str(p))
 
-        if not changed:
-            return 0
+        # ── 2. Clean up deleted files from DB ────────────────────────────────
+        if deleted:
+            from graphsift.adapters.storage import GraphStore
+            store = GraphStore(_db_path_for_root(str(root)))
+            for fp in deleted:
+                try:
+                    store.delete_file_completely(fp)
+                except Exception:
+                    pass
+            logger.info("graphsift: purged %d deleted files from graph DB", len(deleted))
 
-        from graphsift.adapters.filesystem import load_changed_files
-        from graphsift.core import ContextBuilder
-        from graphsift.models import ContextConfig
-
-        new_sources = load_changed_files(changed)
-        builder = ContextBuilder(ContextConfig())
-        for path, source in new_sources.items():
+        # ── 3. Auto-scan for stale source-code references ────────────────────
+        if deleted and _should_auto_scan(str(root), len(deleted), len(manifest_files)):
             try:
-                builder.index_file(path, source)
+                from graphsift.cleanup import StaleRefScanner
+                from graphsift.adapters.filesystem import load_source_map
+                source_map = load_source_map(str(root))
+                scanner = StaleRefScanner(project_root=str(root))
+                report = scanner.scan_after_deletion(deleted, source_map=source_map)
+                if report.findings:
+                    high = report.by_severity.get("HIGH", 0)
+                    med = report.by_severity.get("MEDIUM", 0)
+                    logger.warning(
+                        "graphsift: %d deleted file(s) have %d stale reference(s) "
+                        "(%d HIGH, %d MEDIUM) in remaining source code. "
+                        "Run 'graphsift prune-refs' to inspect or '--fix' to clean up.",
+                        len(deleted), report.total, high, med,
+                    )
             except Exception:
                 pass
 
-        manifest["files_updated"] = changed
-        SafeFileIO.write_json(manifest_path, manifest)
+        # ── 4. Update changed files ──────────────────────────────────────────
+        if changed:
+            from graphsift.adapters.filesystem import load_changed_files
+            from graphsift.core import ContextBuilder
+            from graphsift.models import ContextConfig
+
+            new_sources = load_changed_files(changed)
+            builder = ContextBuilder(ContextConfig())
+            for path, source in new_sources.items():
+                try:
+                    builder.index_file(path, source)
+                except Exception:
+                    pass
+
+        # ── 4. Update manifest ───────────────────────────────────────────────
+        if deleted or changed:
+            manifest["files"] = [f for f in manifest_files if f not in deleted]
+            if changed:
+                manifest["files_updated"] = changed
+            if deleted:
+                manifest["files_deleted"] = deleted
+            SafeFileIO.write_json(manifest_path, manifest)
     except Exception:
         pass
     return 0
@@ -1478,6 +1591,112 @@ def cmd_detect_dead_code(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# prune-refs command  (post-deletion reference cleanup)
+# ---------------------------------------------------------------------------
+
+def cmd_prune_refs(args: argparse.Namespace) -> int:
+    """Scan for stale references to deleted files and optionally auto-fix.
+
+    Detects import statements, symbol references, and string path references
+    in remaining source files that point to deleted components.
+
+    Use --fix to auto-remove stale import lines (creates .bak backups).
+    """
+    project_root = Path(getattr(args, 'project_root', os.getcwd())).resolve()
+    deleted_paths = getattr(args, 'paths', None)
+    fix = getattr(args, 'fix', False)
+
+    try:
+        from graphsift.cleanup import StaleRefScanner  # noqa: PLC0415
+    except ImportError:
+        print("[graphsift] cleanup module not available. Run: pip install graphsift")
+        return 1
+
+    from graphsift.adapters.filesystem import load_source_map  # noqa: PLC0415
+
+    # If no paths given, detect deletions from manifest
+    if not deleted_paths:
+        manifest_path = project_root / ".graphsift" / "manifest.json"
+        if manifest_path.exists():
+            try:
+                from graphsift.read_cache import SafeFileIO  # noqa: PLC0415
+                manifest = SafeFileIO.read_json(manifest_path)
+                manifest_files = manifest.get("files", [])
+                deleted_paths = [
+                    f for f in manifest_files
+                    if not Path(f).exists()
+                ]
+                if not deleted_paths:
+                    print("[graphsift] No deleted files found in manifest.")
+                    return 0
+            except Exception:
+                print("[graphsift] Could not read manifest.")
+                return 1
+        else:
+            print("[graphsift] No manifest found and no paths given.")
+            print("  Usage: graphsift prune-refs [paths...] [--fix]")
+            return 1
+
+    # Scan
+    source_map = load_source_map(str(project_root))
+    scanner = StaleRefScanner(project_root=str(project_root))
+    report = scanner.scan_after_deletion(deleted_paths, source_map=source_map)
+
+    # Print report
+    if not report.findings:
+        print(f"[graphsift] No stale references found for {len(deleted_paths)} deleted file(s).")
+        return 0
+
+    _safe_print(f"\n  {'='*60}")
+    _safe_print(f"  Stale Reference Report - {len(deleted_paths)} deleted file(s)")
+    _safe_print(f"  {'='*60}")
+    _safe_print(f"  Total findings: {report.total}")
+    _safe_print(f"  By severity    : {report.by_severity.get('HIGH', 0)} HIGH, "
+                f"{report.by_severity.get('MEDIUM', 0)} MEDIUM, "
+                f"{report.by_severity.get('LOW', 0)} LOW")
+    _safe_print(f"  By kind        : {report.by_kind}")
+    _safe_print(f"  Auto-fixable   : {report.auto_fixable}")
+    _safe_print(f"  {'='*60}\n")
+
+    for severity in ("HIGH", "MEDIUM", "LOW"):
+        group = [f for f in report.findings if f.severity == severity]
+        if not group:
+            continue
+        _safe_print(f"  [{severity}] - {len(group)} finding(s)")
+        _safe_print()
+        for f in group[:20]:  # Show first 20
+            _safe_print(f"    {f.file_path}:{f.line_number}")
+            _safe_print(f"      {f.line_text.strip()}")
+            if f.suggested_fix:
+                _safe_print(f"      ==> {f.suggested_fix}")
+            _safe_print()
+        if len(group) > 20:
+            _safe_print(f"    ... and {len(group) - 20} more")
+            _safe_print()
+        _safe_print()
+
+    # Apply fixes if requested
+    if fix:
+        _safe_print("  Applying fixes...")
+        result = scanner.apply_fixes(report, dry_run=False)
+        _safe_print(f"  Files modified : {result.get('files_modified', 0)}")
+        _safe_print(f"  Lines removed  : {result.get('lines_removed', 0)}")
+        if result.get("files_backed_up"):
+            _safe_print(f"  Backups created: {len(result['files_backed_up'])}")
+        if result.get("errors"):
+            _safe_print(f"  Errors         : {len(result['errors'])}")
+            for e in result["errors"][:5]:
+                _safe_print(f"    - {e}")
+    else:
+        fixable = sum(1 for f in report.findings if f.suggested_fix)
+        if fixable:
+            _safe_print(f"  Tip: {fixable} finding(s) are auto-fixable. Run with --fix to apply.")
+        _safe_print()
+
+    return 1 if report.total > 0 else 0
+
+
+# ---------------------------------------------------------------------------
 # terse command  (inline terse mode prefix)
 # ---------------------------------------------------------------------------
 
@@ -2361,6 +2580,16 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Minimum confidence threshold 0-1 (default 0.0)")
     p_suggest.set_defaults(func=cmd_suggest_fixes)
 
+    # prune-refs
+    p_prune = sub.add_parser(
+        "prune-refs",
+        help="Scan for stale references to deleted files and optionally auto-fix",
+    )
+    p_prune.add_argument("--project-root", default=_cwd(), help="Repository root path (default: cwd)")
+    p_prune.add_argument("--fix", action="store_true", help="Auto-remove stale import lines (creates .bak backups)")
+    p_prune.add_argument("paths", nargs="*", metavar="PATH", help="Deleted file paths to scan (default: auto-detect from manifest)")
+    p_prune.set_defaults(func=cmd_prune_refs)
+
     # terse
     p_terse = sub.add_parser("terse", help="Return a terse mode prefix for LLM prompts")
     p_terse.add_argument("--level", choices=["lite", "full", "ultra"], default="lite",
@@ -2646,6 +2875,7 @@ def main() -> None:
         "detect-cycles": cmd_detect_cycles,
         "detect-dead-code": cmd_detect_dead_code,
         "suggest-fixes": cmd_suggest_fixes,
+        "prune-refs": cmd_prune_refs,
         "terse": cmd_terse,
         "fix": cmd_fix,
         "add": cmd_add,
