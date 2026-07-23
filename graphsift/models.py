@@ -123,7 +123,7 @@ class PruningStrategy(str, Enum):
 class GraphNode(BaseModel):
     """A symbol in the codebase dependency graph."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     node_id: str = Field(description="Unique identifier: file::symbol_path")
     file_path: str
@@ -152,7 +152,7 @@ class GraphNode(BaseModel):
 class GraphEdge(BaseModel):
     """A directed dependency between two nodes."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     source_id: str
     target_id: str
@@ -173,7 +173,7 @@ class GraphEdge(BaseModel):
 class FileNode(BaseModel):
     """Represents an indexed source file."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     path: str
     language: Language
@@ -194,7 +194,7 @@ class FileNode(BaseModel):
 class ScoredFile(BaseModel):
     """A file with its relevance score for a given query/diff."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     file_node: FileNode
     score: float = Field(ge=0.0, le=1.0, description="Relevance score 0=irrelevant, 1=critical")

@@ -233,7 +233,7 @@ class CommunityDetector:
             if len(member_idxs) < self.min_community_size:
                 continue
 
-            member_paths = [file_paths[i] for i in member_idxs]
+            member_paths = sorted(file_paths[i] for i in member_idxs)
             # Dominant language
             lang_counts: dict[str, int] = defaultdict(int)
             for p in member_paths:

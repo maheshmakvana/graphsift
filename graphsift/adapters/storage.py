@@ -45,7 +45,7 @@ from ..pool import DatabasePool
 
 logger = logging.getLogger(__name__)
 
-_CURRENT_VERSION = 9
+_CURRENT_VERSION = 10
 
 # Schema version table for tracking model schema versions
 _SCHEMA_VERSION_SQL = (
@@ -255,6 +255,16 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 "    version INTEGER NOT NULL DEFAULT 1"
                 ")"
             ),
+        ],
+    ),
+    (
+        10,
+        "add covering index for FTS5 search performance",
+        [
+            """
+            CREATE INDEX IF NOT EXISTS idx_nodes_fts_covering
+            ON nodes(node_id, name, qualified_name, file_path)
+            """,
         ],
     ),
 ]
@@ -477,6 +487,7 @@ class GraphStore:
         with self._lock:
             conn = self._pool.acquire()
             try:
+                conn.execute("BEGIN")
                 conn.executemany(
                     """
                     INSERT INTO nodes
@@ -519,7 +530,10 @@ class GraphStore:
                         for n in nodes
                     ],
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             finally:
                 self._pool.release(conn)
 
@@ -627,6 +641,7 @@ class GraphStore:
         with self._lock:
             conn = self._pool.acquire()
             try:
+                conn.execute("BEGIN")
                 conn.executemany(
                     """
                     INSERT INTO edges (source_id, target_id, kind, weight, metadata)
@@ -646,7 +661,10 @@ class GraphStore:
                         for e in edges
                     ],
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             finally:
                 self._pool.release(conn)
 
@@ -686,6 +704,7 @@ class GraphStore:
         with self._lock:
             conn = self._pool.acquire()
             try:
+                conn.execute("BEGIN")
                 conn.executemany(
                     """
                     INSERT INTO files
@@ -717,7 +736,10 @@ class GraphStore:
                         for f in files
                     ],
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             finally:
                 self._pool.release(conn)
 
@@ -1407,6 +1429,15 @@ class GraphStore:
     def close(self) -> None:
         """Close the underlying database pool."""
         self._pool.close()
+        # Run final PRAGMA optimize on a fresh connection after pool shutdown
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute("PRAGMA optimize")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
 
     def __enter__(self) -> "GraphStore":
         return self

@@ -230,6 +230,8 @@ class DatabasePool:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA mmap_size=268435456")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     @staticmethod
@@ -286,6 +288,10 @@ class DatabasePool:
 
         for conn in in_use.values():
             try:
+                try:
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.Error:
+                    pass
                 conn.close()
             except sqlite3.Error:
                 pass
@@ -295,6 +301,10 @@ class DatabasePool:
             try:
                 conn = self._available.get_nowait()
                 try:
+                    try:
+                        conn.execute("PRAGMA optimize")
+                    except sqlite3.Error:
+                        pass
                     conn.close()
                 except sqlite3.Error:
                     pass
@@ -304,6 +314,10 @@ class DatabasePool:
         # Close any remaining tracked connections
         for conn in all_conns:
             try:
+                try:
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.Error:
+                    pass
                 conn.close()
             except sqlite3.Error:
                 pass

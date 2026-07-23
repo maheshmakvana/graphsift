@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import logging
@@ -483,48 +484,53 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     t_parse_start = time.monotonic()
 
-    if _HAS_TQDM:
-        pbar = tqdm(all_paths, desc="        Parsing", unit="files", ncols=80)
-        for path in pbar:
-            if path not in source_map:
-                unchanged += 1
-                continue
-            try:
-                builder.index_file(path, source_map[path])
-                changed += 1
-            except Exception:
-                skipped += 1
-        pbar.close()
-    else:
-        for i, path in enumerate(all_paths, 1):
-            if path not in source_map:
-                unchanged += 1
-                continue
-            try:
-                builder.index_file(path, source_map[path])
-                changed += 1
-            except Exception:
-                skipped += 1
-            if progress_interval > 0 and i % progress_interval == 0:
+    # Disable GC during hot parse loop — objects are short-lived; let OS reclaim
+    gc.disable()
+    try:
+        if _HAS_TQDM:
+            pbar = tqdm(all_paths, desc="        Parsing", unit="files", ncols=80)
+            for path in pbar:
+                if path not in source_map:
+                    unchanged += 1
+                    continue
+                try:
+                    builder.index_file(path, source_map[path])
+                    changed += 1
+                except Exception:
+                    skipped += 1
+            pbar.close()
+        else:
+            for i, path in enumerate(all_paths, 1):
+                if path not in source_map:
+                    unchanged += 1
+                    continue
+                try:
+                    builder.index_file(path, source_map[path])
+                    changed += 1
+                except Exception:
+                    skipped += 1
+                if progress_interval > 0 and i % progress_interval == 0:
+                    elapsed = time.monotonic() - t_parse_start
+                    rate = i / elapsed if elapsed > 0 else 0
+                    remaining = (total_files - i) / rate if rate > 0 else 0
+                    pct = i * 100 // total_files
+                    bar_len = 20
+                    filled = int(bar_len * i / total_files)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    print(f"        [{bar}] {pct:>3}% | Processing file {i:>6}/{total_files} | ETA: {remaining:>5.0f}s")
+
+            if total_files == 0 or total_files % progress_interval != 0:
                 elapsed = time.monotonic() - t_parse_start
-                rate = i / elapsed if elapsed > 0 else 0
-                remaining = (total_files - i) / rate if rate > 0 else 0
-                pct = i * 100 // total_files
+                rate = total_files / elapsed if elapsed > 0 else 0
                 bar_len = 20
-                filled = int(bar_len * i / total_files)
-                bar = "█" * filled + "░" * (bar_len - filled)
-                print(f"        [{bar}] {pct:>3}% | Processing file {i:>6}/{total_files} | ETA: {remaining:>5.0f}s")
+                bar = "█" * bar_len
+                print(f"        [{bar}] 100% | Processing file {total_files:>6}/{total_files} | {rate:.0f} files/s")
 
-        if total_files == 0 or total_files % progress_interval != 0:
-            elapsed = time.monotonic() - t_parse_start
-            rate = total_files / elapsed if elapsed > 0 else 0
-            bar_len = 20
-            bar = "█" * bar_len
-            print(f"        [{bar}] 100% | Processing file {total_files:>6}/{total_files} | {rate:.0f} files/s")
-
-    parse_ms = (time.monotonic() - t_parse_start) * 1000
-    print(f"        done in {parse_ms:.0f} ms  ({skipped} failed, {unchanged} unchanged)")
-    print()
+        parse_ms = (time.monotonic() - t_parse_start) * 1000
+        print(f"        done in {parse_ms:.0f} ms  ({skipped} failed, {unchanged} unchanged)")
+        print()
+    finally:
+        gc.enable()
 
     # ── Step 4: Build final graph stats ──────────────────────────────────────
     print("  [4/5] Building dependency graph ...")
@@ -2914,6 +2920,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    gc.freeze()  # freeze pre-import objects — GC never rescans them
     parser = _build_parser()
     args = parser.parse_args()
 
