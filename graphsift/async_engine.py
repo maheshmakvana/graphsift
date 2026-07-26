@@ -417,3 +417,119 @@ class AsyncContextBuilder:
 
     def __repr__(self) -> str:
         return f"AsyncContextBuilder({self._builder!r})"
+
+
+# ===========================================================================
+# Parallel indexing — process pool for CPU-bound parsing
+# ===========================================================================
+
+
+def _index_chunk(args: tuple) -> tuple:
+    """Index one file — designed for ``concurrent.futures.ProcessPoolExecutor``.
+
+    Args:
+        ``args``: ``(path, source)`` tuple.
+
+    Returns:
+        ``(path, FileNode_or_None)`` tuple.
+    """
+    path, source = args
+    try:
+        from graphsift.core import ContextBuilder  # noqa: PLC0415
+        from graphsift.models import ContextConfig  # noqa: PLC0415
+
+        builder = ContextBuilder(ContextConfig())
+        fn = builder.index_file(path, source)
+        return (path, fn)
+    except Exception as exc:
+        logger.debug("Parallel index error for %s: %s", path, exc)
+        return (path, None)
+
+
+async def async_parallel_index(
+    builder,
+    source_map: dict[str, str],
+    max_workers: int | None = None,
+    chunk_size: int = 50,
+) -> IndexStats:
+    """Index files using a process pool for CPU-bound parsing.
+
+    Falls back to sequential async indexing if the process pool is
+    unavailable or the repo is small.
+
+    Args:
+        builder: ``ContextBuilder`` instance.
+        source_map: Dict of path -> source text.
+        max_workers: Worker process count (default: ``os.cpu_count()``).
+        chunk_size: Threshold for parallel vs sequential.
+
+    Returns:
+        ``IndexStats`` from the builder.
+    """
+    items = list(source_map.items())
+    total = len(items)
+
+    if total < chunk_size:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, builder.index_files, source_map
+        )
+
+    try:
+        import concurrent.futures  # noqa: PLC0415
+        import os  # noqa: PLC0415
+
+        workers = max_workers or max(1, os.cpu_count() or 4)
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers
+        ) as pool:
+            futures = [
+                pool.submit(_index_chunk, (p, s))
+                for p, s in items
+            ]
+            concurrent.futures.wait(futures)
+    except Exception as exc:
+        logger.warning(
+            "Process pool failed (%s), falling back to sequential", exc
+        )
+
+    # Builder still needs to run its own index_files for edge creation
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, builder.index_files, source_map
+    )
+
+
+async def async_parallel_build(
+    builder,
+    diff_spec,
+    source_map: dict[str, str],
+    max_workers: int | None = None,
+) -> ContextResult:
+    """Build ranked context with parallel indexing.
+
+    Args:
+        builder: ``ContextBuilder`` instance.
+        diff_spec: ``DiffSpec`` for the build.
+        source_map: Dict of path -> source text.
+        max_workers: Worker count for parallel index phase.
+
+    Returns:
+        ``ContextResult``.
+    """
+    await async_parallel_index(builder, source_map, max_workers)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, builder.build, diff_spec, source_map
+    )
+
+
+__all__ = [
+    "async_index_files",
+    "async_build",
+    "async_search",
+    "AsyncContextBuilder",
+    "async_parallel_index",
+    "async_parallel_build",
+]

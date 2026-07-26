@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_EXTENSIONS = {
@@ -26,9 +28,10 @@ _DEFAULT_EXTENSIONS = {
 }
 
 _DEFAULT_EXCLUDES = {
-    "venv", ".venv", "node_modules", "dist", "build",
-    "__pycache__", ".git", ".tox", ".mypy_cache",
-    ".pytest_cache", "*.egg-info",
+    # Non-dot dependency dirs (dot dirs like .next, .git are auto-skipped)
+    "node_modules", "vendor", "Pods", "bower_components", "jspm_packages",
+    "dist", "build", "target", "out", "cdk.out",
+    "__pycache__", "*.egg-info", "coverage", "htmlcov",
 }
 
 
@@ -59,7 +62,10 @@ def load_source_map(
     for path in root_path.rglob("*"):
         if not path.is_file():
             continue
-        # Skip excluded directories
+        # Skip hidden directories (.*) — they are tooling/build output, never source
+        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
+            continue
+        # Skip explicitly excluded directories
         if any(part in excl for part in path.parts):
             continue
         if path.suffix.lower() not in exts:
@@ -68,7 +74,7 @@ def load_source_map(
             logger.debug("graphsift: skipping large file %s", path)
             continue
         try:
-            source_map[str(path)] = path.read_text(encoding=encoding, errors="replace")
+            source_map[str(path)] = SafeFileIO.read(path, encoding=encoding)
         except OSError as exc:
             logger.warning(
                 "graphsift: could not read file",
@@ -105,6 +111,9 @@ def walk_repo(
     for path in root_path.rglob("*"):
         if not path.is_file():
             continue
+        # Skip hidden directories (.*) — they are tooling/build output, never source
+        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
+            continue
         if any(part in excl for part in path.parts):
             continue
         if path.suffix.lower() in exts:
@@ -129,7 +138,7 @@ def load_changed_files(
     result: dict[str, str] = {}
     for p in changed_paths:
         try:
-            result[p] = Path(p).read_text(encoding=encoding, errors="replace")
+            result[p] = SafeFileIO.read(Path(p), encoding=encoding)
         except OSError as exc:
             logger.warning(
                 "graphsift: could not read changed file",

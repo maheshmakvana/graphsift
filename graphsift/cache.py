@@ -8,7 +8,7 @@ Usage::
 
     from graphsift.cache import ASTCache
 
-    cache = ASTCache(max_memory=500, db_path="/tmp/ast_cache.db")
+    cache = ASTCache(max_memory=500, db_path=str(Path(tempfile.gettempdir()) / "ast_cache.db"))
     cached = cache.get("sha256hex")      # FileNode or None
     cache.set("sha256hex", file_node)
     cache.invalidate("src/*.py")        # glob-style pattern
@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import json
 import logging
 import sqlite3
@@ -135,7 +136,7 @@ class ASTCache:
 
     Typical usage for the ``ContextBuilder`` pipeline::
 
-        cache = ASTCache(max_memory=500, db_path="/tmp/ast_cache.db")
+        cache = ASTCache(max_memory=500, db_path=str(Path(tempfile.gettempdir()) / "ast_cache.db"))
 
         # During indexing
         fn = cache.get(file_sha256)
@@ -171,6 +172,7 @@ class ASTCache:
         self._hits_disk = 0
         self._misses = 0
         self._evictions = 0
+        self._warmed_count = 0
 
         # Disk cache
         self._db_path: str | None = db_path if db_path else None
@@ -330,6 +332,88 @@ class ASTCache:
                 logger.warning("graphsift: ASTCache disk clear error: %s", exc)
 
     # ------------------------------------------------------------------
+    # Cache warming (v2.4+)
+    # ------------------------------------------------------------------
+
+    def warm(self, keys: list[str]) -> int:
+        """Pre-load entries from disk into memory cache.
+
+        Useful after a build to warm cache for likely queries.
+
+        Args:
+            keys: Cache keys to warm (typically SHA-256 hashes).
+
+        Returns:
+            Number of entries warmed.
+        """
+        warmed = 0
+        for key in keys:
+            if key in self._mem_store:
+                continue
+            if self._disk_conn is not None:
+                try:
+                    row = self._disk_conn.execute(
+                        "SELECT value_json FROM ast_cache WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    if row is not None:
+                        data = json.loads(row[0])
+                        fn = _dict_to_file_node(data)
+                        if fn is not None:
+                            self.set(key, fn)
+                            warmed += 1
+                            with self._lock:
+                                self._warmed_count += 1
+                except sqlite3.Error as exc:
+                    logger.debug("Cache warm error for %s: %s", key, exc)
+        return warmed
+
+    def warm_from_paths(self, paths: list[str]) -> int:
+        """Compute keys from file paths and warm cache.
+
+        Args:
+            paths: File paths to hash and warm.
+
+        Returns:
+            Number of entries warmed.
+        """
+        keys = []
+        for path in paths:
+            try:
+                p = Path(path)
+                if p.exists():
+                    content = p.read_bytes()
+                    key = hashlib.sha256(content).hexdigest()
+                    keys.append(key)
+            except Exception:
+                pass
+        return self.warm(keys)
+
+    def predictive_warm(
+        self, seed_paths: list[str], graph: object
+    ) -> int:
+        """Warm cache with files likely needed based on graph proximity.
+
+        Uses the dependency graph's ``ranked_neighbors`` to find related
+        files and pre-loads them into memory cache.
+
+        Args:
+            seed_paths: Starting file paths.
+            graph: DependencyGraph with ``ranked_neighbors`` method.
+
+        Returns:
+            Number of entries warmed.
+        """
+        try:
+            if hasattr(graph, "ranked_neighbors"):
+                neighbors = graph.ranked_neighbors(seed_paths=seed_paths)
+                related = list(neighbors.keys())[:50]
+                return self.warm_from_paths(related)
+        except Exception as exc:
+            logger.debug("Predictive warm error: %s", exc)
+        return 0
+
+    # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
 
@@ -348,6 +432,7 @@ class ASTCache:
                 "hit_rate": round(
                     (self._hits_mem + self._hits_disk) / max(total, 1), 4
                 ),
+                "warmed_entries": self._warmed_count,
             }
 
     def close(self) -> None:

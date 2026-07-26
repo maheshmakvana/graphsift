@@ -1,7 +1,7 @@
 # Security Policy
 
-> **graphsift** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
-> Save Claude tokens, reduce LLM costs. 80-150x token reduction, zero telemetry.
+> **graphsift v3.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> Save Claude tokens, reduce LLM costs. 80-150x token reduction, zero telemetry, 5 security layers.
 
 ## Local-First, Zero-Exfiltration Design
 

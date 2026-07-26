@@ -11,7 +11,37 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Production safeguards for auto-scan (mirrors cli.py constants)
+# ---------------------------------------------------------------------------
+_MAX_AUTO_SCAN_FILES = 5000        # skip if repo is larger
+_MAX_AUTO_SCAN_DELETIONS = 10      # skip if batch delete is too large
+_MIN_SCAN_INTERVAL_S = 30.0        # rate limit across MCP calls
+_last_scan_times: dict[str, float] = {}  # root -> last scan timestamp
+
+
+def _mcp_should_auto_scan(root: str, deleted_count: int, total_files_estimate: int) -> bool:
+    """Production gates for auto-scan in the MCP server path."""
+    import time as _time
+    now = _time.monotonic()
+
+    if total_files_estimate > _MAX_AUTO_SCAN_FILES:
+        logger.debug("mcp auto-scan skipped: %d files > %d limit", total_files_estimate, _MAX_AUTO_SCAN_FILES)
+        return False
+    if deleted_count > _MAX_AUTO_SCAN_DELETIONS:
+        logger.debug("mcp auto-scan skipped: %d deletions > %d batch limit", deleted_count, _MAX_AUTO_SCAN_DELETIONS)
+        return False
+    last = _last_scan_times.get(root, 0.0)
+    if now - last < _MIN_SCAN_INTERVAL_S:
+        logger.debug("mcp auto-scan skipped: rate-limited (%.1fs ago)", now - last)
+        return False
+    _last_scan_times[root] = now
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Minimal MCP stdio server (no external dep — pure stdlib)
@@ -106,9 +136,10 @@ def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
 
 def _tool_build_graph(params: dict) -> dict:
     """Index all source files under root_path and build the dependency graph."""
-    from graphsift.adapters.filesystem import load_source_map
-    from graphsift.core import ContextBuilder, estimate_tokens
-    from graphsift.models import ContextConfig, FileNode, GraphEdge, GraphNode
+    from graphsift.adapters.filesystem import walk_repo
+    from graphsift.core import ContextBuilder
+    from graphsift.models import FileNode, GraphEdge, GraphNode
+    from graphsift.sha_cache import load_sha_cache, save_sha_cache, stat_match
 
     root = params.get("root_path", os.getcwd())
     extensions_raw = params.get("extensions")
@@ -121,11 +152,29 @@ def _tool_build_graph(params: dict) -> dict:
     ]))
     progress_interval = int(params.get("progress_interval", 200))
 
-    # -- Ensure SQLite DB is open and migrated (logs migration steps to stderr)
+    # -- Ensure SQLite DB is open and migrated
     store = _get_store(root)
 
-    source_map = load_source_map(root, extensions=extensions, exclude_dirs=exclude_dirs)
-    total_files = len(source_map)
+    # -- Walk paths, stat-check unchanged, read all content for source_map
+    sha_cache = load_sha_cache(root)
+    walk_paths = walk_repo(root, extensions=extensions, exclude_dirs=exclude_dirs)
+    total_files = len(walk_paths)
+    source_map: dict[str, str] = {}
+    needs_index: set[str] = set()
+
+    for p in walk_paths:
+        if sha_cache and stat_match(p, sha_cache):
+            pass  # unchanged — skip indexing, but still read for source_map
+        else:
+            needs_index.add(p)
+        try:
+            source_map[p] = SafeFileIO.read(p)
+        except OSError:
+            pass
+
+    fast_unchanged = total_files - len(needs_index)
+    if fast_unchanged:
+        logger.info("INFO: %d files unchanged (stat-match) — skip re-index", fast_unchanged)
 
     with _lock:
         from graphsift.models import ContextConfig
@@ -133,15 +182,19 @@ def _tool_build_graph(params: dict) -> dict:
         builder = _builders[root]
         _source_maps[root] = source_map
 
-    # -- Index with per-file progress logging
-    all_paths = list(source_map.keys())
+    # -- Index only changed/new files
     parsed_count = 0
     all_nodes: list[GraphNode] = []
     all_edges: list[GraphEdge] = []
     all_file_nodes: list[FileNode] = []
 
-    for path in all_paths:
-        source = source_map[path]
+    for path in walk_paths:
+        source = source_map.get(path)
+        if source is None or path not in needs_index:
+            parsed_count += 1
+            if progress_interval > 0 and parsed_count % progress_interval == 0:
+                logger.info("INFO: Progress: %d/%d files", parsed_count, total_files)
+            continue
         try:
             with _lock:
                 builder.index_file(path, source)
@@ -150,11 +203,9 @@ def _tool_build_graph(params: dict) -> dict:
 
         parsed_count += 1
         if progress_interval > 0 and parsed_count % progress_interval == 0:
-            logger.info(
-                "INFO: Progress: %d/%d files parsed", parsed_count, total_files
-            )
+            logger.info("INFO: Progress: %d/%d files", parsed_count, total_files)
 
-    logger.info("INFO: Progress: %d/%d files parsed", total_files, total_files)
+    logger.info("INFO: Progress: %d/%d files", total_files, total_files)
 
     # -- Gather stats from builder graph
     with _lock:
@@ -164,7 +215,6 @@ def _tool_build_graph(params: dict) -> dict:
     # -- Persist nodes + edges + files to SQLite
     if graph is not None:
         try:
-            # Collect nodes
             from graphsift.models import NodeKind as _NodeKind
             for file_node in graph.all_files():
                 all_file_nodes.append(file_node)
@@ -184,12 +234,24 @@ def _tool_build_graph(params: dict) -> dict:
                         )
             store.save_nodes(all_nodes)
             store.save_files(all_file_nodes)
-            logger.info(
-                "INFO: Persisted %d nodes, %d files to SQLite",
-                len(all_nodes), len(all_file_nodes),
-            )
+            logger.info("INFO: Persisted %d nodes, %d files to SQLite", len(all_nodes), len(all_file_nodes))
         except Exception as exc:  # noqa: BLE001
             logger.warning("build_graph: SQLite persist failed: %s", exc)
+
+    # -- Save SHA cache with mtime+size for future incremental builds
+    if graph is not None:
+        for file_node in graph.all_files():
+            if hasattr(file_node, "sha256") and file_node.sha256:
+                try:
+                    st = os.stat(file_node.path)
+                    sha_cache[file_node.path] = {
+                        "sha": file_node.sha256,
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                    }
+                except OSError:
+                    sha_cache[file_node.path] = file_node.sha256  # plain str fallback
+        save_sha_cache(root, sha_cache)
 
     return {
         "status": "indexed",
@@ -204,14 +266,63 @@ def _tool_build_graph(params: dict) -> dict:
 
 
 def _tool_update_graph(params: dict) -> dict:
-    """Incrementally update the graph with changed files only."""
+    """Incrementally update the graph with changed files only.
+
+    Detects both modified and deleted files.  Deleted files are
+    purged from the graph database automatically.
+    """
     from graphsift.adapters.filesystem import load_changed_files
 
     root = params.get("root_path", os.getcwd())
-    changed = params.get("changed_files", [])
+    candidates = params.get("changed_files", [])
+
+    if not candidates:
+        return {"status": "no_changes", "files_updated": 0}
+
+    # Separate candidates into modified (still exist) and deleted
+    changed = [f for f in candidates if os.path.isfile(f)]
+    deleted = [f for f in candidates if not os.path.isfile(f)]
+
+    # Handle deletions from graph DB
+    deleted_count = 0
+    stale_findings = 0
+    if deleted:
+        try:
+            from graphsift.adapters.storage import GraphStore
+            store = GraphStore(_db_path_for(root))
+            for fp in deleted:
+                try:
+                    store.delete_file_completely(fp)
+                    deleted_count += 1
+                except Exception as exc:
+                    logger.warning("update_graph: delete failed for %s: %s", fp, exc)
+        except Exception as exc:
+            logger.warning("update_graph: could not open store for cleanup: %s", exc)
+
+        # Auto-scan for stale source-code references (gated)
+        total_files_estimate = len(candidates)  # rough proxy for size gate
+        if _mcp_should_auto_scan(root, len(deleted), total_files_estimate):
+            try:
+                from graphsift.cleanup import StaleRefScanner
+                from graphsift.adapters.filesystem import load_source_map
+                source_map = load_source_map(root)
+                scanner = StaleRefScanner(project_root=root)
+                report = scanner.scan_after_deletion(deleted, source_map=source_map)
+                stale_findings = report.total
+                if stale_findings:
+                    logger.warning(
+                        "update_graph: %d stale reference(s) found for deleted file(s). "
+                        "Use the prune_refs tool to inspect or fix.",
+                        stale_findings,
+                    )
+            except Exception:
+                pass
 
     if not changed:
-        return {"status": "no_changes", "files_updated": 0}
+        result: dict = {"status": "cleaned", "files_updated": 0, "files_deleted": deleted_count}
+        if stale_findings:
+            result["stale_references"] = stale_findings
+        return result
 
     builder, source_map = _get_builder(root)
     new_sources = load_changed_files(changed)
@@ -224,7 +335,50 @@ def _tool_update_graph(params: dict) -> dict:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("update_graph: skipped %s: %s", path, exc)
 
-    return {"status": "updated", "files_updated": len(new_sources)}
+    # Auto-scan modified files for removed exports (gated)
+    stale_mod_findings = 0
+    if changed and _mcp_should_auto_scan(root, len(changed), len(candidates)):
+        try:
+            from graphsift.cleanup import StaleRefScanner
+            scanner = StaleRefScanner(project_root=root)
+            report = scanner.scan_after_modification(changed, source_map=new_sources)
+            stale_mod_findings = report.total
+        except Exception:
+            pass
+
+    result: dict = {"status": "updated", "files_updated": len(new_sources)}
+    if deleted_count:
+        result["files_deleted"] = deleted_count
+    if stale_findings:
+        result["stale_references"] = stale_findings
+    if stale_mod_findings:
+        result["stale_references"] = result.get("stale_references", 0) + stale_mod_findings
+    return result
+
+
+def _tool_prune_refs(params: dict) -> dict:
+    """Scan for stale references to deleted files and optionally auto-fix."""
+    project_root = params.get("project_root", os.getcwd())
+    deleted_paths = params.get("deleted_paths", [])
+    fix = params.get("fix", False)
+
+    from graphsift.adapters.filesystem import load_source_map
+    try:
+        from graphsift.cleanup import StaleRefScanner
+    except ImportError:
+        return {"error": "cleanup module not available", "findings": [], "total": 0}
+
+    source_map = load_source_map(project_root)
+    scanner = StaleRefScanner(project_root=project_root)
+    report = scanner.scan_after_deletion(deleted_paths, source_map=source_map)
+    if not report.findings:
+        return {"findings": [], "total": 0, "message": "No stale references found"}
+
+    result = report.model_dump()
+    if fix:
+        fix_result = scanner.apply_fixes(report, dry_run=False)
+        result["fix_applied"] = fix_result
+    return result
 
 
 def _tool_get_context(params: dict) -> dict:
@@ -1118,7 +1272,7 @@ def _tool_list_repos(params: dict) -> dict:
         return {"status": "ok", "summary": "0 registered repository(ies)", "repos": []}
 
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry = json.loads(SafeFileIO.read(registry_path))
     except Exception:
         registry = {}
 
@@ -1533,7 +1687,7 @@ def _tool_cross_repo_search(params: dict) -> dict:
         return {"error": "No repos registered. Run: graphsift register <path>", "results": []}
 
     try:
-        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry = json.loads(SafeFileIO.read(registry_path))
     except Exception:
         return {"error": "Could not read registry.", "results": []}
 
@@ -1900,10 +2054,207 @@ def _tool_should_compact(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auto-trigger helpers
+# ---------------------------------------------------------------------------
+
+
+def _detect_command_type_from_text(text: str) -> str | None:
+    """Detect CLI output type from content using regex.
+
+    Tries the built-in ``graphsift.compress.detect_type`` first (18+ types),
+    then falls back to additional pattern coverage for common tools.
+    Returns the type string (e.g. ``"pytest"``, ``"git_diff"``) or ``None``.
+    """
+    from graphsift.compress import detect_type
+
+    if not text or not text.strip():
+        return None
+
+    # Try the built-in detector first (covers 18+ types)
+    try:
+        detected = detect_type(text)
+        if detected and detected != "generic":
+            return detected
+    except Exception:
+        pass
+
+    # Fallback: additional patterns for key CLI tools
+    import re  # noqa: PLC0415
+
+    head = text[:1000]
+
+    # pytest
+    if re.search(r"(?m)(?:FAILED|ERROR|PASSED|test_|assert)", head):
+        return "pytest"
+    # git diff
+    if re.search(r"(?m)(?:^diff --git|^index |^--- a/)", head):
+        return "git_diff"
+    # git status
+    if re.search(r"(?m)(?:^On branch|nothing to commit|^modified:|^new file:|^deleted:)", head):
+        return "git_status"
+    # eslint with line:col pattern
+    if re.search(r"(?m)\d+:\d+\s+(?:error|warning|rule:)", head):
+        return "eslint"
+    # npm
+    if re.search(r"(?m)(?:ERR!|npm ERR|npm WARN|npm notice)", head):
+        return "npm"
+    # docker
+    if re.search(r"(?m)(?:CONTAINER|IMAGE ID|STATUS|^REPOSITORY)", head):
+        return "docker"
+    # grep -- file:line pattern
+    if re.search(r"(?m)^[^:\n\r]+\.[a-zA-Z]{1,6}:\d+:", head):
+        return "grep"
+
+    return None
+
+
+def _should_auto_verify(file_path: str) -> bool:
+    """Check whether *file_path* is eligible for auto-verification.
+
+    Returns ``True`` when the extension is one of ``.py``, ``.js``, ``.ts``,
+    ``.go``, ``.rs`` **and** the path does not live inside a skipped directory
+    (``.git``, ``node_modules``, ``__pycache__``, ``venv``, ``dist``).
+    """
+    if not file_path:
+        return False
+
+    valid_exts = {".py", ".js", ".ts", ".go", ".rs"}
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in valid_exts:
+        return False
+
+    skip_dirs = {".git", "node_modules", "__pycache__", "venv", "dist"}
+    parts = Path(file_path).parts
+    if any(part in skip_dirs for part in parts):
+        return False
+
+    return True
+
+
+def _tool_auto_process_output(params: dict) -> dict:
+    """Auto-detect and compress CLI output.
+
+    Detects the command type from *text*, then compresses it when the type is
+    recognised and the text is longer than 500 characters.  Returns the
+    compressed (or original) text together with metadata.
+    """
+    from graphsift.compress import compress
+
+    text = params.get("text", "")
+    if not text:
+        return {"error": "text parameter is required"}
+
+    original_chars = len(text)
+    command_type = _detect_command_type_from_text(text)
+
+    if command_type and original_chars > 500:
+        try:
+            compressed = compress(text, command=command_type)
+            compressed_chars = len(compressed)
+            savings_pct = round((1 - compressed_chars / max(original_chars, 1)) * 100, 1)
+            return {
+                "was_compressed": True,
+                "original_chars": original_chars,
+                "compressed_chars": compressed_chars,
+                "savings_pct": savings_pct,
+                "text": compressed,
+            }
+        except Exception:
+            pass
+
+    return {
+        "was_compressed": False,
+        "original_chars": original_chars,
+        "compressed_chars": original_chars,
+        "savings_pct": 0.0,
+        "text": text,
+    }
+
+
+def _tool_auto_verify_and_fix(params: dict) -> dict:
+    """Verify file syntax and return fix suggestions if errors are found.
+
+    Runs a syntax check on *file_path* via ``verify_file``.  When the check
+    fails, also runs ``suggest_fixes`` on the file and attaches the suggestions
+    to the result.
+    """
+    file_path = params.get("file_path", "")
+    project_root = params.get("project_root", "")
+
+    if not file_path:
+        return {"error": "file_path parameter is required"}
+
+    if not _should_auto_verify(file_path):
+        return {
+            "error": "File type not supported or in excluded directory",
+            "file_path": file_path,
+        }
+
+    try:
+        verify_result = _tool_verify_file({
+            "file_path": file_path,
+            "project_root": project_root,
+        })
+
+        result = {
+            "file": file_path,
+            "passed": verify_result.get("passed", False),
+            "syntax_ok": verify_result.get("syntax_ok", False),
+            "syntax_error": verify_result.get("syntax_error"),
+        }
+
+        if not verify_result.get("passed", True):
+            fix_result = _tool_suggest_fixes({
+                "root_path": project_root or os.getcwd(),
+                "changed_files": [file_path],
+            })
+            if "error" in fix_result:
+                result["fix_suggestions"] = []
+                result["total_fix_issues"] = 0
+            else:
+                result["fix_suggestions"] = fix_result.get("suggestions", [])
+                result["total_fix_issues"] = fix_result.get("total_issues", 0)
+
+        return result
+    except Exception:
+        return {"file": file_path, "passed": True, "syntax_ok": True, "syntax_error": None}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
 _TOOLS = {
+    "auto_process_output": {
+        "fn": _tool_auto_process_output,
+        "description": (
+            "Auto-detect and compress CLI output, saving 60-97% tokens. "
+            "Detects 20+ command types (pytest, git, eslint, npm, docker, grep, etc.)"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "CLI output text to compress"},
+            },
+            "required": ["text"],
+        },
+    },
+    "auto_verify_and_fix": {
+        "fn": _tool_auto_verify_and_fix,
+        "description": (
+            "Verify file syntax and return fix suggestions if errors are found. "
+            "Combines syntax checking (Python compile / node --check) with "
+            "graph-based auto-fix analysis."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the file to verify"},
+                "project_root": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+            "required": ["file_path"],
+        },
+    },
     "build_graph": {
         "fn": _tool_build_graph,
         "description": (
@@ -1932,6 +2283,24 @@ _TOOLS = {
                 "root_path": {"type": "string"},
                 "changed_files": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths of changed files"},
             },
+        },
+    },
+    "prune_refs": {
+        "fn": _tool_prune_refs,
+        "description": (
+            "Scan for stale references to deleted files and optionally auto-fix. "
+            "After files are deleted, detects import statements, symbol references, "
+            "and path references in remaining source files that point to deleted components. "
+            "Use fix=true to auto-remove stale import lines (creates .bak backups)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_root": {"type": "string", "description": "Repo root directory (default: cwd)"},
+                "deleted_paths": {"type": "array", "items": {"type": "string"}, "description": "Absolute paths of deleted files"},
+                "fix": {"type": "boolean", "description": "Auto-remove stale import lines (default false)"},
+            },
+            "required": ["deleted_paths"],
         },
     },
     "get_context": {

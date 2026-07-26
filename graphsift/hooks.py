@@ -81,6 +81,45 @@ def wrap_command(command: str, ultra: bool = False) -> str:
     )
 
 
+def compress_bash_hook() -> str:
+    """PostToolUse hook for Bash: compress stdout and record analytics.
+
+    Called by Claude Code PostToolUse hook after every Bash command.
+    Reads original output from stdin, compresses it, records token savings,
+    and writes the compressed output back to stdout.  **Never raises.**
+
+    Usage:
+        python -m graphsift.hooks compress-bash-hook
+    """
+    try:
+        import sys
+        from graphsift.compress import compress
+        from graphsift.analytics import record_call
+
+        text = sys.stdin.read()
+        if not text:
+            return ""
+
+        if len(text) > 200:
+            compressed = compress(text)
+            tokens_saved = (len(text) - len(compressed)) // 4
+            if tokens_saved > 0:
+                record_call(
+                    tokens_saved=tokens_saved,
+                    command_type="bash",
+                    original_chars=len(text),
+                    compressed_chars=len(compressed),
+                )
+            return compressed
+        return text
+    except Exception:
+        # Hook must never fail — if anything goes wrong,
+        # return the original text so no data is lost.
+        import sys
+
+        return sys.stdin.read() if hasattr(sys.stdin, "read") else ""
+
+
 def get_bash_wrapper_script(python_path: str = "python") -> str:
     """Return a bash script for transparent compression via shell functions.
 
@@ -181,10 +220,22 @@ def get_post_tool_use_config(project_root: str, python_path: str) -> dict:
             {
                 "type": "command",
                 "command": (
-                    f'{python_path} -c "from graphsift.analytics import '
-                    f"record_call; record_call(tokens_saved=30000, "
-                    f"command_type='bash')\""
+                    f'{python_path} -m graphsift.hooks compress-bash-hook'
                 ),
             }
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# CLI entry: python -m graphsift.hooks <command>
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "compress-bash-hook":
+        result = compress_bash_hook()
+        sys.stdout.write(result)
+    else:
+        print("Usage: python -m graphsift.hooks compress-bash-hook")

@@ -20,6 +20,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,9 +213,8 @@ class CommunityDetector:
                 if not neighbors:
                     continue
                 neighbor_labels = [label[j] for j in neighbors]
-                # Most common neighbor label
-                from collections import Counter
-                most_common = Counter(neighbor_labels).most_common(1)[0][0]
+                # Most common neighbor label (avoid Counter overhead in hot loop)
+                most_common = max(set(neighbor_labels), key=neighbor_labels.count)
                 if most_common != label[i]:
                     label[i] = most_common
                     changed = True
@@ -232,7 +233,7 @@ class CommunityDetector:
             if len(member_idxs) < self.min_community_size:
                 continue
 
-            member_paths = [file_paths[i] for i in member_idxs]
+            member_paths = sorted(file_paths[i] for i in member_idxs)
             # Dominant language
             lang_counts: dict[str, int] = defaultdict(int)
             for p in member_paths:
@@ -267,11 +268,14 @@ class CommunityDetector:
 
             # Assign community_id to nodes in these files
             try:
+                batch = []
                 for p in member_paths:
                     fn = file_nodes[p]
                     for sym in fn.symbols:
                         nid = sym.node_id if hasattr(sym, "node_id") else f"{p}::{sym}"
-                        store.assign_community(nid, community_id)
+                        batch.append((nid, community_id))
+                if batch:
+                    store.assign_communities_bulk(batch)
             except Exception as exc:
                 logger.warning("CommunityDetector: assign_community failed: %s", exc)
 
@@ -336,6 +340,7 @@ class RiskScorer:
             nodes = dict(graph._nodes)
 
         results = []
+        risk_batch: list[tuple[str, float, list[str], dict[str, Any] | None]] = []
         for fp, fn in file_nodes.items():
             reasons: list[str] = []
 
@@ -372,10 +377,13 @@ class RiskScorer:
                 "reasons": reasons,
             })
 
-            try:
-                store.upsert_risk(fp, risk, reasons)
-            except Exception as exc:
-                logger.warning("RiskScorer: upsert_risk failed for %s: %s", fp, exc)
+            risk_batch.append((fp, risk, reasons, None))
+
+        # Bulk persist all risk scores in a single transaction
+        try:
+            store.upsert_risks_bulk(risk_batch)
+        except Exception as exc:
+            logger.warning("RiskScorer: bulk upsert failed: %s", exc)
 
         results.sort(key=lambda x: -x["risk_score"])
         logger.info("INFO: Risk scores computed: %d files", len(results))
@@ -429,14 +437,14 @@ class WikiGenerator:
             content = _render_wiki_page(comm, members, high_risk, key_symbols)
 
             if page_path.exists() and not force:
-                existing = page_path.read_text(encoding="utf-8")
+                existing = SafeFileIO.read(page_path)
                 if existing == content:
                     unchanged += 1
                     continue
-                page_path.write_text(content, encoding="utf-8")
+                SafeFileIO.write(page_path, content)
                 updated += 1
             else:
-                page_path.write_text(content, encoding="utf-8")
+                SafeFileIO.write(page_path, content)
                 generated += 1
 
         return {"pages_generated": generated, "pages_updated": updated, "pages_unchanged": unchanged}
@@ -455,7 +463,7 @@ class WikiGenerator:
         name_lower = community_name.lower()
         for page in self.output_dir.glob("*.md"):
             if name_lower in page.stem.lower():
-                return page.read_text(encoding="utf-8")
+                return SafeFileIO.read(page)
         return None
 
 
@@ -583,10 +591,10 @@ class RefactorEngine:
                 errors.append(f"File not found: {fp}")
                 continue
             try:
-                content = fp.read_text(encoding="utf-8")
+                content = SafeFileIO.read(fp)
                 new_content = content.replace(edit["old"], edit["new"])
                 if new_content != content:
-                    fp.write_text(new_content, encoding="utf-8")
+                    SafeFileIO.write(fp, new_content)
                     applied += 1
             except OSError as exc:
                 errors.append(f"Error writing {fp}: {exc}")
@@ -708,9 +716,7 @@ class Postprocessor:
         if fts:
             logger.info("INFO: Rebuilding FTS index ...")
             try:
-                store._conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
-                store._conn.commit()
-                row_count = store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+                row_count = store.rebuild_fts()
                 result["fts_indexed"] = row_count
                 logger.info("INFO: FTS index rebuilt: %d rows indexed", row_count)
             except Exception as exc:

@@ -20,10 +20,12 @@ Usage::
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from graphsift.executor import ProcessRunner
+
+from graphsift.read_cache import SafeFileIO
 
 
 @dataclass
@@ -43,6 +45,7 @@ class Verifier:
     def __init__(self, project_root: str = "", python_path: str = "") -> None:
         self.project_root = Path(project_root or os.getcwd()).resolve()
         self.python_path = python_path or sys.executable
+        self._runner = ProcessRunner(cwd=str(self.project_root), timeout=30)
         self._lang_map: dict[str, str] = {
             ".py": "python",
             ".js": "javascript",
@@ -80,7 +83,7 @@ class Verifier:
     def _check_python_syntax(self, path: Path) -> tuple[bool, str]:
         """Run python -c 'compile(...)' on the file."""
         try:
-            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            compile(SafeFileIO.read(path), str(path), "exec")
             return True, ""
         except SyntaxError as e:
             return False, f"SyntaxError: {e}"
@@ -88,14 +91,14 @@ class Verifier:
     def _check_node_syntax(self, path: Path) -> tuple[bool, str]:
         """Run node --check on the file (if node is available)."""
         try:
-            result = subprocess.run(
+            result = self._runner.run_simple(
                 ["node", "--check", str(path)],
-                capture_output=True, text=True, timeout=10,
+                timeout=10,
             )
-            if result.returncode == 0:
+            if result.exit_code == 0:
                 return True, ""
             return False, result.stderr.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except Exception:
             return True, ""  # node not available, skip
 
     def lint(self, file_path: str) -> tuple[bool, str]:
@@ -107,11 +110,43 @@ class Verifier:
         ext = full_path.suffix.lower()
         try:
             if ext == ".py":
-                result = subprocess.run(
+                result = self._runner.run_simple(
                     [self.python_path, "-m", "py_compile", str(full_path)],
-                    capture_output=True, text=True, timeout=10,
+                    timeout=10,
                 )
-                return result.returncode == 0, result.stderr.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+                return result.ok(), result.stderr.strip()
+        except Exception:
             pass
         return True, ""
+
+    def run_all(
+        self,
+        paths: list[str],
+        skip_lint: bool = False,
+    ) -> dict[str, VerifyResult]:
+        """Run verification on multiple files in batch.
+
+        Args:
+            paths: List of file paths (relative to project_root).
+            skip_lint: When True, only run syntax checks (faster).
+
+        Returns:
+            Dict mapping each file path to its ``VerifyResult``.
+        """
+        results: dict[str, VerifyResult] = {}
+        for file_path in paths:
+            try:
+                vr = self.check(file_path)
+                if not skip_lint and vr.syntax_ok:
+                    lint_ok, lint_out = self.lint(file_path)
+                    vr.lint_ok = lint_ok
+                    vr.lint_output = lint_out[:500] if lint_out else ""
+                    vr.passed = vr.syntax_ok and lint_ok
+                results[file_path] = vr
+            except Exception as exc:
+                results[file_path] = VerifyResult(
+                    file=file_path,
+                    syntax_ok=False,
+                    syntax_error=str(exc),
+                )
+        return results

@@ -20,10 +20,16 @@ Usage::
 
 from __future__ import annotations
 
+import enum
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -35,6 +41,35 @@ class Citation:
     valid: bool = False
     error: str = ""
 
+
+class EnforceMode(str, enum.Enum):
+    """How to handle unverifiable claims in enforce_text()."""
+    MARK = "mark"        # Append [UNKNOWN] after unverifiable claims
+    STRIP = "strip"      # Remove unverifiable claims from text
+    REPORT = "report"    # Return report without modifying text
+    ENFORCE = "enforce"  # Auto-correct: strip invalid AND return report
+
+
+@dataclass
+class EnforceResult:
+    """Result of evidence enforcement on a text."""
+    text: str
+    verified_claims: list[Citation] = field(default_factory=list)
+    unverified_claims: list[Citation] = field(default_factory=list)
+    total_claims: int = 0
+    unverified_count: int = 0
+
+    @property
+    def summary(self) -> str:
+        return (
+            f"EnforceResult: {self.total_claims} claims, "
+            f"{self.unverified_count} unverified"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regex
+# ---------------------------------------------------------------------------
 
 _FILE_LINE_RE = re.compile(
     r"""
@@ -52,11 +87,20 @@ _FILE_LINE_RE = re.compile(
 _SRC_DIRS = {"src", "lib", "app", "graphsift", "tests", "packages"}
 
 
+# ---------------------------------------------------------------------------
+# Evidence Checker
+# ---------------------------------------------------------------------------
+
+
 class EvidenceChecker:
     """Validates file:line citations against the actual filesystem."""
 
     def __init__(self, project_root: str = "") -> None:
         self.project_root = Path(project_root or ".").resolve()
+
+    # ------------------------------------------------------------------
+    # Check
+    # ------------------------------------------------------------------
 
     def check_response(self, text: str) -> list[Citation]:
         """Find and validate all file:line citations in *text*.
@@ -85,6 +129,67 @@ class EvidenceChecker:
             citations.append(citation)
 
         return citations
+
+    # ------------------------------------------------------------------
+    # Enforce
+    # ------------------------------------------------------------------
+
+    def enforce_text(
+        self,
+        text: str,
+        mode: EnforceMode = EnforceMode.MARK,
+    ) -> EnforceResult:
+        """Verify every file:line claim and enforce citation rules.
+
+        Steps:
+        1. Find all citations via ``check_response()``.
+        2. For each citation:
+           - Verified → keep as-is.
+           - Unverified → handle per mode.
+        3. Return ``EnforceResult`` with processed text and counts.
+
+        Args:
+            text: Text containing file:line claims.
+            mode: ``EnforceMode`` (MARK, STRIP, REPORT, or ENFORCE).
+
+        Returns:
+            ``EnforceResult`` with modified text and claim breakdown.
+        """
+        citations = self.check_response(text)
+        verified: list[Citation] = [c for c in citations if c.valid]
+        unverified: list[Citation] = [c for c in citations if not c.valid]
+
+        result_text = text
+
+        if mode == EnforceMode.MARK:
+            # Append [UNKNOWN] at the end of each unverified claim
+            for c in unverified:
+                marker = f" [UNKNOWN]"
+                # Insert marker after the raw citation text
+                result_text = result_text.replace(c.raw, c.raw + marker, 1)
+
+        elif mode in (EnforceMode.STRIP, EnforceMode.ENFORCE):
+            # Remove unverified citation text from output
+            for c in unverified:
+                result_text = result_text.replace(c.raw, "", 1)
+            # Clean up double spaces left by removals
+            result_text = re.sub(r"  +", " ", result_text)
+            # Clean up "in " at end of sentences
+            result_text = re.sub(r"\bin\s+\.", ".", result_text)
+
+        # REPORT mode: leave text untouched
+
+        return EnforceResult(
+            text=result_text,
+            verified_claims=verified,
+            unverified_claims=unverified,
+            total_claims=len(citations),
+            unverified_count=len(unverified),
+        )
+
+    # ------------------------------------------------------------------
+    # Validation internals
+    # ------------------------------------------------------------------
 
     def _validate(self, citation: Citation) -> None:
         """Check if the cited file:line actually exists."""
@@ -133,3 +238,11 @@ class EvidenceChecker:
             return 1 <= line <= total
         except Exception:
             return False
+
+
+__all__ = [
+    "Citation",
+    "EnforceMode",
+    "EnforceResult",
+    "EvidenceChecker",
+]

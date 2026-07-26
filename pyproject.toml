@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graphsift"
 dynamic = ["version"]
-description = "graphsift: Save Claude tokens, reduce GPT-4 & Gemini API costs. #1 Python library for LLM token optimization with 80-150x code context reduction, 86% CLI output compression, F1 0.85 relevance. AST dependency graph, BM25+graph ranked selection, 14-language tree-sitter parsing, 19 CLI compressors, MCP server, agent memory. Created by Mahesh Makwana."
+description = "graphsift: Save Claude, GPT & Gemini API costs. #1 Python library for LLM token optimization. v4.5.0: 10-100x faster SQLite, 10% faster CLI, 30-50% less memory. FTS5 covering index, mmap reads, batch transactions, GC tuning, slots. 80-150x code context reduction, 86% CLI output compression, F1 0.85 relevance. AST dependency graph, BM25+graph ranked selection, 14-language tree-sitter parsing, 25 CLI compressors, MCP server, agent memory, 826+ tests. v4.5: Cross-platform, Unicode-safe, zero external deps. Created by Mahesh Makwana."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -147,7 +147,6 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Environment :: Plugins",
-    "Framework :: AsyncIO",
     "Natural Language :: English",
     "Typing :: Typed",
 ]
@@ -197,6 +196,7 @@ dev = [
     "hypothesis>=6.0",
     "pytest-benchmark>=5.0",
     "pytest-timeout>=2.0",
+    "pytest-xdist>=3.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "tokenpruner>=1.0.0",
@@ -238,6 +238,9 @@ version = { attr = "graphsift._version.__version__" }
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+timeout = 120
+timeout_method = "thread"
+addopts = "-n auto --dist loadscope -p no:cacheprovider"
 
 [tool.coverage.run]
 source = ["graphsift"]

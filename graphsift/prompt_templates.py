@@ -57,6 +57,14 @@ Tag every factual claim with its verification level:
 
 If you cannot verify a claim from the provided context,
 use **[UNKNOWN]** — do not fabricate evidence.
+
+## Output Evidence Enforcement (AUTO-VERIFIED)
+Every file:line claim in your output MUST reference a real file on disk.
+Before returning output, verify every file:line reference against the actual filesystem.
+Unverifiable claims MUST be marked [UNKNOWN] — do not fabricate evidence.
+Output will be scanned by EvidenceChecker after generation.
+Every file:line reference will be validated against the actual filesystem.
+Invalid references will be flagged. You are responsible for accuracy.
 """
 
 _ANTI_HALLUCINATION_RULES = """
@@ -727,6 +735,211 @@ class SecurityArchitectureTemplate:
 
 
 # ---------------------------------------------------------------------------
+# GraphSiftExtendedTemplate — Enhanced: best-practice patterns + evidence rigor
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GraphSiftExtendedTemplate:
+    """Extended prompt template incorporating proven 2026 best-practice
+    patterns: evidence markers, confidence calibration, coherence guard,
+    step-by-step reasoning, UNRECOGNIZED ENTITY RULE, and anti-hallucination
+    rules — all in a task-adaptive structure.
+
+    Synthesis of highest-performing patterns from 2026 prompt research:
+      - Evidence markers [VERIFIED-REAL] with confidence tiers
+      - UNRECOGNIZED ENTITY RULE for anti-hallucination
+      - Coherence Guard for deterministic self-check
+      - Step-by-step reading for thorough bug/code analysis
+      - Task-specific protocols (debug, review, code, research)
+
+    Args:
+        role: System role override (default: senior software engineer).
+        mode: ``"auto"`` (detect from task), ``"code"`` (code gen/analysis),
+              ``"review"`` (code review), ``"debug"`` (bug finding),
+              ``"research"`` (anti-hallucination-sensitive).
+    """
+
+    role: str = "senior software engineer"
+    mode: str = "auto"
+
+    _EVIDENCE_INSTRUCTION = """
+## Evidence & Confidence Markers (Mandatory)
+Tag EVERY claim with its verification level:
+  - **[VERIFIED-REAL]** — directly from provided context/code/diff
+  - **[VERIFIED-SYNTHETIC]** — mock/example data, never valid for production
+  - **[UNKNOWN]** — genuinely uncertain, requires human confirmation
+
+Confidence calibration (tier every output):
+  - **[CONFIDENCE:HIGH]** — directly from provided context, official docs, or verified source
+  - **[CONFIDENCE:MODERATE]** — reasonable inference from available context, not explicitly confirmed
+  - **[CONFIDENCE:LOW]** — guess, pattern extrapolation — requires human verification
+  - When LOW, explicitly name what would make it HIGH ("needs X file checked")
+"""
+
+    _UNRECOGNIZED_ENTITY_RULE = """
+## UNRECOGNIZED ENTITY RULE (Non-Negotiable)
+If you encounter a library, framework, API, tool, or concept name that you do NOT
+recognize with high confidence from your training data OR the provided context:
+  1. **State explicitly** that you don't know this entity
+  2. **Do NOT fabricate** its API, version numbers, usage, or behavior
+  3. If the user asks you to write code using it, say "I don't know this library"
+     rather than inventing plausible-looking function calls
+  4. Suggest alternatives you DO know, or ask for documentation
+
+*Searching costs seconds. Confabulating costs the user's trust.*
+"""
+
+    _CORE_BEHAVIOR = """
+## Core Behavior
+- **Be thorough, helpful, and precise** — read every line carefully
+- **Think step by step** for complex tasks before answering
+- **Check your work** — after writing, review for correctness, edge cases, and security
+- **Self-correct** — if you spot an error in your own output, fix it before finalizing
+"""
+
+    _COHERENCE_GUARD = """
+## Coherence Guard (Deterministic Pre-Output Check)
+Before returning output, run this internal check:
+  1. Does every claim trace back to provided context? If not, mark [UNKNOWN]
+  2. Are there contradictions between different parts of your answer? If yes, REVISE
+  3. Are there any invented API signatures or library features? If yes, REMOVE
+  4. Does the code handle stated failure modes? If not, REVISE
+  5. If coherence check fails → refuse structured output with reason
+"""
+
+    _ANTI_HALLUCINATION = """
+## Anti-Hallucination Rules
+- **Honesty Over Helpfulness** — if unsure, say "I don't know" explicitly
+- **Source Grounding** — every claim must trace to provided context OR named public source
+- **Do NOT** invent API signatures, library features, error types, or version numbers
+- **Validation Theater Detection** — running your own code against your own generated data
+  and reporting "100% pass" is not valid evidence. Label synthetic data [VERIFIED-SYNTHETIC]
+- **Copyright** — max 15 words per source quote, one quote per source, paraphrase by default
+- **Fallback First** — specify failure handling BEFORE the happy path
+"""
+
+    def render(
+        self,
+        task: str,
+        task_type: str = "auto",
+        output_schema: Optional[dict] = None,
+        extra_rules: Optional[list[str]] = None,
+    ) -> str:
+        """Render a complete prompt.
+
+        Args:
+            task: The actual task description.
+            task_type: ``"code"``, ``"review"``, ``"debug"``, ``"research"``,
+                       or ``"auto"`` (heuristic from task text).
+            output_schema: Optional JSON schema dict. If provided, forces
+                           JSON-only output matching the schema.
+            extra_rules: Optional additional constraints to append.
+
+        Returns:
+            Complete prompt string.
+        """
+        if task_type == "auto":
+            task_type = self._detect_type(task)
+
+        lines: list[str] = [
+            f"# Role: {self.role}",
+            "",
+            self._CORE_BEHAVIOR.strip(),
+            "",
+            self._UNRECOGNIZED_ENTITY_RULE.strip(),
+            "",
+        ]
+
+        # Mode-specific additions
+        if task_type == "review":
+            lines += [
+                "## Code Review Protocol",
+                "- Read EVERY changed line in the diff carefully — do not skim",
+                "- For each finding: tag with [VERIFIED-REAL] (from diff) or [UNKNOWN]",
+                "- Check: correctness → security → performance → maintainability → testing",
+                "- Check for issues the diff INTRODUCES AND issues the original code ALREADY HAD",
+                "- Provide exploit scenarios for security findings",
+                "- Include exact line references and concrete fix suggestions",
+                "",
+            ]
+        elif task_type == "debug":
+            lines += [
+                "## Bug Finding Protocol",
+                "- Read EVERY line of code carefully — do not skim familiar patterns",
+                "- Check: logic errors, edge cases, resource leaks, type mismatches, security",
+                "- For each bug: severity (error/warning/info), exact line, fix suggestion",
+                "- Check LOGIC issues (ordering, conditions, edge cases) AND structural issues equally",
+                "- Check for code smells: magic numbers (name them as constants), hardcoded values, unclear naming, excessive complexity",
+                "- Check for missing: validation, error handling, encoding, type hints, docstrings",
+                "",
+            ]
+        elif task_type == "research":
+            lines += [
+                "## Research Protocol",
+                "- Apply UNRECOGNIZED ENTITY RULE strictly — do not fabricate",
+                "- If entity is unknown: state it, do NOT guess, offer alternatives",
+                "- Search before answering if uncertain about current information",
+                "",
+            ]
+
+        lines += [
+            self._EVIDENCE_INSTRUCTION.strip(),
+            "",
+            self._ANTI_HALLUCINATION.strip(),
+            "",
+            self._COHERENCE_GUARD.strip(),
+            "",
+        ]
+
+        if extra_rules:
+            lines.append("--- EXTRA CONSTRAINTS ---")
+            for r in extra_rules:
+                lines.append(f"  - {r}")
+            lines.append("")
+
+        # Task itself
+        lines.append("## Task")
+        lines.append(task)
+        lines.append("")
+
+        # Output schema enforcement
+        if output_schema:
+            lines.extend([
+                "--- OUTPUT FORMAT ---",
+                "Return ONLY valid JSON matching this schema:",
+                f"```json\n{json.dumps(output_schema, indent=2)}\n```",
+                "No commentary, explanations, or markdown outside the JSON structure.",
+            ])
+        else:
+            lines.extend([
+                "--- OUTPUT GUIDELINES ---",
+                "- Return code in code blocks with language tag",
+                "- Tag every claim with its evidence level",
+                "- Include edge cases you handled (and ones you didn't)",
+                "- End with a brief self-review of your own output",
+            ])
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _detect_type(task: str) -> str:
+        """Heuristic task-type detection from the task text."""
+        lower = task.lower()
+        keywords = {
+            "review": ["review", "diff", "pull request", "code change", "check for"],
+            "debug": ["bug", "fix", "error", "issue", "debug", "broken", "incorrect"],
+            "research": ["explain", "what is", "research", "find", "search", "documentation"],
+        }
+        scores = {}
+        for ttype, words in keywords.items():
+            scores[ttype] = sum(1 for w in words if w in lower)
+        if scores and max(scores.values()) > 0:
+            return max(scores, key=scores.get)
+        return "code"
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -738,6 +951,14 @@ _TEMPLATE_REGISTRY: dict[str, Any] = {
     "production_app": ProductionAppTemplate(),
     "theme_change": ThemeChangeTemplate(),
     "security_architecture": SecurityArchitectureTemplate(),
+    "extended": GraphSiftExtendedTemplate(),
+}
+
+_ALIASES: dict[str, str] = {
+    "hybrid": "extended",
+    "enhanced": "extended",
+    "combined": "extended",
+    "best": "extended",
 }
 
 
@@ -746,7 +967,8 @@ def get_template(name: str):
 
     Args:
         name: One of ``fix``, ``add``, ``refactor``, ``production_app``,
-              ``theme_change``, ``security_architecture``.
+              ``theme_change``, ``security_architecture``, ``extended``.
+              Aliases: ``hybrid``, ``enhanced``, ``combined``, ``best``.
 
     Returns:
         Template instance with a ``.render(**kwargs)`` method.
@@ -754,10 +976,12 @@ def get_template(name: str):
     Raises:
         ValueError: If name is unknown.
     """
-    tpl = _TEMPLATE_REGISTRY.get(name)
+    resolved = _ALIASES.get(name, name)
+    tpl = _TEMPLATE_REGISTRY.get(resolved)
     if tpl is None:
         raise ValueError(
             f"Unknown template: {name}. "
-            f"Options: {list(_TEMPLATE_REGISTRY)}"
+            f"Options: {list(_TEMPLATE_REGISTRY)} "
+            f"(aliases: {list(_ALIASES)})"
         )
     return tpl
