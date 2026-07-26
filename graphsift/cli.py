@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import logging
@@ -11,7 +12,65 @@ import sys
 
 from pathlib import Path
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Production safeguards for auto-scan
+# ---------------------------------------------------------------------------
+
+# Size gate: skip auto-scan on repos larger than this (load_source_map is O(n))
+_MAX_AUTO_SCAN_FILES = 5000
+
+# Batch gate: skip auto-scan when more than this many files are deleted at once
+# to avoid scanning after bulk operations like rm -rf src/
+_MAX_AUTO_SCAN_DELETIONS = 10
+
+# Rate limit: minimum seconds between auto-scans for the same repo root
+_MIN_SCAN_INTERVAL_S = 30.0
+
+# Track last scan time per project root (module-level) for rate limiting
+_last_scan_times: dict[str, float] = {}
+
+
+def _should_auto_scan(root: str, deleted_count: int, total_files: int) -> bool:
+    """Check all production safeguards before running an auto-scan.
+
+    Returns False when any gate is triggered, with a debug log explaining why.
+    """
+    import time as _time
+    now = _time.monotonic()
+
+    # Size gate
+    if total_files > _MAX_AUTO_SCAN_FILES:
+        logger.debug(
+            "graphsift: auto-scan skipped — repo has %d files (max %d)",
+            total_files, _MAX_AUTO_SCAN_FILES,
+        )
+        return False
+
+    # Batch gate
+    if deleted_count > _MAX_AUTO_SCAN_DELETIONS:
+        logger.debug(
+            "graphsift: auto-scan skipped — %d files deleted in batch (max %d)",
+            deleted_count, _MAX_AUTO_SCAN_DELETIONS,
+        )
+        return False
+
+    # Rate limit gate
+    last = _last_scan_times.get(root, 0.0)
+    elapsed = now - last
+    if elapsed < _MIN_SCAN_INTERVAL_S:
+        logger.debug(
+            "graphsift: auto-scan skipped — last scan %.1fs ago (min %.0fs)",
+            elapsed, _MIN_SCAN_INTERVAL_S,
+        )
+        return False
+
+    _last_scan_times[root] = now
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -20,6 +79,21 @@ logger = logging.getLogger(__name__)
 
 def _cwd() -> str:
     return os.getcwd()
+
+
+def _safe_print(*args, **kwargs) -> None:
+    """Print with Unicode fallback for terminals that don't support it (Windows)."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        # Replace non-ASCII characters with ASCII equivalents
+        sanitized = []
+        for a in args:
+            if isinstance(a, str):
+                sanitized.append(a.encode("ascii", errors="replace").decode("ascii"))
+            else:
+                sanitized.append(str(a))
+        print(*sanitized, **kwargs)
 
 
 def _find_claude_settings(project_root: Path) -> Path:
@@ -50,7 +124,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     mcp_config: dict = {}
     if mcp_path.exists():
         try:
-            mcp_config = json.loads(mcp_path.read_text(encoding="utf-8"))
+            mcp_config = SafeFileIO.read_json(mcp_path)
         except Exception:
             mcp_config = {}
 
@@ -61,7 +135,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         "args": ["-m", "graphsift.mcp_server"],
         "env": {},
     }
-    mcp_path.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
+    SafeFileIO.write_json(mcp_path, mcp_config)
     print(f"[graphsift] Wrote {mcp_path}")
 
     # 2. Inject hooks into .claude/settings.json
@@ -70,7 +144,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         settings: dict = {}
         if settings_path.exists():
             try:
-                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                settings = SafeFileIO.read_json(settings_path)
             except Exception:
                 settings = {}
 
@@ -111,7 +185,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                     "type": "command",
                     "command": (
                         f"{_python_executable()} -m graphsift.cli update "
-                        f"--project-root \"{project_root}\" 2>/dev/null || true"
+                        f"--project-root \"{project_root}\" 2>{os.devnull} || true"
                     ),
                 }
             ],
@@ -150,7 +224,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         if not any("graphsift.compress" in h.get("command", "") for entry in settings["hooks"]["PostToolUse"] for h in entry.get("hooks", [])):
             settings["hooks"]["PostToolUse"].append(bash_post_hook)
 
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        SafeFileIO.write_json(settings_path, settings)
         print(f"[graphsift] Wrote hooks -> {settings_path}")
 
     # 3. Write skill files
@@ -164,7 +238,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         wrapper_script = get_bash_wrapper_script(python_path=_python_executable())
 
         # Check if already installed
-        existing = bashrc_path.read_text(encoding="utf-8") if bashrc_path.exists() else ""
+        existing = SafeFileIO.read(bashrc_path) if bashrc_path.exists() else ""
         if "# graphsift: transparent output compression" not in existing:
             with open(bashrc_path, "a", encoding="utf-8") as f:
                 f.write(f"\n# graphsift: transparent output compression\n")
@@ -175,12 +249,98 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     print("[graphsift] Installation complete.")
     print()
-    print("  Next steps:")
-    print("  1. Restart Claude Code (to load the MCP server)")
-    print("  2. Ask Claude: 'Build the graphsift graph for this repo'")
-    print("     or run:  graphsift build")
-    print()
+    _print_cli_instructions(args, project_root)
     return 0
+
+
+def _print_cli_instructions(args: argparse.Namespace, project_root: Path) -> None:
+    """Print per-CLI instructions based on install flags."""
+    install_all = getattr(args, 'all', False)
+    targets = []
+    if install_all:
+        targets = ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]
+    else:
+        for name in ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]:
+            if getattr(args, name.replace("-", "_"), False):
+                targets.append(name)
+    if not targets:
+        # Default: show all
+        targets = ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]
+
+    mcp_path = _find_mcp_json(project_root)
+
+    instructions = {
+        "claude-code": (
+            "  Claude Code:  ✅ Auto (MCP + hooks already installed)\n"
+            f"                MCP config: {mcp_path}\n"
+            "                PostToolUse hooks auto-fire on every file change."
+        ),
+        "claude-desktop": (
+            "  Claude Desktop:  ⚠️  Manual setup needed\n"
+            "                 1. Open Claude Desktop → Settings → Developer → Edit Config\n"
+            "                 2. Add to claude_desktop_config.json:\n"
+            '                   { "mcpServers": { "graphsift": {'
+            f' "command": "{_python_executable()}",'
+            ' "args": ["-m", "graphsift.mcp_server"] } } }\n'
+            "                 3. Restart Claude Desktop\n"
+            "                 4. No auto-hooks — run manually:\n"
+            "                    'Build the graphsift graph' then use prune_refs tool"
+        ),
+        "cursor": (
+            "  Cursor:  ✅ MCP auto-detected\n"
+            f"          graphsift MCP server registered in {mcp_path}\n"
+            "          Cursor reads .mcp.json automatically.\n"
+            "          For auto-cleanup on file changes, run:\n"
+            f"          graphsift watch --daemon --project-root {project_root}"
+        ),
+        "windsurf": (
+            "  Windsurf:  ✅ MCP auto-detected (same .mcp.json)\n"
+            f"            Config: {mcp_path}\n"
+            "            For auto-cleanup, run:\n"
+            f"            graphsift watch --daemon --project-root {project_root}"
+        ),
+        "continue": (
+            "  Continue.dev:  ✅ MCP auto-detected\n"
+            f"                Config: {mcp_path}\n"
+            "                Continue reads .mcp.json automatically.\n"
+            "                For auto-cleanup, run:\n"
+            f"                graphsift watch --daemon --project-root {project_root}"
+        ),
+        "codex": (
+            "  Codex CLI (OpenAI):  ⚠️  No MCP support\n"
+            "                      Use pipe syntax:\n"
+            "                        graphsift build\n"
+            "                        pytest -v | graphsift compress\n"
+            "                        graphsift prune-refs\n"
+            "                      For auto-cleanup, run:\n"
+            f"                        graphsift watch --daemon --project-root {project_root}"
+        ),
+        "copilot": (
+            "  GitHub Copilot CLI:  ⚠️  No MCP support\n"
+            "                      Use CLI commands directly:\n"
+            "                        graphsift build\n"
+            "                        graphsift prune-refs [--fix]\n"
+            "                      For auto-cleanup, run:\n"
+            f"                        graphsift watch --daemon --project-root {project_root}"
+        ),
+    }
+
+    print("  Supported CLI / Agent integration:")
+    print()
+    for t in targets:
+        if t in instructions:
+            print(instructions[t])
+            print()
+    if any(t in targets for t in ["cursor", "windsurf", "continue", "codex", "copilot"]):
+        print("  NOTE: For CLIs without PostToolUse hooks, the watch daemon")
+        print("  provides the same auto-cleanup on file changes (2s poll).")
+        print()
+    print("  Next steps:")
+    print("  1. Build the graph:              graphsift build")
+    print("  2. Start auto-watch (optional):   graphsift watch --daemon")
+    print("  3. Scan for stale refs:           graphsift prune-refs")
+    print("  4. Fix stale refs (with backup):  graphsift prune-refs --fix")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +369,11 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
     }
     exclude_dirs = set(args.exclude_dirs) if args.exclude_dirs else {
-        "venv", ".venv", "node_modules", ".git", "__pycache__",
-        "dist", "build", ".mypy_cache", ".pytest_cache",
+        # Dot dirs (.*) are auto-skipped in load_source_map
+        # Keep only explicit non-dot build/dep dirs
+        "node_modules", "vendor", "Pods", "bower_components", "jspm_packages",
+        "dist", "build", "target", "out", "cdk.out",
+        "__pycache__", "*.egg-info", "coverage", "htmlcov",
     }
     progress_interval = int(getattr(args, "progress_interval", 200))
 
@@ -223,6 +386,9 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Step 1: Open / migrate SQLite DB ─────────────────────────────────────
     print("  [1/5] Opening database ...")
     db_path = _db_path_for_root(str(root))
+    from graphsift.sha_cache import load_sha_cache, save_sha_cache
+    sha_cache = load_sha_cache(str(root))
+    incremental = bool(sha_cache) and not getattr(args, "force", False)
     _t0 = time.monotonic()
 
     class _MigrationPrinter:
@@ -250,50 +416,126 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     # ── Step 2: Discover files ────────────────────────────────────────────────
     print("  [2/5] Scanning files ...")
-    source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
-    total_files = len(source_map)
 
-    # Count by extension
-    from collections import Counter
-    ext_counts: Counter = Counter(Path(p).suffix.lower() for p in source_map)
-    print(f"        found {total_files} files")
-    for ext, cnt in ext_counts.most_common(8):
-        print(f"          {ext or '(no ext)':10s}  {cnt}")
-    print()
+    if incremental:
+        # ── Fast incremental path: walk paths, stat-check, only read changed ──
+        from graphsift.adapters.filesystem import walk_repo
+        from graphsift.sha_cache import stat_match
+        walk_paths = walk_repo(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
+        total_files = len(walk_paths)
+        all_paths = walk_paths  # full file list for progress & manifest
+
+        from collections import Counter
+        ext_counts = Counter(Path(p).suffix.lower() for p in all_paths)
+        print(f"        found {total_files} files")
+        for ext, cnt in ext_counts.most_common(8):
+            print(f"          {ext or '(no ext)':10s}  {cnt}")
+        print()
+
+        # Stat-check every file against cache — zero content reads for unchanged
+        source_map = {}
+        for p in all_paths:
+            if not stat_match(p, sha_cache):
+                try:
+                    source_map[p] = SafeFileIO.read(p)
+                except OSError:
+                    pass
+
+        fast_unchanged = total_files - len(source_map)
+        if fast_unchanged:
+            print(f"        {fast_unchanged} files unchanged (mtime+size match) — content read skipped")
+            print()
+    else:
+        # ── Full scan: read everything into memory ──
+        source_map = load_source_map(str(root), extensions=extensions, exclude_dirs=exclude_dirs)
+        total_files = len(source_map)
+        all_paths = list(source_map.keys())
+
+        from collections import Counter
+        ext_counts = Counter(Path(p).suffix.lower() for p in source_map)
+        print(f"        found {total_files} files")
+        for ext, cnt in ext_counts.most_common(8):
+            print(f"          {ext or '(no ext)':10s}  {cnt}")
+        print()
+
+    # ── Purge stale files (excluded dirs, deleted files) ──────────────
+    purged = store.purge_stale_files(set(all_paths))
+    if purged["files"]:
+        print(f"        purged {purged['files']} stale files ({purged['nodes']} nodes, {purged['edges']} edges, {purged['risk']} risk)")
+        print()
 
     # ── Step 3: Parse & index ─────────────────────────────────────────────────
     print(f"  [3/5] Parsing {total_files} files ...")
     from graphsift.models import DepthTier  # noqa: PLC0415
     depth_tier_val = DepthTier(getattr(args, 'depth', 'execution'))
     builder = ContextBuilder(ContextConfig(depth_tier=depth_tier_val))
-    all_paths = list(source_map.keys())
+    if incremental:
+        builder._sha_cache = sha_cache
     skipped = 0
+    unchanged = 0
+    changed = 0  # tracks files that were actually re-parsed
+
+    # Check if tqdm is available for a proper progress bar
+    try:
+        from tqdm import tqdm  # noqa: PLC0415
+        _HAS_TQDM = True
+    except ImportError:
+        _HAS_TQDM = False
+
     t_parse_start = time.monotonic()
 
-    for i, path in enumerate(all_paths, 1):
-        try:
-            builder.index_file(path, source_map[path])
-        except Exception:
-            skipped += 1
-        if progress_interval > 0 and i % progress_interval == 0:
-            elapsed = time.monotonic() - t_parse_start
-            rate = i / elapsed if elapsed > 0 else 0
-            pct = i * 100 // total_files
-            print(f"        Progress: {i:>6}/{total_files}  [{pct:>3}%]  {rate:.0f} files/s")
+    # Disable GC during hot parse loop — objects are short-lived; let OS reclaim
+    gc.disable()
+    try:
+        if _HAS_TQDM:
+            pbar = tqdm(all_paths, desc="        Parsing", unit="files", ncols=80)
+            for path in pbar:
+                if path not in source_map:
+                    unchanged += 1
+                    continue
+                try:
+                    builder.index_file(path, source_map[path])
+                    changed += 1
+                except Exception:
+                    skipped += 1
+            pbar.close()
+        else:
+            for i, path in enumerate(all_paths, 1):
+                if path not in source_map:
+                    unchanged += 1
+                    continue
+                try:
+                    builder.index_file(path, source_map[path])
+                    changed += 1
+                except Exception:
+                    skipped += 1
+                if progress_interval > 0 and i % progress_interval == 0:
+                    elapsed = time.monotonic() - t_parse_start
+                    rate = i / elapsed if elapsed > 0 else 0
+                    remaining = (total_files - i) / rate if rate > 0 else 0
+                    pct = i * 100 // total_files
+                    bar_len = 20
+                    filled = int(bar_len * i / total_files)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    print(f"        [{bar}] {pct:>3}% | Processing file {i:>6}/{total_files} | ETA: {remaining:>5.0f}s")
 
-    if total_files % progress_interval != 0 or total_files == 0:
-        elapsed = time.monotonic() - t_parse_start
-        rate = total_files / elapsed if elapsed > 0 else 0
-        print(f"        Progress: {total_files:>6}/{total_files}  [100%]  {rate:.0f} files/s")
+            if total_files == 0 or total_files % progress_interval != 0:
+                elapsed = time.monotonic() - t_parse_start
+                rate = total_files / elapsed if elapsed > 0 else 0
+                bar_len = 20
+                bar = "█" * bar_len
+                print(f"        [{bar}] 100% | Processing file {total_files:>6}/{total_files} | {rate:.0f} files/s")
 
-    parse_ms = (time.monotonic() - t_parse_start) * 1000
-    print(f"        done in {parse_ms:.0f} ms  ({skipped} skipped)")
-    print()
+        parse_ms = (time.monotonic() - t_parse_start) * 1000
+        print(f"        done in {parse_ms:.0f} ms  ({skipped} failed, {unchanged} unchanged)")
+        print()
+    finally:
+        gc.enable()
 
     # ── Step 4: Build final graph stats ──────────────────────────────────────
     print("  [4/5] Building dependency graph ...")
     t_graph = time.monotonic()
-    stats = builder.index_files(source_map)
+    stats = builder.index_files_incremental(source_map) if incremental else builder.index_files(source_map)
     graph_ms = (time.monotonic() - t_graph) * 1000
 
     # Language breakdown from stats
@@ -349,32 +591,39 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
 
     # ── Step 6: Post-processing (flows, communities, risk, FTS) ───────────────
     pp_result: dict = {}
-    if not getattr(args, "skip_postprocess", False):
-        print("  [6/6] Post-processing (flows, communities, risk, FTS) ...")
-        t_pp = time.monotonic()
-        from graphsift.adapters.postprocess import Postprocessor
+    if getattr(args, "postprocess", False):
+        if incremental and changed == 0:
+            print("  [6/6] No changes detected — skipping post-processing")
+            print()
+        else:
+            print("  [6/6] Post-processing (flows, communities, risk, FTS) ...")
+            t_pp = time.monotonic()
+            from graphsift.adapters.postprocess import Postprocessor
 
-        class _PPPrinter:
-            def write(self, msg: str) -> None:
-                msg = msg.strip()
-                if msg:
-                    print(f"        {msg}")
-            def flush(self) -> None:
-                pass
+            class _PPPrinter:
+                def write(self, msg: str) -> None:
+                    msg = msg.strip()
+                    if msg:
+                        print(f"        {msg}")
+                def flush(self) -> None:
+                    pass
 
-        import logging as _logging
-        _pp_handler = _logging.StreamHandler(_PPPrinter())  # type: ignore[arg-type]
-        _pp_handler.setFormatter(_logging.Formatter("%(message)s"))
-        _pp_logger = _logging.getLogger("graphsift.adapters.postprocess")
-        _pp_logger.setLevel(_logging.INFO)
-        _pp_logger.addHandler(_pp_handler)
-        _pp_logger.propagate = False
+            import logging as _logging
+            _pp_handler = _logging.StreamHandler(_PPPrinter())  # type: ignore[arg-type]
+            _pp_handler.setFormatter(_logging.Formatter("%(message)s"))
+            _pp_logger = _logging.getLogger("graphsift.adapters.postprocess")
+            _pp_logger.setLevel(_logging.INFO)
+            _pp_logger.addHandler(_pp_handler)
+            _pp_logger.propagate = False
 
-        if graph_obj is not None:
-            pp = Postprocessor()
-            pp_result = pp.run(graph_obj, store, source_map)
-        pp_ms = (time.monotonic() - t_pp) * 1000
-        print(f"        time           : {pp_ms:.0f} ms")
+            if graph_obj is not None:
+                pp = Postprocessor()
+                pp_result = pp.run(graph_obj, store, source_map)
+            pp_ms = (time.monotonic() - t_pp) * 1000
+            print(f"        time           : {pp_ms:.0f} ms")
+            print()
+    else:
+        print("  [6/6] Post-processing skipped (use --postprocess to enable)")
         print()
 
     # ── Manifest ──────────────────────────────────────────────────────────────
@@ -384,11 +633,26 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         "symbols_extracted": stats.symbols_extracted,
         "edges_created": stats.edges_created,
         "duration_ms": stats.duration_ms,
-        "files": [str(p) for p in source_map.keys()],
+        "files": [str(p) for p in all_paths],
     }
     manifest_path = root / ".graphsift" / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    SafeFileIO.write_json(manifest_path, manifest)
+
+    # ── Save SHA cache for next incremental build ──
+    if graph_obj is not None:
+        for file_node in graph_obj.all_files():
+            if hasattr(file_node, "sha256") and file_node.sha256:
+                try:
+                    st = os.stat(file_node.path)
+                    sha_cache[file_node.path] = {
+                        "sha": file_node.sha256,
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                    }
+                except OSError:
+                    sha_cache[file_node.path] = file_node.sha256  # plain str fallback
+        save_sha_cache(str(root), sha_cache)
 
     total_ms = (time.monotonic() - _t0) * 1000
 
@@ -426,44 +690,107 @@ def _db_path_for_root(root: str) -> str:
 # ---------------------------------------------------------------------------
 
 def cmd_update(args: argparse.Namespace) -> int:
-    root = Path(args.project_root).resolve()
-    manifest_path = root / ".graphsift" / "manifest.json"
-
-    if not manifest_path.exists():
-        # Silent - no graph built yet, nothing to update
-        return 0
-
+    """Incremental graph update — called by PostToolUse hook.  Never raises."""
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        return 0
+        root = Path(args.project_root).resolve()
+        manifest_path = root / ".graphsift" / "manifest.json"
 
-    # Find files newer than manifest
-    manifest_mtime = manifest_path.stat().st_mtime
-    changed: list[str] = []
-    for file_path in manifest.get("files", []):
-        p = Path(file_path)
-        if p.exists() and p.stat().st_mtime > manifest_mtime:
-            changed.append(str(p))
+        if not manifest_path.exists():
+            return 0
 
-    if not changed:
-        return 0
-
-    from graphsift.adapters.filesystem import load_changed_files
-    from graphsift.core import ContextBuilder
-    from graphsift.models import ContextConfig
-
-    new_sources = load_changed_files(changed)
-    builder = ContextBuilder(ContextConfig())
-    for path, source in new_sources.items():
         try:
-            builder.index_file(path, source)
+            manifest = SafeFileIO.read_json(manifest_path)
         except Exception:
-            pass
+            return 0
 
-    # Touch manifest to update mtime
-    manifest["files_updated"] = changed
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        manifest_files: list[str] = manifest.get("files", [])
+        manifest_mtime = manifest_path.stat().st_mtime
+
+        # ── 1. Detect deleted files ──────────────────────────────────────────
+        deleted: list[str] = []
+        changed: list[str] = []
+        for file_path in manifest_files:
+            p = Path(file_path)
+            if not p.exists():
+                deleted.append(str(p))
+            elif p.stat().st_mtime > manifest_mtime:
+                changed.append(str(p))
+
+        # ── 2. Clean up deleted files from DB ────────────────────────────────
+        if deleted:
+            from graphsift.adapters.storage import GraphStore
+            store = GraphStore(_db_path_for_root(str(root)))
+            for fp in deleted:
+                try:
+                    store.delete_file_completely(fp)
+                except Exception:
+                    pass
+            logger.info("graphsift: purged %d deleted files from graph DB", len(deleted))
+
+        # ── 3. Auto-scan for stale source-code references ────────────────────
+        if deleted and _should_auto_scan(str(root), len(deleted), len(manifest_files)):
+            try:
+                from graphsift.cleanup import StaleRefScanner
+                from graphsift.adapters.filesystem import load_source_map
+                source_map = load_source_map(str(root))
+                scanner = StaleRefScanner(project_root=str(root))
+                report = scanner.scan_after_deletion(deleted, source_map=source_map)
+                if report.findings:
+                    high = report.by_severity.get("HIGH", 0)
+                    med = report.by_severity.get("MEDIUM", 0)
+                    logger.warning(
+                        "graphsift: %d deleted file(s) have %d stale reference(s) "
+                        "(%d HIGH, %d MEDIUM) in remaining source code. "
+                        "Run 'graphsift prune-refs' to inspect or '--fix' to clean up.",
+                        len(deleted), report.total, high, med,
+                    )
+            except Exception:
+                pass
+
+        # ── 4. Update changed files ──────────────────────────────────────────
+        if changed:
+            from graphsift.adapters.filesystem import load_changed_files
+            from graphsift.core import ContextBuilder
+            from graphsift.models import ContextConfig
+
+            new_sources = load_changed_files(changed)
+            builder = ContextBuilder(ContextConfig())
+            for path, source in new_sources.items():
+                try:
+                    builder.index_file(path, source)
+                except Exception:
+                    pass
+
+        # ── 5. Auto-scan modified files for removed exports ─────────────────
+        if changed and _should_auto_scan(str(root), len(changed), len(manifest_files)):
+            try:
+                from graphsift.cleanup import StaleRefScanner
+                from graphsift.adapters.filesystem import load_source_map
+                source_map = load_source_map(str(root))
+                scanner = StaleRefScanner(project_root=str(root))
+                report = scanner.scan_after_modification(changed, source_map=source_map)
+                if report.findings:
+                    high = report.by_severity.get("HIGH", 0)
+                    med = report.by_severity.get("MEDIUM", 0)
+                    logger.warning(
+                        "graphsift: %d modified file(s) had %d symbol(s) removed "
+                        "(%d HIGH, %d MEDIUM) that may break dependents. "
+                        "Run 'graphsift prune-refs' to inspect.",
+                        len(changed), report.total, high, med,
+                    )
+            except Exception:
+                pass
+
+        # ── 6. Update manifest ───────────────────────────────────────────────
+        if deleted or changed:
+            manifest["files"] = [f for f in manifest_files if f not in deleted]
+            if changed:
+                manifest["files_updated"] = changed
+            if deleted:
+                manifest["files_deleted"] = deleted
+            SafeFileIO.write_json(manifest_path, manifest)
+    except Exception:
+        pass
     return 0
 
 
@@ -482,7 +809,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     if manifest_path.exists():
         try:
-            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            m = SafeFileIO.read_json(manifest_path)
             print(f"  Graph     : built ({m.get('files_indexed', '?')} files, "
                   f"{m.get('symbols_extracted', '?')} symbols, "
                   f"{m.get('edges_created', '?')} edges)")
@@ -498,6 +825,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     skill_count = len(list(skills_dir.glob("*/SKILL.md"))) if skills_dir.exists() else 0
     print(f"  Skills    : {skill_count} installed")
     print()
+
+    # Evolution status
+    try:
+        from graphsift.evolve_registry import EvolveRegistry
+        registry = EvolveRegistry()
+        entries = registry.list_entries()
+        if entries:
+            print(f"Evolution cache: {len(entries)} entries")
+            for e in entries:
+                print(f"  {e.get('fingerprint', '?')[:16]}: score={e.get('score', 0):.4f}")
+        else:
+            print("Evolution cache: empty")
+    except ImportError:
+        pass  # evolve module not available
+
     return 0
 
 
@@ -512,9 +854,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     mcp_path = _find_mcp_json(project_root)
     if mcp_path.exists():
         try:
-            cfg = json.loads(mcp_path.read_text(encoding="utf-8"))
+            cfg = SafeFileIO.read_json(mcp_path)
             cfg.get("mcpServers", {}).pop("graphsift", None)
-            mcp_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            SafeFileIO.write_json(mcp_path, cfg)
             print(f"[graphsift] Removed MCP entry from {mcp_path}")
         except Exception as exc:
             print(f"[graphsift] Warning: could not update {mcp_path}: {exc}")
@@ -602,13 +944,13 @@ def _write_skills(project_root: Path) -> None:
 def _write_skill(path: Path, title: str, description: str, steps: list[str], example: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     steps_md = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(steps))
-    path.write_text(
+    content = (
         f"# {title}\n\n"
         f"{description}\n\n"
         f"## Steps\n\n{steps_md}\n\n"
-        f"## Example trigger\n\n> {example}\n",
-        encoding="utf-8",
+        f"## Example trigger\n\n> {example}\n"
     )
+    SafeFileIO.write(path, content)
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +963,7 @@ _REGISTRY_PATH = Path.home() / ".graphsift" / "registry.json"
 def _load_registry() -> dict[str, dict]:
     if _REGISTRY_PATH.exists():
         try:
-            return json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
+            return SafeFileIO.read_json(_REGISTRY_PATH)
         except Exception:
             pass
     return {}
@@ -629,7 +971,7 @@ def _load_registry() -> dict[str, dict]:
 
 def _save_registry(registry: dict[str, dict]) -> None:
     _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _REGISTRY_PATH.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+    SafeFileIO.write_json(_REGISTRY_PATH, registry)
 
 
 # ---------------------------------------------------------------------------
@@ -731,15 +1073,18 @@ def cmd_postprocess(args: argparse.Namespace) -> int:
 # watch command
 # ---------------------------------------------------------------------------
 
-def cmd_watch(args: argparse.Namespace) -> int:
+
+def _watch_loop(root: Path, manifest_path: Path) -> None:
+    """Scan for file changes, update graph, auto-clean deleted files, scan stale refs.
+
+    Designed for CLIs without PostToolUse hooks (Cursor, Windsurf, Continue.dev,
+    Claude Desktop, Codex CLI, Copilot CLI).  Runs a 2-second poll loop.
+    Never raises.
+    """
     import time
     from graphsift.adapters.filesystem import load_changed_files
     from graphsift.core import ContextBuilder
     from graphsift.models import ContextConfig
-
-    root = Path(args.project_root).resolve()
-    manifest_path = root / ".graphsift" / "manifest.json"
-    print(f"[graphsift] Watching {root} for changes (Ctrl+C to stop) ...")
 
     last_mtimes: dict[str, float] = {}
 
@@ -755,9 +1100,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         pass
         return mtimes
 
-    last_mtimes = _scan_mtimes()
-
     try:
+        last_mtimes = _scan_mtimes()
         while True:
             time.sleep(2)
             current = _scan_mtimes()
@@ -767,6 +1111,32 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             if changed or removed:
                 print(f"[graphsift] {len(changed)} changed, {len(removed)} removed — updating graph ...")
+
+                # Handle deleted files: DB cleanup + stale ref scan
+                if removed and _should_auto_scan(str(root), len(removed), len(current)):
+                    try:
+                        db_path = _db_path_for_root(str(root))
+                        from graphsift.adapters.storage import GraphStore
+                        store = GraphStore(db_path)
+                        for fp in removed:
+                            try:
+                                store.delete_file_completely(fp)
+                            except Exception:
+                                pass
+                        # Scan for stale references
+                        from graphsift.cleanup import StaleRefScanner
+                        from graphsift.adapters.filesystem import load_source_map
+                        source_map = load_source_map(str(root))
+                        scanner = StaleRefScanner(project_root=str(root))
+                        report = scanner.scan_after_deletion(removed, source_map=source_map)
+                        if report.findings:
+                            print(f"[graphsift] WARNING: {report.total} stale reference(s) found "
+                                  f"({report.by_severity.get('HIGH', 0)} HIGH). "
+                                  f"Run: graphsift prune-refs --fix")
+                    except Exception:
+                        pass
+
+                # Handle changed files: re-index + scan for removed exports
                 if changed:
                     new_sources = load_changed_files(changed)
                     builder = ContextBuilder(ContextConfig())
@@ -776,9 +1146,103 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         except Exception:
                             pass
                     print(f"[graphsift] Updated {len(changed)} files.")
+                    # Scan for symbols removed from modified files
+                    if _should_auto_scan(str(root), len(changed), len(current)):
+                        try:
+                            from graphsift.cleanup import StaleRefScanner
+                            from graphsift.adapters.filesystem import load_source_map
+                            source_map = load_source_map(str(root))
+                            scanner = StaleRefScanner(project_root=str(root))
+                            report = scanner.scan_after_modification(changed, source_map=source_map)
+                            if report.findings:
+                                print(f"[graphsift] WARNING: {report.total} removed symbol reference(s) "
+                                      f"found in modified files. Run: graphsift prune-refs")
+                        except Exception:
+                            pass
+
                 last_mtimes = current
+    except Exception:
+        pass
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    import threading
+
+    root = Path(args.project_root).resolve()
+    manifest_path = root / ".graphsift" / "manifest.json"
+
+    if getattr(args, 'daemon', False):
+        t = threading.Thread(target=_watch_loop, args=(root, manifest_path), daemon=True)
+        t.start()
+        print(f"[graphsift] Watch daemon started for {root}")
+        return 0
+
+    print(f"[graphsift] Watching {root} for changes (Ctrl+C to stop) ...")
+    try:
+        _watch_loop(root, manifest_path)
     except KeyboardInterrupt:
         print("\n[graphsift] Watch stopped.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# auto-guide functions
+# ---------------------------------------------------------------------------
+
+
+def auto_guide(
+    task: str,
+    changed_files: list[str] | None = None,
+    project_root: str = "",
+) -> dict:
+    """Build focused code context for a given task. Never raises.
+
+    Args:
+        task: Free-text description of what you want to review or understand.
+        changed_files: Optional list of changed file paths to anchor context.
+        project_root: Repo root path (default: cwd).
+
+    Returns:
+        Dict with keys ``context`` (str) and ``files_selected`` (int).
+    """
+    try:
+        from graphsift.adapters.filesystem import load_source_map
+        from graphsift.core import ContextBuilder
+        from graphsift.models import ContextConfig, DiffSpec
+
+        root = project_root or os.getcwd()
+        source_map = load_source_map(root)
+        if not source_map:
+            return {"context": "", "files_selected": 0}
+
+        config = ContextConfig(token_budget=40_000)
+        builder = ContextBuilder(config)
+        builder.index_files(source_map)
+
+        diff = DiffSpec(
+            changed_files=changed_files or list(source_map.keys())[:3],
+            query=task,
+        )
+        result = builder.build(diff, source_map=source_map)
+        return {
+            "context": result.rendered_context,
+            "files_selected": result.files_selected,
+        }
+    except Exception:
+        return {"context": "", "files_selected": 0}
+
+
+def cmd_guide(args: argparse.Namespace) -> int:
+    """Print focused context for a task description."""
+    task = " ".join(getattr(args, 'task', [])) or "Understand the codebase"
+    result = auto_guide(
+        task=task,
+        project_root=getattr(args, 'project_root', os.getcwd()),
+    )
+    if result["files_selected"]:
+        print(f"[graphsift] Selected {result['files_selected']} files for context")
+        print()
+    print(result["context"])
     return 0
 
 
@@ -873,7 +1337,7 @@ def cmd_visualize(args: argparse.Namespace) -> int:
     ][:1000]
 
     html = _render_graph_html(nodes_js, links_js, str(root))
-    output_path.write_text(html, encoding="utf-8")
+    SafeFileIO.write(output_path, html)
 
     print(f"[graphsift] Graph visualization -> {output_path}")
     if args.serve:
@@ -1284,6 +1748,112 @@ def cmd_detect_dead_code(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# prune-refs command  (post-deletion reference cleanup)
+# ---------------------------------------------------------------------------
+
+def cmd_prune_refs(args: argparse.Namespace) -> int:
+    """Scan for stale references to deleted files and optionally auto-fix.
+
+    Detects import statements, symbol references, and string path references
+    in remaining source files that point to deleted components.
+
+    Use --fix to auto-remove stale import lines (creates .bak backups).
+    """
+    project_root = Path(getattr(args, 'project_root', os.getcwd())).resolve()
+    deleted_paths = getattr(args, 'paths', None)
+    fix = getattr(args, 'fix', False)
+
+    try:
+        from graphsift.cleanup import StaleRefScanner  # noqa: PLC0415
+    except ImportError:
+        print("[graphsift] cleanup module not available. Run: pip install graphsift")
+        return 1
+
+    from graphsift.adapters.filesystem import load_source_map  # noqa: PLC0415
+
+    # If no paths given, detect deletions from manifest
+    if not deleted_paths:
+        manifest_path = project_root / ".graphsift" / "manifest.json"
+        if manifest_path.exists():
+            try:
+                from graphsift.read_cache import SafeFileIO  # noqa: PLC0415
+                manifest = SafeFileIO.read_json(manifest_path)
+                manifest_files = manifest.get("files", [])
+                deleted_paths = [
+                    f for f in manifest_files
+                    if not Path(f).exists()
+                ]
+                if not deleted_paths:
+                    print("[graphsift] No deleted files found in manifest.")
+                    return 0
+            except Exception:
+                print("[graphsift] Could not read manifest.")
+                return 1
+        else:
+            print("[graphsift] No manifest found and no paths given.")
+            print("  Usage: graphsift prune-refs [paths...] [--fix]")
+            return 1
+
+    # Scan
+    source_map = load_source_map(str(project_root))
+    scanner = StaleRefScanner(project_root=str(project_root))
+    report = scanner.scan_after_deletion(deleted_paths, source_map=source_map)
+
+    # Print report
+    if not report.findings:
+        print(f"[graphsift] No stale references found for {len(deleted_paths)} deleted file(s).")
+        return 0
+
+    _safe_print(f"\n  {'='*60}")
+    _safe_print(f"  Stale Reference Report - {len(deleted_paths)} deleted file(s)")
+    _safe_print(f"  {'='*60}")
+    _safe_print(f"  Total findings: {report.total}")
+    _safe_print(f"  By severity    : {report.by_severity.get('HIGH', 0)} HIGH, "
+                f"{report.by_severity.get('MEDIUM', 0)} MEDIUM, "
+                f"{report.by_severity.get('LOW', 0)} LOW")
+    _safe_print(f"  By kind        : {report.by_kind}")
+    _safe_print(f"  Auto-fixable   : {report.auto_fixable}")
+    _safe_print(f"  {'='*60}\n")
+
+    for severity in ("HIGH", "MEDIUM", "LOW"):
+        group = [f for f in report.findings if f.severity == severity]
+        if not group:
+            continue
+        _safe_print(f"  [{severity}] - {len(group)} finding(s)")
+        _safe_print()
+        for f in group[:20]:  # Show first 20
+            _safe_print(f"    {f.file_path}:{f.line_number}")
+            _safe_print(f"      {f.line_text.strip()}")
+            if f.suggested_fix:
+                _safe_print(f"      ==> {f.suggested_fix}")
+            _safe_print()
+        if len(group) > 20:
+            _safe_print(f"    ... and {len(group) - 20} more")
+            _safe_print()
+        _safe_print()
+
+    # Apply fixes if requested
+    if fix:
+        _safe_print("  Applying fixes...")
+        result = scanner.apply_fixes(report, dry_run=False)
+        _safe_print(f"  Files modified : {result.get('files_modified', 0)}")
+        _safe_print(f"  Lines removed  : {result.get('lines_removed', 0)}")
+        if result.get("files_backed_up"):
+            _safe_print(f"  Backups created: {len(result['files_backed_up'])}")
+        if result.get("errors"):
+            _safe_print(f"  Errors         : {len(result['errors'])}")
+            for e in result["errors"][:5]:
+                _safe_print(f"    - {e}")
+    else:
+        fixable = sum(1 for f in report.findings if f.suggested_fix)
+        if fixable:
+            _safe_print(f"  Tip: {fixable} finding(s) are auto-fixable. Run with --fix to apply.")
+        _safe_print()
+
+    return 1 if report.total > 0 else 0
+
+
+# ---------------------------------------------------------------------------
 # terse command  (inline terse mode prefix)
 # ---------------------------------------------------------------------------
 
@@ -1374,6 +1944,68 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"Error    : {result.syntax_error}")
     print(f"Passed   : {result.passed}")
     return 0 if result.passed else 1
+
+
+# ---------------------------------------------------------------------------
+# test-impact command — smart selective test runner
+# ---------------------------------------------------------------------------
+
+def cmd_test_impact(args: argparse.Namespace) -> int:
+    """Run full or selective tests with impact analysis."""
+    from graphsift.test_impact import TestImpactAnalyzer
+
+    analyzer = TestImpactAnalyzer(project_root=args.project_root)
+
+    if args.mode == "status":
+        snap = analyzer._memory.last_snapshot()
+        if snap is None:
+            print("No test snapshots found. Run `graphsift test-impact full` first.")
+            return 1
+        print(f"Test Snapshot #{snap.id}")
+        print(f"  Mode       : {snap.mode}")
+        print(f"  Status     : {snap.status}")
+        print(f"  Commit     : {snap.commit_hash}")
+        print(f"  Tests      : {snap.tests_run} run, "
+              f"{snap.tests_passed} passed, {snap.tests_failed} failed")
+        print(f"  Duration   : {snap.duration_ms:.0f}ms")
+        print(f"  Timestamp  : {snap.created_at}")
+        if snap.changed_files:
+            print(f"  Changed    : {len(snap.changed_files)} files")
+        if snap.impacted_tests:
+            print(f"  Impacted   : {len(snap.impacted_tests)} test files")
+        return 0 if snap.status == "passed" else 1
+
+    if args.mode == "full":
+        print("Running FULL test suite (baseline for selective mode)...")
+        result = analyzer.run_full(
+            pytest_args=args.pytest_args,
+            timeout=args.timeout,
+        )
+    else:
+        print("Running SELECTIVE tests (only impacted by changes)...")
+        result = analyzer.run_selective(
+            changed_files=args.changed_files,
+            pytest_args=args.pytest_args,
+            timeout=args.timeout,
+        )
+
+    print(f"\n{'='*60}")
+    print(f"  {result.summary}")
+    print(f"{'='*60}")
+    if result.duration_ms > 0:
+        print(f"  Time      : {result.duration_ms:.0f}ms")
+    if result.tests_run > 0:
+        print(f"  Tests     : {result.tests_run} total, "
+              f"{result.tests_passed} passed, {result.tests_failed} failed")
+    if result.skipped_tests > 0:
+        print(f"  Skipped   : {result.skipped_tests} tests "
+              f"({result.savings_pct:.0f}% savings)")
+    if result.impacted_tests:
+        print(f"  Files     : {len(result.impacted_tests)} impacted test files")
+    if result.message:
+        print(f"  Info      : {result.message}")
+
+    return 0 if result.status == "passed" else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1498,7 +2130,7 @@ def _detect_build_tools(root: Path) -> dict[str, str]:
     if pkg_json.exists():
         try:
             import json  # noqa: PLC0415
-            pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+            pkg = SafeFileIO.read_json(pkg_json)
             scripts = pkg.get("scripts", {})
             if "test" in scripts:
                 tools["test"] = f"npm test  ({scripts['test']})"
@@ -1525,7 +2157,7 @@ def _detect_build_tools(root: Path) -> dict[str, str]:
     makefile = root / "Makefile"
     if makefile.exists():
         try:
-            content = makefile.read_text(encoding="utf-8")
+            content = SafeFileIO.read(makefile)
             if ".PHONY" in content or ":" in content:
                 tools["has_makefile"] = "make"
                 for target in ("test", "build", "lint", "fmt", "install"):
@@ -1577,8 +2209,10 @@ def cmd_claude_md(args: argparse.Namespace) -> int:
     print(f"[graphsift] Scanning {root} for CLAUDE.md generation ...")
 
     exclude_dirs: set[str] = {
-        "venv", ".venv", "node_modules", ".git", "__pycache__",
-        "dist", "build", ".mypy_cache", ".pytest_cache",
+        # Dot dirs (.*) auto-skipped; list non-dot dirs only
+        "node_modules", "vendor", "Pods", "bower_components", "jspm_packages",
+        "dist", "build", "target", "out", "cdk.out",
+        "__pycache__", "*.egg-info", "coverage", "htmlcov",
     }
 
     # Detect project name
@@ -1675,7 +2309,7 @@ def cmd_claude_md(args: argparse.Namespace) -> int:
     content = "\n".join(lines)
 
     claude_md_path.parent.mkdir(parents=True, exist_ok=True)
-    claude_md_path.write_text(content, encoding="utf-8")
+    SafeFileIO.write(claude_md_path, content)
 
     print()
     print(f"  Written: {claude_md_path}")
@@ -1689,8 +2323,252 @@ def cmd_claude_md(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# loop-engineering commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_loop_init(args: argparse.Namespace) -> int:
+	"""Scaffold loop config for the project."""
+	from graphsift.loop_config import LoopConfig
+
+	root = Path(args.project_root).resolve()
+	config = LoopConfig()
+	config.save(str(root))
+	print(f"[graphsift] Loop config initialized at {root / '.graphsift' / 'loop-config.json'}")
+	print()
+	# Run audit
+	from graphsift.loop_engineering import LoopEngine
+	engine = LoopEngine(repo_root=str(root))
+	audit = engine.audit_readiness()
+	print(f"  Loop Readiness Score: {audit['score']}/{audit['max_score']} ({audit['percentage']}%)")
+	print(f"  Level: {audit['level']}")
+	if audit['suggestions']:
+		print("  Suggestions:")
+		for s in audit['suggestions']:
+			print(f"    - {s}")
+	return 0
+
+
+def cmd_loop_run(args: argparse.Namespace) -> int:
+	"""Run a specific loop pattern."""
+	from graphsift.loop_engineering import LoopEngine, PatternType
+
+	engine = LoopEngine(repo_root=args.project_root)
+	pattern = PatternType(args.pattern)
+
+	method_map = {
+		PatternType.DAILY_TRIAGE: engine.run_daily_triage,
+		PatternType.PR_BABYSITTER: engine.run_pr_babysitter,
+		PatternType.CI_SWEEPER: engine.run_ci_sweeper,
+		PatternType.DEP_SWEEPER: engine.run_dep_sweeper,
+		PatternType.CHANGELOG_DRAFT: engine.run_changelog,
+		PatternType.POST_MERGE_CLEANUP: engine.run_cleanup,
+		PatternType.ISSUE_TRIAGE: engine.run_issue_triage,
+	}
+
+	fn = method_map.get(pattern)
+	if not fn:
+		print(f"[graphsift] Unknown pattern: {args.pattern}")
+		return 1
+
+	result = fn()
+	print(f"[graphsift] Loop run: {result.pattern.value}")
+	print(f"  Status  : {result.status.value}")
+	print(f"  Summary : {result.summary}")
+	print(f"  Duration: {result.duration_ms:.0f}ms")
+	print(f"  Tokens  : {result.tokens_used}")
+	print(f"  Run ID  : {result.run_id[:12]}")
+	if result.error:
+		print(f"  Error   : {result.error}")
+	return 0 if result.status.value == "success" else 1
+
+
+def cmd_loop_status(args: argparse.Namespace) -> int:
+	"""Show loop engine status."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	report = engine.full_report()
+	sched = report.get("scheduler", {})
+	budget = report.get("budget", {})
+
+	print(f"[graphsift] Loop Engine Status")
+	print(f"  Scheduler     : {'running' if sched.get('running') else 'stopped'}")
+	print(f"  Patterns      : {len(sched.get('patterns', {}))}")
+	print(f"  Daily budget  : {budget.get('daily_limit', 500_000):,} tokens")
+	print(f"  Today spend   : {budget.get('today_total', 0):,} tokens")
+	print(f"  Budget remain : {budget.get('budget_remaining', 0):,} tokens")
+	print(f"  Week spend    : {budget.get('week_total', 0):,} tokens")
+	print(f"  Worktrees     : {len(report.get('active_worktrees', []))} active")
+	drift = report.get("drift", [])
+	if drift:
+		for d in drift:
+			print(f"  Drift         : {d.get('type')} ({d.get('from')} -> {d.get('to')})")
+	return 0
+
+
+def cmd_loop_report(args: argparse.Namespace) -> int:
+	"""Full loop activity report."""
+	import json
+
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	report = engine.full_report()
+	print(json.dumps(report, indent=2, default=str))
+	return 0
+
+
+def cmd_loop_schedule(args: argparse.Namespace) -> int:
+	"""List scheduled patterns."""
+	from graphsift.loop_engineering import LoopEngine, PatternType, PATTERN_REGISTRY
+
+	engine = LoopEngine(repo_root=args.project_root)
+	sched = engine.full_report().get("scheduler", {})
+	patterns = sched.get("patterns", {})
+
+	if not patterns:
+		print("[graphsift] No patterns registered.")
+		return 0
+
+	print(f"{'Pattern':<25} {'Cadence':<12} {'Maturity':<10} {'Enabled':<10}")
+	print("-" * 60)
+	for name, info in sorted(patterns.items()):
+		registry_info = PATTERN_REGISTRY.get(PatternType(name), {})
+		cadence = registry_info.get("cadence", f"{info.get('cadence_seconds', 0)}s")
+		print(f"{name:<25} {cadence:<12} {info.get('maturity', 'L1'):<10} {str(info.get('enabled', True)):<10}")
+	return 0
+
+
+def cmd_loop_cost(args: argparse.Namespace) -> int:
+	"""Estimate token cost per pattern."""
+	from graphsift.loop_engineering import LoopCostBudgeter, LoopEngine, MaturityLevel, PatternType
+
+	budgeter = LoopCostBudgeter()
+	pattern = PatternType(args.pattern)
+	maturity = MaturityLevel(args.maturity)
+
+	est = budgeter.estimate_cost(pattern, maturity)
+	print(f"[graphsift] Cost estimate for {args.pattern} @ {args.maturity}")
+	print(f"  Estimated tokens per run: {est:,}")
+	print(f"  Daily budget: {budgeter.DEFAULT_DAILY_LIMIT:,}")
+	print(f"  Max runs/day: {budgeter.DEFAULT_DAILY_LIMIT // max(est, 1)}")
+	print(f"  Weekly estimate (daily): {est * 7:,}")
+	return 0
+
+
+def cmd_loop_audit(args: argparse.Namespace) -> int:
+	"""Loop readiness score and suggestions."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	audit = engine.audit_readiness()
+
+	print(f"[graphsift] Loop Readiness Audit")
+	print(f"  Score     : {audit['score']}/{audit['max_score']} ({audit['percentage']}%)")
+	print(f"  Level     : {audit['level']}")
+	print(f"  Badge     : {audit['badge']}")
+	print()
+	if audit['suggestions']:
+		print("  Suggestions to improve:")
+		for s in audit['suggestions']:
+			print(f"    ☐ {s}")
+	else:
+		print("  No suggestions — loop setup looks complete!")
+	return 0
+
+
+def cmd_loop_session_start(args: argparse.Namespace) -> int:
+	"""Run one-shot session start diagnostic. No background loops."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	diag = engine.session_start()
+	print("[graphsift] Session diagnostics complete")
+	print(f"  Summary  : {diag['summary']}")
+	print(f"  Patterns : {len(diag.get('patterns_run', []))}")
+	for p in diag.get('patterns_run', []):
+		print(f"    - {p['pattern']}: {p['status']} ({p['tokens']} tok, {p['duration_ms']:.0f}ms)")
+	print(f"  Total    : {diag.get('total_tokens', 0)} tokens, {diag.get('total_duration_ms', 0):.0f}ms")
+	if diag.get('drift'):
+		for d in diag['drift']:
+			print(f"  Drift    : {d.get('type')}")
+	print()
+	print("  Tip: run 'graphsift loop run <pattern>' for deeper analysis")
+	print("  Tip: run 'graphsift loop diagnose' when you're stuck")
+	return 0
+
+
+def cmd_loop_diagnose(args: argparse.Namespace) -> int:
+	"""Run comprehensive diagnostic — use when struggling with code."""
+	import json
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	result = engine.run_diagnostic()
+	print(f"[graphsift] Diagnostic complete")
+	print(f"  Status   : {result.status.value}")
+	print(f"  Summary  : {result.summary}")
+	print(f"  Duration : {result.duration_ms:.0f}ms")
+	print(f"  Tokens   : {result.tokens_used}")
+	if args.message:
+		struggle = engine.detect_struggle(user_message=args.message)
+		if struggle['triggered']:
+			print(f"  Struggle : {struggle['reason']} (confidence: {struggle['confidence']:.1f})")
+			print(f"  Suggest  : run 'graphsift loop run {struggle['suggested_pattern'].value}'")
+	return 0
+
+
+def cmd_loop_struggle(args: argparse.Namespace) -> int:
+	"""Check for struggle signals in user message or failure patterns."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	result = engine.detect_struggle(user_message=args.message, repeated_failures=args.failures)
+	if result['triggered']:
+		print(f"[graphsift] Struggling detected: {result['reason']}")
+		print(f"  Confidence : {result['confidence']:.1f}")
+		print(f"  Suggested  : graphsift loop run {result['suggested_pattern'].value}")
+		print(f"  Or run     : graphsift loop diagnose")
+	else:
+		print("[graphsift] No struggle signals detected.")
+		print("  If you ARE stuck, try: graphsift loop diagnose")
+	return 0
+
+
+def cmd_loop_reset_breaker(args: argparse.Namespace) -> int:
+	"""Reset circuit breaker for a pattern."""
+	from graphsift.loop_engineering import LoopEngine
+
+	engine = LoopEngine(repo_root=args.project_root)
+	engine._circuit_breaker.reset(args.pattern)
+	print(f"[graphsift] Circuit breaker reset for pattern: {args.pattern}")
+	return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
+
+class _LazyPatternChoices:
+    """Defer PatternType import (and thus loop_engineering module) until arg validation."""
+    _values: list[str] | None = None
+
+    def _load(self) -> list[str]:
+        if self._values is None:
+            from .loop_engineering import PatternType  # noqa: PLC0415
+            _LazyPatternChoices._values = [p.value for p in PatternType]
+        return self._values
+
+    def __iter__(self):
+        return iter(self._load())
+
+    def __contains__(self, item):
+        return item in self._load()
+
+    def __len__(self):
+        return len(self._load())
+
 
 def _build_parser() -> argparse.ArgumentParser:
     from ._version import __version__  # noqa: PLC0415
@@ -1713,6 +2591,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--no-hooks", action="store_true", help="Skip hook injection")
     p_install.add_argument("--no-skills", action="store_true", help="Skip skill file creation")
     p_install.add_argument("--bash-wrapper", action="store_true", help="Install transparent bash command compression")
+    p_install.add_argument("--all", action="store_true", help="Show instructions for all supported CLIs")
+    p_install.add_argument("--claude-code", action="store_true", help="Show Claude Code instructions (default)")
+    p_install.add_argument("--claude-desktop", action="store_true", help="Show Claude Desktop instructions")
+    p_install.add_argument("--cursor", action="store_true", help="Show Cursor instructions")
+    p_install.add_argument("--windsurf", action="store_true", help="Show Windsurf instructions")
+    p_install.add_argument("--continue", dest="continue_", action="store_true", help="Show Continue.dev instructions")
+    p_install.add_argument("--codex", action="store_true", help="Show Codex CLI (OpenAI) instructions")
+    p_install.add_argument("--copilot", action="store_true", help="Show Copilot CLI instructions")
 
     # serve
     sub.add_parser("serve", help="Start MCP stdio server (used by Claude Code)")
@@ -1726,8 +2612,12 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Log progress every N files (default 200, 0=disable)")
     p_build.add_argument("--depth", choices=["planning", "exploration", "execution"],
                          default="execution", help="Context depth tier (default: execution)")
+    p_build.add_argument("--postprocess", action="store_true",
+                         help="Run flow/community/risk/FTS post-processing (off by default for speed)")
     p_build.add_argument("--skip-postprocess", action="store_true",
-                         help="Skip flow/community/risk/FTS post-processing after indexing")
+                         help=argparse.SUPPRESS)  # deprecated no-op, kept for compat
+    p_build.add_argument("--force", action="store_true",
+                         help="Force full rebuild (ignore SHA cache)")
 
     # update
     p_update = sub.add_parser("update", help="Incrementally update graph (changed files only)")
@@ -1748,6 +2638,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # watch
     p_watch = sub.add_parser("watch", help="Watch for file changes and auto-update graph")
     p_watch.add_argument("--project-root", default=_cwd())
+    p_watch.add_argument("--daemon", action="store_true", help="Run in background (no blocking)")
+
+    # guide
+    p_guide = sub.add_parser("guide", help="Pre-compute focused code context for agents")
+    p_guide.add_argument("task", nargs="*", help="Task description")
+    p_guide.add_argument("--project-root", default=_cwd())
 
     # claude-md
     p_claude = sub.add_parser("claude-md", help="Auto-generate CLAUDE.md with project topology")
@@ -1849,6 +2745,16 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Minimum confidence threshold 0-1 (default 0.0)")
     p_suggest.set_defaults(func=cmd_suggest_fixes)
 
+    # prune-refs
+    p_prune = sub.add_parser(
+        "prune-refs",
+        help="Scan for stale references to deleted files and optionally auto-fix",
+    )
+    p_prune.add_argument("--project-root", default=_cwd(), help="Repository root path (default: cwd)")
+    p_prune.add_argument("--fix", action="store_true", help="Auto-remove stale import lines (creates .bak backups)")
+    p_prune.add_argument("paths", nargs="*", metavar="PATH", help="Deleted file paths to scan (default: auto-detect from manifest)")
+    p_prune.set_defaults(func=cmd_prune_refs)
+
     # terse
     p_terse = sub.add_parser("terse", help="Return a terse mode prefix for LLM prompts")
     p_terse.add_argument("--level", choices=["lite", "full", "ultra"], default="lite",
@@ -1902,12 +2808,214 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--text", required=True, help="Text to check for citations")
     p_ev.add_argument("--project-root", default=_cwd(), help="Project root (default: cwd)")
 
+    # test-impact — smart selective test runner
+    p_ti = sub.add_parser(
+        "test-impact",
+        help="Smart test runner: run only tests affected by changed files. "
+             "Saves 60-95%% test time on incremental changes.",
+    )
+    p_ti.add_argument(
+        "mode", nargs="?",
+        choices=["full", "selective", "status"],
+        default="selective",
+        help="'full' = run all tests (baseline) | "
+             "'selective' = run only impacted tests (default) | "
+             "'status' = show last test snapshot",
+    )
+    p_ti.add_argument(
+        "--changed-files", nargs="*", default=None,
+        help="Space-separated file paths (auto-detected via git if omitted)",
+    )
+    p_ti.add_argument(
+        "--project-root", default=_cwd(),
+        help="Project root (default: cwd)",
+    )
+    p_ti.add_argument(
+        "--pytest-args", default="--tb=short -q",
+        help="Extra pytest arguments (default: '--tb=short -q')",
+    )
+    p_ti.add_argument(
+        "--timeout", type=int, default=120,
+        help="Test timeout in seconds (default: 120)",
+    )
+
+    # evolve
+    evolve_parser = sub.add_parser(
+        "evolve",
+        help="Run or manage evolutionary parameter optimization.",
+    )
+    evolve_sub = evolve_parser.add_subparsers(dest="evolve_action")
+
+    # evolve run
+    run_parser = evolve_sub.add_parser("run", help="Run evolution on the current codebase.")
+    run_parser.add_argument("--rounds", type=int, default=40, help="Number of evolution rounds.")
+    run_parser.add_argument("--population", type=int, default=6, help="Population per round.")
+    run_parser.add_argument("--source-dir", type=str, default=".", help="Root directory of the codebase.")
+
+    # evolve status
+    evolve_sub.add_parser("status", help="Show cached evolution results.")
+
+    # evolve clear
+    evolve_sub.add_parser("clear", help="Clear all cached evolution results.")
+
+    # -----------------------------------------------------------------------
+    # loop command  (loop-engineering)
+    # -----------------------------------------------------------------------
+    _lazy_pt = _LazyPatternChoices()
+    loop_parser = sub.add_parser("loop", help="Loop-engineering: scheduled automation patterns")
+    loop_sub = loop_parser.add_subparsers(dest="loop_action", required=True)
+
+    # loop init
+    p_loop_init = loop_sub.add_parser("init", help="Scaffold loop config for the project")
+    p_loop_init.add_argument("--project-root", default=_cwd())
+
+    # loop run
+    p_loop_run = loop_sub.add_parser("run", help="Run a specific loop pattern")
+    p_loop_run.add_argument("pattern", choices=_lazy_pt, help="Pattern to run")
+    p_loop_run.add_argument("--project-root", default=_cwd())
+
+    # loop status
+    p_loop_status = loop_sub.add_parser("status", help="Show loop engine status")
+    p_loop_status.add_argument("--project-root", default=_cwd())
+
+    # loop report
+    p_loop_report = loop_sub.add_parser("report", help="Full loop activity report")
+    p_loop_report.add_argument("--project-root", default=_cwd())
+
+    # loop schedule
+    p_loop_sched = loop_sub.add_parser("schedule", help="List scheduled patterns")
+    p_loop_sched.add_argument("--project-root", default=_cwd())
+
+    # loop cost
+    p_loop_cost = loop_sub.add_parser("cost", help="Estimate token cost per pattern")
+    p_loop_cost.add_argument("--pattern", choices=_lazy_pt, required=True, help="Pattern type")
+    p_loop_cost.add_argument("--maturity", choices=["L1", "L2", "L3"], default="L1", help="Maturity level")
+    p_loop_cost.add_argument("--project-root", default=_cwd())
+
+    # loop audit
+    p_loop_audit = loop_sub.add_parser("audit", help="Loop readiness score and suggestions")
+    p_loop_audit.add_argument("--project-root", default=_cwd())
+
+    # loop start (one-shot session start diagnostic)
+    p_loop_start = loop_sub.add_parser("session-start", help="Run one-shot session start diagnostic (~12K tokens, no background loops)")
+    p_loop_start.add_argument("--project-root", default=_cwd())
+
+    # loop diagnose (run when user is struggling)
+    p_loop_diag = loop_sub.add_parser("diagnose", help="Run comprehensive diagnostic (use when struggling with code)")
+    p_loop_diag.add_argument("--project-root", default=_cwd())
+    p_loop_diag.add_argument("--message", default="", help="User message to analyze for struggle signals")
+
+    # loop struggle (check for struggle signals)
+    p_loop_struggle = loop_sub.add_parser("struggle", help="Check if user is showing struggle signals")
+    p_loop_struggle.add_argument("--message", default="", help="User message to analyze")
+    p_loop_struggle.add_argument("--failures", type=int, default=0, help="Number of repeated failures")
+    p_loop_struggle.add_argument("--project-root", default=_cwd())
+
+    # loop cost
+    p_loop_breaker = loop_sub.add_parser("reset-breaker", help="Reset circuit breaker for a pattern")
+    p_loop_breaker.add_argument("pattern", help="Pattern name to reset")
+    p_loop_breaker.add_argument("--project-root", default=_cwd())
+
     return parser
 
 
 def main() -> None:
+    gc.freeze()  # freeze pre-import objects — GC never rescans them
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Handle evolve command with sub-actions inline
+    if args.command == "evolve":
+        from graphsift.evolve_registry import EvolveRegistry
+        registry = EvolveRegistry()
+
+        if args.evolve_action == "status":
+            entries = registry.list_entries()
+            if not entries:
+                print("No evolution results cached.")
+                return
+            print(f"Cached evolution results ({len(entries)}):")
+            print(f"  {'Fingerprint':<20} {'Score':<10} {'Params':<60}")
+            print(f"  {'-'*90}")
+            for e in entries:
+                fp = e.get("fingerprint", "?")[:16]
+                score = f"{e.get('score', 0):.4f}"
+                params_str = str(e.get("params", {}))
+                if len(params_str) > 55:
+                    params_str = params_str[:55] + "..."
+                print(f"  {fp:<20} {score:<10} {params_str:<60}")
+
+        elif args.evolve_action == "clear":
+            registry.clear()
+            print("Evolution cache cleared.")
+
+        elif args.evolve_action == "run":
+            # Collect source files
+            from pathlib import Path
+            from graphsift import PythonParser, DependencyGraph, DiffSpec
+
+            src_dir = Path(args.source_dir).resolve()
+            source_map = {}
+            for py_file in src_dir.rglob("*.py"):
+                if "venv" in str(py_file) or ".venv" in str(py_file) or "__pycache__" in str(py_file):
+                    continue
+                try:
+                    source_map[str(py_file.relative_to(src_dir))] = SafeFileIO.read(py_file)
+                except Exception:
+                    continue
+
+            if not source_map:
+                print(f"No Python files found in {args.source_dir}")
+                return
+
+            print(f"Found {len(source_map)} Python files. Running evolution...")
+            print(f"  Rounds: {args.rounds}, Population: {args.population}")
+
+            from graphsift.evolve import EvolutionOptimizer, ParameterSpace, make_evaluator
+
+            diff = DiffSpec(changed_files=list(source_map.keys())[:3], query="Optimize params")
+            space = ParameterSpace.full_space()
+            optimizer = EvolutionOptimizer(space, seed=42, verbose=True)
+            evaluator = make_evaluator(source_map, diff, space_type="full")
+
+            result = optimizer.optimize(
+                seed_params=space.defaults(),
+                evaluator=evaluator,
+                rounds=args.rounds,
+                population=args.population,
+            )
+
+            print(f"\nEvolution complete!")
+            print(f"  Best score: {result.best_score:.4f}")
+            print(f"  Improvements: {result.improvements}/{result.rounds}")
+            print(f"  Duration: {result.duration_s:.1f}s")
+            print(f"\nBest params:")
+            for k, v in result.best_params.items():
+                print(f"  {k}: {v}")
+
+        return
+
+    # Handle loop command with sub-actions
+    if args.command == "loop":
+        loop_actions = {
+            "init": cmd_loop_init,
+            "run": cmd_loop_run,
+            "status": cmd_loop_status,
+            "report": cmd_loop_report,
+            "schedule": cmd_loop_schedule,
+            "cost": cmd_loop_cost,
+            "audit": cmd_loop_audit,
+            "session-start": cmd_loop_session_start,
+            "diagnose": cmd_loop_diagnose,
+            "struggle": cmd_loop_struggle,
+            "reset-breaker": cmd_loop_reset_breaker,
+        }
+        fn = loop_actions.get(args.loop_action)
+        if fn:
+            sys.exit(fn(args))
+        else:
+            print(f"[graphsift] Unknown loop action: {args.loop_action}")
+            sys.exit(1)
 
     commands = {
         "install": cmd_install,
@@ -1933,15 +3041,18 @@ def main() -> None:
         "detect-cycles": cmd_detect_cycles,
         "detect-dead-code": cmd_detect_dead_code,
         "suggest-fixes": cmd_suggest_fixes,
+        "prune-refs": cmd_prune_refs,
         "terse": cmd_terse,
         "fix": cmd_fix,
         "add": cmd_add,
         "refactor": cmd_refactor,
         "verify": cmd_verify,
+        "test-impact": cmd_test_impact,
         "tool-budgets": cmd_tool_budgets,
         "read-cache": cmd_read_cache,
         "evidence": cmd_evidence,
         "claude-md": cmd_claude_md,
+        "guide": cmd_guide,
     }
 
     # Support func-based dispatch for new-style subcommands

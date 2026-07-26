@@ -123,7 +123,7 @@ class PruningStrategy(str, Enum):
 class GraphNode(BaseModel):
     """A symbol in the codebase dependency graph."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     node_id: str = Field(description="Unique identifier: file::symbol_path")
     file_path: str
@@ -152,7 +152,7 @@ class GraphNode(BaseModel):
 class GraphEdge(BaseModel):
     """A directed dependency between two nodes."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     source_id: str
     target_id: str
@@ -173,7 +173,7 @@ class GraphEdge(BaseModel):
 class FileNode(BaseModel):
     """Represents an indexed source file."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     path: str
     language: Language
@@ -194,7 +194,7 @@ class FileNode(BaseModel):
 class ScoredFile(BaseModel):
     """A file with its relevance score for a given query/diff."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, slots=True)
 
     file_node: FileNode
     score: float = Field(ge=0.0, le=1.0, description="Relevance score 0=irrelevant, 1=critical")
@@ -324,6 +324,22 @@ class ContextConfig(BaseModel):
     dedup_enabled: bool = Field(
         default=True,
         description="Enable entropy-based deduplication of near-identical files to improve context diversity.",
+    )
+    auto_evolve: bool = Field(
+        default=False,
+        description="When True, ContextBuilder automatically runs EvolutionOptimizer to tune parameters for this codebase.",
+    )
+    evolve_rounds: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Number of evolution rounds when auto_evolve is enabled.",
+    )
+    evolve_population: int = Field(
+        default=6,
+        ge=2,
+        le=20,
+        description="Population size per evolution round when auto_evolve is enabled.",
     )
     schema_version: int = Field(default=2, ge=1, description="Schema version for migration support")
 

@@ -181,14 +181,15 @@ class DatabasePool:
         conn = self.acquire()
         try:
             if params is not None:
-                return conn.execute(sql, params)
-            return conn.execute(sql)
+                cursor = conn.execute(sql, params)
+            else:
+                cursor = conn.execute(sql)
         except sqlite3.Error:
-            # Mark connection as suspect but still release it
             self.release(conn)
             raise
         else:
             self.release(conn)
+            return cursor
 
     def executemany(
         self,
@@ -206,12 +207,13 @@ class DatabasePool:
         """
         conn = self.acquire()
         try:
-            return conn.executemany(sql, params_list)
+            cursor = conn.executemany(sql, params_list)
         except sqlite3.Error:
             self.release(conn)
             raise
         else:
             self.release(conn)
+            return cursor
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -228,6 +230,8 @@ class DatabasePool:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA mmap_size=268435456")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     @staticmethod
@@ -284,6 +288,10 @@ class DatabasePool:
 
         for conn in in_use.values():
             try:
+                try:
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.Error:
+                    pass
                 conn.close()
             except sqlite3.Error:
                 pass
@@ -293,6 +301,10 @@ class DatabasePool:
             try:
                 conn = self._available.get_nowait()
                 try:
+                    try:
+                        conn.execute("PRAGMA optimize")
+                    except sqlite3.Error:
+                        pass
                     conn.close()
                 except sqlite3.Error:
                     pass
@@ -302,6 +314,10 @@ class DatabasePool:
         # Close any remaining tracked connections
         for conn in all_conns:
             try:
+                try:
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.Error:
+                    pass
                 conn.close()
             except sqlite3.Error:
                 pass

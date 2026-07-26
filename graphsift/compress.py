@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from graphsift.read_cache import SafeFileIO
+
 # ---------------------------------------------------------------------------
 # Compression level
 # ---------------------------------------------------------------------------
@@ -46,6 +48,12 @@ _NOISE_RE = re.compile(
     r"|[\d.]+\s*%"                           # percentage progress
     r"|[=\-]+\s*\d+%\s*[=\-]+"              # ==== 45% ==== style
     r")\s*$"
+)
+
+# Regex matching trivial getter/setter boilerplate and pass-through methods.
+# Used by _semantic_compress to collapse repeated trivial method patterns.
+_BOILERPLATE_RE = re.compile(
+    r"^\s*(?:def (get|set|is|has)_\w+|return self\.\w+|pass\s*#)"
 )
 
 
@@ -846,7 +854,7 @@ def tee_save(text: str, label: str = "output") -> Path | None:
         return None
     tee_path = Path(_TEE_DIR) / f"{label}.txt"
     tee_path.parent.mkdir(parents=True, exist_ok=True)
-    tee_path.write_text(text, encoding="utf-8")
+    SafeFileIO.write(tee_path, text)
     return tee_path
 
 
@@ -951,13 +959,10 @@ def _semantic_compress(text: str) -> str:
         i += 1
 
     # Second pass: collapse getter/setter / trivial method patterns
-    boiler_re = re.compile(
-        r"^\s*(?:def (get|set|is|has)_\w+|return self\.\w+|pass\s*#)"
-    )
     filtered: list[str] = []
     boiler_count = 0
     for line in collapsed:
-        if boiler_re.match(line):
+        if _BOILERPLATE_RE.match(line):
             boiler_count += 1
         else:
             if boiler_count > 0:

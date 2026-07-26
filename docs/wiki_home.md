@@ -1,7 +1,7 @@
 # graphsift Wiki Home
 
-> **graphsift v3.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).  
-> The #1 token saver for Claude, GPT-4 & Gemini. 80-150× fewer tokens, F1 0.85 relevance accuracy, 93% feature coverage.
+> **graphsift v3.1** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).  
+> The #1 token saver for Claude, GPT-4 & Gemini. 80-150× fewer tokens, F1 0.85 relevance accuracy, 95% feature coverage, 767 tests.
 
 <p align="center">
   <a href="https://pepy.tech/projects/graphsift"><img src="https://static.pepy.tech/badge/graphsift" alt="Downloads"></a>

@@ -330,6 +330,7 @@ class Harness:
         self._hooks: list[HarnessHook] = []
         self._lock = threading.RLock()
         self._stats: HarnessStats = HarnessStats()
+        self.drift_detector: DriftDetector = DriftDetector(window_size=10)
 
     # ------------------------------------------------------------------
     # Hook registry
@@ -453,7 +454,70 @@ class Harness:
 
         self._stats.last_run = time.time()
         self._stats.warnings_issued += len(warnings)
+
+        # Auto-drift check after build
+        try:
+            if diff_spec and hasattr(self, 'drift_detector'):
+                action = AgentAction(
+                    action_type="build",
+                    target=str(getattr(diff_spec, 'changed_files', [])),
+                    timestamp=time.time(),
+                )
+                alerts = self.drift_detector.record(action)
+                if alerts:
+                    self._stats.drift_alerts += len(alerts)
+                    for alert in alerts:
+                        logger.warning("Drift alert [%s]: %s", alert.severity, alert.suggestion)
+        except Exception:
+            pass
+
         return warnings
+
+    def record_action(self, action_type: str, target: str, metadata: dict | None = None) -> list:
+        """Record an agent action and check for drift. Never raises.
+
+        Args:
+            action_type: Type of action (``"build"``, ``"index"``, ``"read"``, etc.).
+            target: File path, symbol, or description the action targets.
+            metadata: Optional extra data attached to the action.
+
+        Returns:
+            List of ``DriftAlert`` instances (empty if no drift detected).
+        """
+        try:
+            if not hasattr(self, 'drift_detector'):
+                return []
+            action = AgentAction(
+                action_type=action_type,
+                target=target,
+                timestamp=time.time(),
+                metadata=metadata or {},
+            )
+            alerts = self.drift_detector.record(action)
+            if alerts:
+                self._stats.drift_alerts += len(alerts)
+                for alert in alerts:
+                    logger.warning("Drift alert [%s]: %s", alert.severity, alert.suggestion)
+            return alerts or []
+        except Exception:
+            return []
+
+    def drift_report(self) -> dict:
+        """Return current drift state. Never raises.
+
+        Returns:
+            Dict with keys ``alerts``, ``total_actions``, and ``stats``.
+        """
+        try:
+            if not hasattr(self, 'drift_detector'):
+                return {"alerts": [], "total_actions": 0, "stats": {"drift_alerts": 0}}
+            return {
+                "alerts": [str(a) for a in self.drift_detector.alerts],
+                "total_actions": len(getattr(self.drift_detector, '_recent_actions', [])),
+                "stats": {"drift_alerts": self._stats.drift_alerts},
+            }
+        except Exception:
+            return {"alerts": [], "total_actions": 0, "stats": {"drift_alerts": 0}}
 
     def run_pre_index(self, root_path: str) -> list[str]:
         """Run all pre_index hooks.

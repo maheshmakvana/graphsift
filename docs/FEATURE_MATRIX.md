@@ -1,8 +1,8 @@
 # graphsift v3.0 — Complete Feature Matrix
 
-> **The full inventory of all 38 modules, 25 CLI compressors, 7 MCP tools, and every capability in graphsift v3.0.**
+> **The full inventory of all 40 modules, 25 CLI compressors, 7 MCP tools, and every capability in graphsift v3.1.**
 >
-> Coverage: **93%** (25/27 features delivered). Tests: **702** (+115% from v2.3). Star on [GitHub](https://github.com/maheshmakvana/graphsift).
+> Coverage: **95%** (27/28 features delivered). Tests: **767** (+9% from v3.0). Star on [GitHub](https://github.com/maheshmakvana/graphsift).
 
 ---
 
@@ -71,6 +71,22 @@
 | `planner.py` | `Planner` | ~350 | Plan-first engine — 7 phases (scan → analyze → architect → plan → execute → validate → review) | — |
 | `planner.py` | `ExecutionPlan` | ~100 | Structured plan with ordered phases and topological steps | — |
 | `toolchain.py` | `ToolChain` | ~250 | DAG-based step chains — build, review, run with rollback | — |
+
+### 🔄 Loop Engineering (2 new modules)
+
+| Module | Class/Function | Lines | Description | CLI Command |
+|--------|---------------|:----:|-------------|:-----------:|
+| `loop_engineering.py` | `LoopEngine` | ~450 | Main orchestrator — struggle-aware loop execution | `graphsift loop` |
+| `loop_engineering.py` | `StruggleDetector` | ~80 | Detects repeated failures, frustration, approach changes | — |
+| `loop_engineering.py` | `LoopState` | ~100 | Persistent JSON state + run ledger | — |
+| `loop_engineering.py` | `CircuitBreaker` | ~60 | Auto-stops after 5 consecutive failures | `loop reset-breaker` |
+| `loop_engineering.py` | `HumanGate` | ~50 | L1/L2/L3 maturity safety model | — |
+| `loop_engineering.py` | `LoopCostBudgeter` | ~60 | 500K tokens/day per-pattern cost cap | `loop cost` |
+| `loop_engineering.py` | `WorktreeManager` | ~70 | Git worktree isolation | — |
+| `loop_engineering.py` | `7 Pattern Types` | ~80 | Daily Triage, PR, CI, Deps, Changelog, Cleanup, Issues | `loop run <pattern>` |
+| `loop_config.py` | `LoopConfig` | ~80 | JSON config at `.graphsift/loop-config.json` | `loop init` |
+| — | SessionStart | — | One-shot ~12K tok diagnostic at session start | `loop session-start` |
+| — | Audit Readiness | — | Loop readiness score (0-100) | `loop audit` |
 
 ### 🔒 Security (4 modules)
 
