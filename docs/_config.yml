@@ -1,0 +1,12 @@
+# GitHub Pages configuration for graphsift
+title: graphsift
+description: LLM Token Optimization Engine — 80-150x token reduction for Claude, GPT-5 & Gemini
+url: https://maheshmakvana.github.io/graphsift
+github_repo: maheshmakvana/graphsift
+lang: en_US
+# No Jekyll theme needed — we use a static index.html
+include:
+  - index.html
+  - robots.txt
+  - sitemap.xml
+  - images

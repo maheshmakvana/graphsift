@@ -2,7 +2,7 @@
 
 > **Version:** 3.0.0 · Created by [Mahesh Makwana](https://github.com/maheshmakvana) · [Source](https://github.com/maheshmakvana/graphsift/tree/master/graphsift)
 >
-> *Save Claude tokens. Reduce GPT-4 costs. Optimize Gemini context windows. 80-150x token reduction.*
+> *Save Claude tokens. Reduce GPT costs. Optimize Gemini context windows. 80-150x token reduction.*
 
 ---
 

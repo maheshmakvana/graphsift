@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — #1 LLM Token Saver — Reduce Claude GPT-4 Gemini API Costs by 99%" width="600">
+  <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — LLM Token Optimization Engine for Claude, GPT-5 & Gemini" width="600" style="max-width:100%;height:auto">
 </p>
 
 <h1 align="center">graphsift v4.5.0</h1>
 <p align="center">
-  <strong>#1 Token Saver for Claude, GPT-4, Gemini & Every LLM —<br>
+  <strong>Token Saver for Claude, GPT-5, Gemini & Every LLM —<br>
   80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 826+ Tests, Zero External Dependencies<br>
   Reduce LLM API Costs by Up to 99% — Works with Claude Code, Cursor, Windsurf, Continue.dev, Codex CLI, Copilot CLI & Any Terminal</strong>
 </p>
@@ -124,15 +124,53 @@ tests/stress/test_memory_leak.py ....  4 passed
 - **Unicode Sanitizer** — Strips control characters from CLI output. No more classifier crashes.
 
 <p align="center">
-  <a href="#-save-tokens-save-money-why-graphsift">Why graphsift?</a> ·
+  <a href="#-save-claude-gpt--gemini-api-costs--graphsift-v450">Why graphsift?</a> ·
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-install">Install</a> ·
   <a href="#-api-overview">API</a> ·
-  <a href="#-new-in-v31">v3.1</a> ·
   <a href="#-benchmarks">Benchmarks</a> ·
-  <a href="#-july-2026--prompt-engineering-benchmark-graphsift-extended-wins-9310">Prompt Benchmark</a> ·
-  <a href="#-docs">Docs</a>
+  <a href="#-with-vs-without-graphsift">WITH vs WITHOUT</a> ·
+  <a href="#-security-first-architecture">Security</a> ·
+  <a href="#-further-reading">Docs</a>
 </p>
+
+<br>
+
+<details>
+<summary><strong>📑 Full Table of Contents</strong></summary>
+
+- [v4.5.0 — Performance Release](#-v450--performance-acceleration-12-optimizations-zero-external-dependencies)
+- [Install](#-install)
+- [Quick Start](#-quick-start)
+- [Why graphsift?](#-save-claude-gpt--gemini-api-costs--graphsift-v450)
+  - [Who saves with graphsift](#who-saves-with-graphsift)
+  - [Comparison vs alternatives](#-graphsift-vs-alternatives)
+- [Core Concepts](#-core-concepts)
+- [API Overview](#-api-overview)
+  - [Core Context API](#core-context-api)
+  - [Compression & Output](#compression--output)
+  - [Search & Retrieval](#search--retrieval)
+  - [Memory & Persistence](#memory--persistence)
+  - [Planning & Execution](#planning--execution)
+  - [Security](#security)
+  - [CLI Commands](#cli-commands)
+- [Live Download Statistics](#-live-download-statistics)
+- [Benchmarks](#-benchmarks)
+  - [Relevance Accuracy](#relevance-accuracy-f1-score)
+  - [Token Reduction](#token-reduction--save-claude--openai-costs)
+  - [Performance](#performance-v450)
+  - [CLI Output Compression](#cli-output-compression--19-command-types)
+- [Prompt Engineering Benchmark](#-july-2026--prompt-engineering-benchmark-graphsift-extended-wins-9310)
+- [WITH vs WITHOUT graphsift](#-with-vs-without-graphsift--how-claude-gpt-5-and-gemini-behave-differently)
+  - [Hallucination Risk](#-hallucination-risk--with-vs-without-graphsift)
+  - [Cost Comparison](#cost-comparison--monthly--per-session)
+- [Security Architecture](#-security-first-architecture)
+- [Further Reading](#-further-reading)
+- [Related Projects](#-related-token-saving-projects)
+- [Author](#-author)
+- [License](#-license)
+
+</details>
 
 
 ## 🤖 NEW in v3.5 - Intelligent Auto-Compression + Agent Guidance
@@ -288,13 +326,13 @@ Built-in safety gates prevent performance issues on large repos:
 
 ---
 
-## 🚀 Save Claude Tokens, Reduce GPT-4 & Gemini API Costs — graphsift v4.5.0
+## 🚀 Save Claude, GPT & Gemini API Costs — graphsift v4.5.0
 
-**graphsift** is the **#1 Python library for LLM token optimization** — purpose-built for AI-assisted development with Claude Code, GPT-4, Gemini, Codex, and every major LLM. It's the only token saver that combines **AST dependency graph analysis**, **BM25+graph ranked relevance scoring**, **14-language tree-sitter parsing**, **25 CLI output compressors**, and **50+ Python modules** into a single zero-dependency package.
+**graphsift** is a **Python library for LLM token optimization** — purpose-built for AI-assisted development with Claude Code, GPT-5, Gemini, and every major LLM. It combines **AST dependency graph analysis**, **BM25+graph ranked relevance scoring**, **14-language tree-sitter parsing**, **25 CLI output compressors**, and **50+ Python modules** into a single zero-dependency package.
 
 Every time you send code to an LLM for review, debugging, or generation, graphsift **ranks every file by relevance** (F1 0.85), **enforces hard token budgets**, **compresses CLI output** (60-97% savings), and **blocks prompt injection** — delivering **80–150× token reduction** with **826+ passing tests** and **99% feature coverage**.
 
-> **Save up to 99% on Claude Code API costs. Reduce OpenAI GPT-4 bills by $0.036/review. Keep Gemini within context limits on large monorepos. Trusted by developers worldwide.**
+> **Save up to 99% on Claude Code API costs. Reduce OpenAI GPT bills by $0.036/review. Keep Gemini within context limits on large monorepos.**
 
 ### Why graphsift Reduces LLM Costs Better Than Any Alternative
 
@@ -303,7 +341,7 @@ Every time you send code to an LLM for review, debugging, or generation, graphsi
 | **Reduce Claude Code token costs** | ✓ 80-150× context compression | Blast-radius: 4× only |
 | **CLI output compression for LLMs** | ✓ 25 compressors, 60-97% savings | Manual grep/sed: fragile |
 | **Code review context optimization** | ✓ F1 0.85 relevance ranking | Binary graph: 0.54 F1 |
-| **Multi-LLM support** | ✓ Claude, GPT-4, Gemini, Codex, Copilot | Single-LLM tools |
+| **Multi-LLM support** | ✓ Claude, GPT-5, Gemini, Codex, Copilot | Single-LLM tools |
 | **MCP server for Claude Code** | ✓ 49 tools, 4 prompts | None |
 | **Anti-hallucination guardrails** | ✓ 6 Fable5 templates with evidence markers | None |
 | **Security** | ✓ PathValidator + CommandSanitizer + DataScrubber | None |
@@ -323,7 +361,7 @@ Every time you send code to an LLM for review, debugging, or generation, graphsi
 | User | Savings | Why |
 |------|:-------:|-----|
 | **Claude Code users** | Up to **99%** per review | Ranked context + token budgets eliminate context bloat |
-| **OpenAI / GPT-4 devs** | **$0.036/review** instead of $5.40 | Smart file selection slashes API costs |
+| **OpenAI / GPT devs** | **$0.036/review** instead of $5.40 | Smart file selection slashes API costs |
 | **Gemini & Codex teams** | Stay within context limits | Never hit the ceiling on large monorepos |
 | **MCP-connected agents** | Automatic optimization | 7+ MCP tools for token-efficient workflows |
 | **CI/CD pipelines** | **60-97%** compression | Compress pytest/eslint/kubectl output before LLM analysis |
@@ -348,7 +386,7 @@ graphsift is downloaded **10,365 times** (all-time) on PyPI, with **1,533 downlo
 | ⭐ **Total downloads (all-time)** | **10,365** |
 | 📅 **Last 30 days** | **1,533** |
 | ⏰ **Last 24 hours** | **549** |
-| 🏷️ **Latest version** | **1.5.3** |
+| 🏷️ **Latest version** | **4.5.0** |
 | 👥 **Unique downloaders (approx.)** | Tracked live on [pepy.tech](https://pepy.tech/projects/graphsift) |
 
 > **Note:** PyPI download counts reflect `pip install` and CI pipeline pulls. Unique downloader counts are approximated by IP address on pepy.tech.
@@ -432,7 +470,7 @@ v3.0 shipped **11 entirely new modules**, **702 tests** (+115%), and **93% featu
 
 ### Full v2.3 → v3.0 Upgrade
 
-See the [V3 Upgrade Guide](docs/V3_UPGRADE_GUIDE.md) for the complete 27-feature comparison matrix. **25/27 features delivered (93%).**
+For the v2.3 → v3.0 feature comparison matrix, see the version history in the [Changelog](CHANGELOG.md). **25/27 features delivered (93%).**
 
 ```
 Category              v2.3           v3.0              Improvement
@@ -592,13 +630,13 @@ graphsift discover      # Find missed token-saving opportunities
 
 Benchmarked on a **143-file FastAPI app** reviewing a 50-line change to `auth/manager.py`:
 
-| Approach | Files Sent | Tokens | Cost (GPT-4 @ $30/M) | Cost (Claude Opus @ $15/M) | Savings vs Raw |
+| Approach | Files Sent | Tokens | Cost (GPT-5 @ $15/M) | Cost (Claude Fable @ $15/M) | Savings vs Raw |
 |---|---|---|---|---|---|
-| Raw source | 143/143 | ~180,000 | $5.40 | $2.70 | — |
-| Binary blast-radius | 8–12/143 | 6,000–8,000 | $0.24 | $0.10 | 96% |
-| **graphsift (ranked + budget)** | **3–5/143** | **800–1,200** | **$0.036** | **$0.015** | **99.4%** |
+| Raw source | 143/143 | ~180,000 | $2.70 | $2.70 | — |
+| Binary blast-radius | 8–12/143 | 6,000–8,000 | $0.10 | $0.10 | 96% |
+| **graphsift (ranked + budget)** | **3–5/143** | **800–1,200** | **$0.015** | **$0.015** | **99.4%** |
 
-> **Save $2.69 per code review** with Claude Opus. On 100 reviews/month = **$269/month savings**.
+> **Save $2.68 per code review** with GPT-5 or Claude Fable. On 100 reviews/month = **$268/month savings**.
 
 ### Performance (v4.5.0)
 
@@ -661,7 +699,7 @@ from graphsift.prompt_templates import get_template; tpl = get_template("extende
 
 ---
 
-## ⚖️ WITH vs WITHOUT graphsift — How Claude, GPT-4, and Gemini Behave Differently
+## ⚖️ WITH vs WITHOUT graphsift — How Claude, GPT-5, and Gemini Behave Differently
 
 > **The single most important question graphsift answers:** *What happens when you build a real project with an LLM — FastAPI backend, React frontend, database, auth — and you DON'T optimize your context window?*
 
@@ -682,7 +720,7 @@ Tested across **15 real-world developer scenarios** and validated against a **fu
 
 ### Full Project Lifecycle — Building a FastAPI + React App
 
-When building a **FastAPI backend + React frontend** (with auth, database models, API routes, and CI/CD) using Claude Code, GPT-4, or Gemini — the difference between an optimized and unoptimized context window is the difference between **shipping in hours vs fighting hallucinations all day**.
+When building a **FastAPI backend + React frontend** (with auth, database models, API routes, and CI/CD) using Claude Code, GPT-5, or Gemini — the difference between an optimized and unoptimized context window is the difference between **shipping in hours vs fighting hallucinations all day**.
 
 | Dev Phase | 📦 WITHOUT graphsift | ⚡ WITH graphsift | Savings |
 |:---|---:|---:|---:|
@@ -743,11 +781,6 @@ WITH graphsift:     [PROJECT LOGIC][PROJECT LOGIC][PROJECT LOGIC][PROJECT LOGIC]
 
 > **Bottom line:** A team of 5 developers doing CI/CD + daily reviews saves **$68.50/month** — and that's just the *token cost*. The real savings are in **shipping 2–3× faster** because your LLM actually sees your code.
 
-### Real Developer Testimony
-
-> *"Before graphsift, I'd ask Claude to add a route and it would create endpoints I never defined — it was guessing because it couldn't see the router file anymore. After graphsift, it references the exact route decorators. Night and day."*
-> — graphsift user, FastAPI + React project
-
 ---
 
 **Without graphsift:** Claude reads 2,748 tokens of unfiltered output — ANSI escapes, timestamps, progress bars, PASSED lines. It must *find* the problem in the noise.
@@ -782,11 +815,10 @@ graphsift is built on a **zero-exfiltration, local-first** architecture:
 
 | Document | What It Covers |
 |---|---|
-| [V3 Upgrade Guide](docs/V3_UPGRADE_GUIDE.md) | Full v2.3 → v3.0 feature comparison (27 features, 93% coverage) |
-| [Architecture Deep Dive](docs/DECONSTRUCTING_GRAPHSIFT_ARCHITECTURE.md) | Module design, data flow, architectural decisions |
+| [Prompt Engineering Benchmark](docs/PROMPT_BENCHMARK_2026.md) | 4 prompt architectures compared — 12 scenarios, 9.4/10 winner |
+| [Architecture Guide](docs/GUIDE.md) | System design, use cases, FAQ, and detailed walkthrough |
 | [API Reference](docs/API_REFERENCE.md) | Complete reference for all public classes and functions |
-| [Economics of LLM Context Windows](docs/ECONOMICS_MECHANICS_OF_LLM_CONTEXT_WINDOWS.md) | Why context optimization is the highest-leverage AI investment |
-| [Wiki Home](docs/wiki_home.md) | Community wiki — FAQ, use cases, deep dives |
+| [Why graphsift Detailed](docs/WHY_GRAPHSIFT_DETAILED.md) | In-depth explanation with benchmarks and cost analysis |
 | [Changelog](CHANGELOG.md) | Full release history |
 | [Contributing Guide](CONTRIBUTING.md) | Development setup, code style, PR workflow |
 | [Security Policy](SECURITY.md) | Zero-exfiltration design, data handling |

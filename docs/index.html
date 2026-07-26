@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>graphsift — LLM Token Optimization Engine</title>
+  <meta name="description" content="graphsift: Ranked context selection for LLM-powered code review. 80-150x token reduction, F1 0.85 relevance accuracy. AST dependency graph, CLI compression, MCP server. Save Claude, GPT-5 & Gemini costs.">
+  <meta name="keywords" content="llm token optimization, claude token saver, code review context, ast dependency graph, mcp server, gemini api costs, cli output compression">
+  <meta name="author" content="Mahesh Makwana">
+  <meta name="theme-color" content="#2563eb">
+  <meta property="og:title" content="graphsift — LLM Token Optimization Engine">
+  <meta property="og:description" content="80-150x token reduction for Claude, GPT-5 & Gemini. AST dependency graph, BM25 ranking, CLI compression, MCP server. Zero external deps.">
+  <meta property="og:url" content="https://github.com/maheshmakvana/graphsift">
+  <meta property="og:type" content="software">
+  <meta property="og:image" content="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png">
+  <meta property="og:site_name" content="graphsift">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="graphsift — LLM Token Optimization Engine">
+  <meta name="twitter:description" content="80-150x token reduction for Claude, GPT-5 & Gemini. AST dep graph, BM25 ranking, CLI compression, MCP server. Zero external deps.">
+  <link rel="canonical" href="https://github.com/maheshmakvana/graphsift">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "graphsift",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Linux, macOS, Windows",
+    "description": "Ranked context selection for LLM-powered code review. 80-150x token reduction, F1 0.85 relevance accuracy. AST dependency graph, BM25+graph ranking, CLI output compression, MCP server.",
+    "url": "https://github.com/maheshmakvana/graphsift",
+    "downloadUrl": "https://pypi.org/project/graphsift/",
+    "softwareVersion": "4.5.0",
+    "releaseNotes": "https://github.com/maheshmakvana/graphsift/releases",
+    "license": "https://opensource.org/licenses/MIT",
+    "author": {
+      "@type": "Person",
+      "name": "Mahesh Makwana",
+      "url": "https://github.com/maheshmakvana"
+    },
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "aggregateRating": {
+      "@type": "AggregateRating",
+      "ratingValue": "4.5",
+      "bestRating": "5",
+      "ratingCount": "4",
+      "reviewCount": "0"
+    },
+    "featureList": [
+      "Ranked context selection for code review",
+      "AST dependency graph parsing (14 languages)",
+      "BM25+graph relevance scoring",
+      "CLI output compression (19+ command types)",
+      "MCP server with 52 tools",
+      "Agent memory and cross-session persistence",
+      "Zero telemetry, zero external dependencies"
+    ],
+    "programmingLanguage": "Python",
+    "requirements": "Python 3.9+",
+    "softwareHelp": {
+      "@type": "WebPage",
+      "url": "https://github.com/maheshmakvana/graphsift#readme"
+    }
+  }
+  </script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; line-height: 1.6; color: #1a1a2e; background: #f8f9fa; }
+    .container { max-width: 800px; margin: 0 auto; padding: 3rem 1.5rem; }
+    h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; background: linear-gradient(135deg, #2563eb, #7c3aed); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    h2 { font-size: 1.25rem; font-weight: 500; color: #475569; margin-bottom: 2rem; }
+    .hero { text-align: center; padding: 4rem 0 2rem; }
+    .hero p { font-size: 1.1rem; max-width: 600px; margin: 1rem auto; color: #64748b; }
+    .cta { display: inline-flex; gap: 0.5rem; align-items: center; background: #2563eb; color: #fff; padding: 0.75rem 1.5rem; border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 1.5rem; font-size: 0.95rem; }
+    .cta:hover { background: #1d4ed8; }
+    .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem; margin: 3rem 0; }
+    .feature { background: #fff; padding: 1.5rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .feature h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; color: #1e293b; }
+    .feature p { font-size: 0.875rem; color: #64748b; }
+    .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 2rem 0; text-align: center; }
+    .metric { background: #fff; padding: 1.5rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .metric .value { font-size: 1.75rem; font-weight: 700; color: #2563eb; }
+    .metric .label { font-size: 0.8rem; color: #94a3b8; margin-top: 0.25rem; }
+    .badges { text-align: center; margin: 2rem 0; }
+    .badges img { height: 24px; margin: 0.25rem; }
+    .links { text-align: center; margin: 3rem 0; }
+    .links a { color: #2563eb; text-decoration: none; margin: 0 0.75rem; font-size: 0.9rem; }
+    .links a:hover { text-decoration: underline; }
+    code { background: #e2e8f0; padding: 0.125rem 0.375rem; border-radius: 4px; font-size: 0.85rem; }
+    footer { text-align: center; padding: 2rem 0; color: #94a3b8; font-size: 0.85rem; }
+    .install { background: #1e293b; color: #e2e8f0; padding: 1.25rem; border-radius: 12px; text-align: center; margin: 2rem 0; }
+    .install code { background: #334155; color: #f1f5f9; font-size: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="hero">
+      <h1>graphsift</h1>
+      <h2>LLM Token Optimization Engine</h2>
+      <div class="badges">
+        <img src="https://img.shields.io/pypi/v/graphsift.svg?style=flat&color=blue" alt="PyPI version">
+        <img src="https://img.shields.io/pypi/pyversions/graphsift.svg?style=flat&color=blue" alt="Python versions">
+        <img src="https://static.pepy.tech/badge/graphsift" alt="Downloads">
+        <img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="Stars">
+        <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
+      </div>
+      <p>Ranked context selection for AI-assisted development. Automatically delivers the most relevant code to your LLM — using 80–150× fewer tokens with F1 0.85 accuracy.</p>
+      <a href="https://github.com/maheshmakvana/graphsift" class="cta">View on GitHub →</a>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="value">80–150×</div><div class="label">Token Reduction</div></div>
+      <div class="metric"><div class="value">0.85</div><div class="label">F1 Relevance</div></div>
+      <div class="metric"><div class="value">826+</div><div class="label">Tests Passing</div></div>
+    </div>
+
+    <div class="install">
+      <code>pip install graphsift</code><br>
+      <small style="color: #94a3b8; display: block; margin-top: 0.5rem;">Zero external deps · Zero telemetry · Works with Claude, GPT-5, Gemini</small>
+    </div>
+
+    <div class="features">
+      <div class="feature">
+        <h3>Ranked Context</h3>
+        <p>BM25 + graph proximity scoring selects only the files that matter for your change.</p>
+      </div>
+      <div class="feature">
+        <h3>CLI Compression</h3>
+        <p>19+ command-specific compressors — pytest, git, npm, docker, kubectl — at 60–97% savings.</p>
+      </div>
+      <div class="feature">
+        <h3>AST Graph</h3>
+        <p>Parses 14 languages. Traces imports, symbols, class hierarchies, and decorator patterns.</p>
+      </div>
+      <div class="feature">
+        <h3>MCP Server</h3>
+        <p>52 MCP tools for Claude Code. Automatic context optimization, compression, and verification.</p>
+      </div>
+      <div class="feature">
+        <h3>Agent Memory</h3>
+        <p>SQLite-backed cross-session knowledge graph with TTL-based expiry and convention learning.</p>
+      </div>
+      <div class="feature">
+        <h3>Security First</h3>
+        <p>Path validation, command sanitization, data scrubbing. Zero network calls during analysis.</p>
+      </div>
+    </div>
+
+    <div class="links">
+      <a href="https://github.com/maheshmakvana/graphsift">GitHub</a>
+      <a href="https://pypi.org/project/graphsift/">PyPI</a>
+      <a href="https://github.com/maheshmakvana/graphsift#readme">Documentation</a>
+      <a href="https://github.com/maheshmakvana/graphsift/blob/master/docs/API_REFERENCE.md">API Reference</a>
+      <a href="https://github.com/maheshmakvana/graphsift/blob/master/CHANGELOG.md">Changelog</a>
+    </div>
+
+    <footer>
+      Created by <a href="https://github.com/maheshmakvana" style="color: #64748b;">Mahesh Makwana</a> · MIT License · <a href="https://github.com/maheshmakvana/graphsift/blob/master/SECURITY.md" style="color: #64748b;">Zero Telemetry</a>
+    </footer>
+  </div>
+</body>
+</html>

@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: "graphsift: Ranked Code Context Selection for LLM Token Optimization"
+message: "If you use graphsift in your research, please cite it as below."
+type: software
+authors:
+  - family-names: Makwana
+    given-names: Mahesh
+    email: maheshmakwana527@gmail.com
+    orcid: ""
+    website: "https://github.com/maheshmakvana"
+version: 4.5.0
+date-released: 2026-07-23
+url: "https://github.com/maheshmakvana/graphsift"
+repository-code: "https://github.com/maheshmakvana/graphsift"
+license: MIT
+keywords:
+  - llm-token-optimization
+  - code-context-selection
+  - claude-code
+  - mcp-server
+  - ast-dependency-graph
+  - ranked-relevance
+  - cli-output-compression
