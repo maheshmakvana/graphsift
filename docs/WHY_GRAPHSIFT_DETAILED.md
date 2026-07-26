@@ -22,7 +22,7 @@
 
 ## 🚨 The Problem: Context Window Is Your #1 Bottleneck
 
-Every LLM — whether Claude, GPT-4, Gemini, or Codex — has a **context window limit** (typically 100K–200K tokens for Claude, 128K for GPT-4, 1M for Gemini). You'd think bigger is better.
+Every LLM — whether Claude, GPT-5, Gemini, or Codex — has a **context window limit** (typically 100K–200K tokens for Claude, 128K for GPT-5, 1M for Gemini). You'd think bigger is better.
 
 **The reality:** When you send your codebase to an LLM for review, debugging, or code generation, the math works against you:
 
@@ -201,8 +201,7 @@ Hallucination in code generation is not random — it's **caused by missing cont
 | Claude Opus | $15/M | $2.70 | $0.30 | **89%** |
 | Claude Sonnet | $3/M | $0.54 | $0.06 | **89%** |
 | Claude Haiku | $0.25/M | $0.045 | $0.005 | **89%** |
-| GPT-4 Turbo | $10/M | $1.80 | $0.20 | **89%** |
-| GPT-4o | $2.50/M | $0.45 | $0.05 | **89%** |
+| GPT-5 | $15/M | $2.70 | $0.015 | **99.4%** |
 | Gemini 1.5 Pro | $1.25/M | $0.225 | $0.025 | **89%** |
 
 > **No matter which LLM you use, graphsift cuts your token costs by ~87–89%.**
@@ -245,7 +244,7 @@ Hallucination in code generation is not random — it's **caused by missing cont
 | User Profile | Why graphsift | Expected Savings |
 |-------------|--------------|:----------------:|
 | **Claude Code daily user** | Automatic token optimization via MCP tools | Up to **99%** per review |
-| **OpenAI / GPT-4 developer** | $0.036/review instead of $5.40 | **~$5.36/review** |
+| **OpenAI / GPT developer** | $0.015/review instead of $2.70 | **~$2.68/review** |
 | **Gemini / Codex team** | Stay within context limits on monorepos | **Never hit ceiling** |
 | **CI/CD pipeline operator** | Compress test/lint output before LLM analysis | **60–97%** compression |
 | **Multi-agent system builder** | Compress inter-agent conversation | **60–82%** savings |
@@ -274,7 +273,7 @@ Hallucination in code generation is not random — it's **caused by missing cont
 
 ### Will graphsift work with any LLM?
 
-**Yes.** Claude, GPT-4, Gemini, Codex, Llama, Mistral, Copilot — any LLM that accepts text/code input. graphsift just optimizes what you send. It doesn't care about the model.
+**Yes.** Claude, GPT-5, Gemini, Codex, Llama, Mistral, Copilot — any LLM that accepts text/code input. graphsift just optimizes what you send. It doesn't care about the model.
 
 ### Can I use graphsift with Caveman?
 
@@ -325,17 +324,15 @@ builder = ContextBuilder(ContextConfig(token_budget=2000))
 
 | Resource | What You'll Find |
 |----------|-----------------|
-| [Main README](../README.md) | Quick start, install, full API reference |
-| [Feature Matrix](FEATURE_MATRIX.md) | Complete inventory of all 38 modules and 25 compressors |
+| [Main README](../README.md) | Quick start, install, full API overview |
 | [API Reference](API_REFERENCE.md) | Complete reference for all public classes and functions |
-| [Architecture Deep Dive](DECONSTRUCTING_GRAPHSIFT_ARCHITECTURE.md) | Module design, data flow, architectural decisions |
-| [Economics of LLM Context Windows](ECONOMICS_MECHANICS_OF_LLM_CONTEXT_WINDOWS.md) | Why context optimization is the highest-leverage AI investment |
-| [V3 Upgrade Guide](V3_UPGRADE_GUIDE.md) | Full v2.3 → v3.0 feature comparison |
+| [Architecture Guide](GUIDE.md) | System design, use cases, and FAQ |
+| [Prompt Benchmark](PROMPT_BENCHMARK_2026.md) | 4 prompt architectures compared |
 | [Changelog](../CHANGELOG.md) | Full release history |
 
 ---
 
-> **graphsift: The #1 Token Saver for Claude, GPT-4, Gemini & Every LLM.**
+> **graphsift: Token Saver for Claude, GPT-5, Gemini & Every LLM.**
 >
 > `pip install graphsift` · Zero telemetry · Zero accounts · Zero network calls · Just savings.
 >
