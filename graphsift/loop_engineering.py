@@ -35,7 +35,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
 import uuid
@@ -44,6 +43,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from graphsift.executor import ProcessRunner
+from graphsift.read_cache import SafeFileIO
 
 from graphsift._version import __version__
 
@@ -361,6 +363,7 @@ class LoopState:
         self._ledger_file = self._state_dir / "ledger.jsonl"
         self._lock = threading.RLock()
         self._state: dict[str, Any] = self._load()
+        self._runner = ProcessRunner(cwd=self._repo_root, timeout=30)
 
     @staticmethod
     def _repo_hash(repo_root: str) -> str:
@@ -374,7 +377,7 @@ class LoopState:
     def _load(self) -> dict[str, Any]:
         if self._state_file.exists():
             try:
-                data = json.loads(self._state_file.read_text(encoding="utf-8"))
+                data = SafeFileIO.read_json(self._state_file)
                 if isinstance(data, dict):
                     return data
             except (json.JSONDecodeError, OSError):
@@ -383,7 +386,7 @@ class LoopState:
 
     def save(self) -> None:
         with self._lock:
-            self._state_file.write_text(json.dumps(self._state, indent=2, default=str), encoding="utf-8")
+            SafeFileIO.write_json(self._state_file, self._state)
 
     def record_run(self, pattern_name: str, record: LoopRunRecord) -> None:
         with self._lock:
@@ -430,14 +433,14 @@ class LoopState:
     def detect_drift(self) -> list[dict[str, Any]]:
         drifts = []
         try:
-            r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
+            r = self._runner.run_simple(["git", "rev-parse", "HEAD"])
+            if r.ok():
                 current = r.stdout.strip()
                 last = self._state.get("last_commit_hash")
                 if last and last != current:
                     drifts.append({"type": "commit_changed", "from": last[:12], "to": current[:12]})
                 self._state["last_commit_hash"] = current
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except Exception:
             pass
         return drifts
 
@@ -557,6 +560,7 @@ class WorktreeManager:
         self._base_path = os.path.join(str(Path.home() / ".graphsift" / "worktrees"), LoopState._repo_hash(self._repo_root))
         os.makedirs(self._base_path, exist_ok=True)
         self._active: dict[str, str] = {}
+        self._runner = ProcessRunner(cwd=self._repo_root, timeout=30)
 
     def create(self, pattern_name: str, branch: str | None = None) -> str | None:
         safe_name = pattern_name.replace("_", "-")
@@ -564,23 +568,23 @@ class WorktreeManager:
         wt_path = os.path.join(self._base_path, wt_name)
         try:
             branch_arg = branch or f"loop-auto/{safe_name}-{int(time.time())}"
-            subprocess.run(["git", "branch", branch_arg, "HEAD"], cwd=self._repo_root, capture_output=True, timeout=30)
-            r = subprocess.run(["git", "worktree", "add", wt_path, branch_arg], cwd=self._repo_root, capture_output=True, text=True, timeout=30)
-            if r.returncode == 0:
+            self._runner.run_simple(["git", "branch", branch_arg, "HEAD"], timeout=30)
+            r = self._runner.run_simple(["git", "worktree", "add", wt_path, branch_arg], timeout=30)
+            if r.ok():
                 self._active[wt_name] = wt_path
                 return wt_path
-        except subprocess.SubprocessError:
+        except Exception:
             pass
         return None
 
     def remove(self, worktree_path: str) -> bool:
         try:
-            r = subprocess.run(["git", "worktree", "remove", "--force", worktree_path], cwd=self._repo_root, capture_output=True, text=True, timeout=30)
-            if r.returncode == 0:
+            r = self._runner.run_simple(["git", "worktree", "remove", "--force", worktree_path], timeout=30)
+            if r.ok():
                 name = next((n for n, p in self._active.items() if p == worktree_path), worktree_path)
                 self._active.pop(name, None)
                 return True
-        except subprocess.SubprocessError:
+        except Exception:
             pass
         return False
 
@@ -649,6 +653,7 @@ class LoopEngine:
         self._worktree_mgr = WorktreeManager(self._repo_root)
         self._struggle = StruggleDetector(self)  # no background timer
         self._session_initialized = False
+        self._runner = ProcessRunner(cwd=self._repo_root, timeout=10)
 
     # ------------------------------------------------------------------
     # Struggle detection
@@ -881,10 +886,10 @@ class LoopEngine:
         score += min(15, registered * 2)
 
         try:
-            r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, timeout=5)
-            if r.returncode == 0:
+            r = self._runner.run_simple(["git", "rev-parse", "HEAD"], timeout=5)
+            if r.ok():
                 score += 10
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except Exception:
             suggestions.append("Initialize a git repository for full loop functionality")
 
         if self._budgeter.weekly_report().get("daily_limit", 0) > 0:
@@ -914,10 +919,10 @@ class LoopEngine:
 
     def _get_changed_files(self) -> list[str]:
         try:
-            r = subprocess.run(["git", "diff", "--name-only", "HEAD~1"], capture_output=True, text=True, timeout=10)
-            if r.returncode == 0 and r.stdout.strip():
+            r = self._runner.run_simple(["git", "diff", "--name-only", "HEAD~1"])
+            if r.ok() and r.stdout.strip():
                 return [f for f in r.stdout.strip().split("\n") if f]
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except Exception:
             pass
         return ["src/main.py", "src/utils.py"]
 
@@ -934,28 +939,28 @@ class LoopEngine:
 
     def _get_git_log(self) -> list[dict[str, str]]:
         try:
-            r = subprocess.run(["git", "log", "--oneline", "-10"], capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
+            r = self._runner.run_simple(["git", "log", "--oneline", "-10"])
+            if r.ok():
                 entries = []
                 for line in r.stdout.strip().split("\n"):
                     if line:
                         parts = line.split(" ", 1)
                         entries.append({"hash": parts[0], "message": parts[1] if len(parts) > 1 else ""})
                 return entries
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except Exception:
             pass
         return [{"hash": "abc1234", "message": "feat: sample commit"}]
 
     def _cleanup_stale_branches(self) -> int:
         count = 0
         try:
-            r = subprocess.run(["git", "branch", "--merged", "HEAD"], capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
+            r = self._runner.run_simple(["git", "branch", "--merged", "HEAD"])
+            if r.ok():
                 for branch in r.stdout.strip().split("\n"):
                     b = branch.strip().replace("*", "").strip()
                     if b and b not in ("main", "master", "develop") and b.startswith("loop-auto/"):
-                        subprocess.run(["git", "branch", "-d", b], capture_output=True, timeout=10)
+                        self._runner.run_simple(["git", "branch", "-d", b])
                         count += 1
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except Exception:
             pass
         return count

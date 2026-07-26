@@ -45,7 +45,7 @@ from ..pool import DatabasePool
 
 logger = logging.getLogger(__name__)
 
-_CURRENT_VERSION = 9
+_CURRENT_VERSION = 10
 
 # Schema version table for tracking model schema versions
 _SCHEMA_VERSION_SQL = (
@@ -255,6 +255,16 @@ _MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 "    version INTEGER NOT NULL DEFAULT 1"
                 ")"
             ),
+        ],
+    ),
+    (
+        10,
+        "add covering index for FTS5 search performance",
+        [
+            """
+            CREATE INDEX IF NOT EXISTS idx_nodes_fts_covering
+            ON nodes(node_id, name, qualified_name, file_path)
+            """,
         ],
     ),
 ]
@@ -477,6 +487,7 @@ class GraphStore:
         with self._lock:
             conn = self._pool.acquire()
             try:
+                conn.execute("BEGIN")
                 conn.executemany(
                     """
                     INSERT INTO nodes
@@ -519,7 +530,10 @@ class GraphStore:
                         for n in nodes
                     ],
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             finally:
                 self._pool.release(conn)
 
@@ -627,6 +641,7 @@ class GraphStore:
         with self._lock:
             conn = self._pool.acquire()
             try:
+                conn.execute("BEGIN")
                 conn.executemany(
                     """
                     INSERT INTO edges (source_id, target_id, kind, weight, metadata)
@@ -646,7 +661,10 @@ class GraphStore:
                         for e in edges
                     ],
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             finally:
                 self._pool.release(conn)
 
@@ -686,6 +704,7 @@ class GraphStore:
         with self._lock:
             conn = self._pool.acquire()
             try:
+                conn.execute("BEGIN")
                 conn.executemany(
                     """
                     INSERT INTO files
@@ -717,7 +736,10 @@ class GraphStore:
                         for f in files
                     ],
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             finally:
                 self._pool.release(conn)
 
@@ -797,6 +819,25 @@ class GraphStore:
             finally:
                 self._pool.release(conn)
 
+    def assign_communities_bulk(
+        self, assignments: list[tuple[str, int]]
+    ) -> None:
+        """Assign community_id to many nodes in a single transaction.
+
+        Args:
+            assignments: List of (node_id, community_id) pairs.
+        """
+        with self._lock:
+            conn = self._pool.acquire()
+            try:
+                conn.executemany(
+                    "UPDATE nodes SET community_id=? WHERE node_id=?",
+                    [(cid, nid) for nid, cid in assignments],
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
+
     def load_communities(self) -> list[dict[str, Any]]:
         """Load all community records.
 
@@ -841,6 +882,34 @@ class GraphStore:
                         metadata=excluded.metadata
                     """,
                     (file_path, risk_score, json.dumps(reasons), json.dumps(metadata or {})),
+                )
+                conn.commit()
+            finally:
+                self._pool.release(conn)
+
+    def upsert_risks_bulk(
+        self, risks: list[tuple[str, float, list[str], dict[str, Any] | None]]
+    ) -> None:
+        """Upsert many risk scores in a single transaction.
+
+        Args:
+            risks: List of (file_path, risk_score, reasons, metadata) tuples.
+        """
+        with self._lock:
+            conn = self._pool.acquire()
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO risk_index (file_path, risk_score, reasons, computed_at, metadata)
+                    VALUES (?, ?, ?, datetime('now'), ?)
+                    ON CONFLICT(file_path) DO UPDATE SET
+                        risk_score=excluded.risk_score,
+                        reasons=excluded.reasons,
+                        computed_at=excluded.computed_at,
+                        metadata=excluded.metadata
+                    """,
+                    [(fp, score, json.dumps(reasons), json.dumps(md or {}))
+                     for fp, score, reasons, md in risks],
                 )
                 conn.commit()
             finally:
@@ -1170,6 +1239,165 @@ class GraphStore:
     # Stats / schema
     # ------------------------------------------------------------------
 
+    def purge_stale_files(self, valid_paths: set[str]) -> dict[str, int]:
+        """Remove from the DB any files that are no longer in the source map.
+
+        Handles the case where exclude dirs change or files are deleted —
+        purges files, nodes, edges, risk scores, flow snapshots, and FTS
+        entries belonging to stale paths. Community node counts are
+        recalculated after removal.
+
+        Args:
+            valid_paths: Set of file paths that are still valid (current source map).
+
+        Returns:
+            Dict with counts of purged records per table:
+            ``{"files": N, "nodes": N, "edges": N, "risk": N, "flows": N}``.
+        """
+        conn = self._pool.acquire()
+        try:
+            # Get all file paths currently in the DB
+            db_paths = {
+                row["path"]
+                for row in conn.execute("SELECT path FROM files").fetchall()
+            }
+            stale = db_paths - valid_paths
+            if not stale:
+                return {"files": 0, "nodes": 0, "edges": 0, "risk": 0, "flows": 0}
+
+            logger.info(
+                "graphsift: purging %d stale files from DB",
+                len(stale),
+            )
+
+            counts: dict[str, int] = {"files": 0, "nodes": 0, "edges": 0, "risk": 0, "flows": 0}
+
+            for fp in stale:
+                # Delete edges referencing this file's nodes
+                pattern = f"{fp}::%"
+                cur = conn.execute(
+                    "DELETE FROM edges WHERE source_id LIKE ? OR target_id LIKE ?",
+                    (pattern, pattern),
+                )
+                counts["edges"] += cur.rowcount
+
+                # Delete nodes belonging to this file
+                cur = conn.execute("DELETE FROM nodes WHERE file_path = ?", (fp,))
+                counts["nodes"] += cur.rowcount
+
+                # Delete risk index entry
+                cur = conn.execute("DELETE FROM risk_index WHERE file_path = ?", (fp,))
+                counts["risk"] += cur.rowcount
+
+                # Delete file record
+                cur = conn.execute("DELETE FROM files WHERE path = ?", (fp,))
+                counts["files"] += cur.rowcount
+
+            # Flow snapshots may reference purged nodes — clear and flag rebuild
+            cur = conn.execute("DELETE FROM flow_snapshots")
+            counts["flows"] = cur.rowcount
+
+            # Recalculate community node counts
+            conn.execute(
+                """UPDATE communities SET node_count = (
+                    SELECT COUNT(*) FROM nodes WHERE nodes.community_id = communities.community_id
+                )"""
+            )
+
+            conn.commit()
+
+            # Rebuild FTS index
+            try:
+                conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            logger.info(
+                "graphsift: purge complete — files=%d nodes=%d edges=%d risk=%d flows=%d",
+                counts["files"], counts["nodes"], counts["edges"],
+                counts["risk"], counts["flows"],
+            )
+            return counts
+        finally:
+            self._pool.release(conn)
+
+    def delete_file_completely(self, file_path: str) -> dict[str, int]:
+        """Remove ALL traces of a single file from the graph database.
+
+        Purges edges, nodes, files records, and risk scores for the given
+        file. Rebuilds FTS and recalculates community node counts.
+
+        Args:
+            file_path: Absolute or repo-relative path of the deleted file.
+
+        Returns:
+            Dict with counts of removed records per table.
+        """
+        conn = self._pool.acquire()
+        try:
+            counts: dict[str, int] = {"files": 0, "nodes": 0, "edges": 0, "risk": 0, "flows": 0}
+
+            pattern = f"{file_path}::%"
+
+            cur = conn.execute(
+                "DELETE FROM edges WHERE source_id LIKE ? OR target_id LIKE ?",
+                (pattern, pattern),
+            )
+            counts["edges"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+            counts["nodes"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM risk_index WHERE file_path = ?", (file_path,))
+            counts["risk"] = cur.rowcount
+
+            cur = conn.execute("DELETE FROM files WHERE path = ?", (file_path,))
+            counts["files"] = cur.rowcount
+
+            # Recalculate community node counts
+            conn.execute(
+                """UPDATE communities SET node_count = (
+                    SELECT COUNT(*) FROM nodes WHERE nodes.community_id = communities.community_id
+                )"""
+            )
+
+            conn.commit()
+
+            # Rebuild FTS
+            try:
+                conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            logger.info(
+                "graphsift: deleted file %s — edges=%d nodes=%d risk=%d files=%d",
+                file_path, counts["edges"], counts["nodes"],
+                counts["risk"], counts["files"],
+            )
+            return counts
+        finally:
+            self._pool.release(conn)
+
+    def rebuild_fts(self) -> int:
+        """Rebuild the FTS5 full-text search index.
+
+        Returns:
+            Number of indexed rows.
+        """
+        conn = self._pool.acquire()
+        try:
+            conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+            conn.commit()
+            row_count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+            return row_count
+        except sqlite3.OperationalError as exc:
+            logger.warning("FTS rebuild skipped: %s", exc)
+            return 0
+        finally:
+            self._pool.release(conn)
+
     def stats(self) -> dict[str, Any]:
         """Return row counts across all tables.
 
@@ -1201,6 +1429,15 @@ class GraphStore:
     def close(self) -> None:
         """Close the underlying database pool."""
         self._pool.close()
+        # Run final PRAGMA optimize on a fresh connection after pool shutdown
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute("PRAGMA optimize")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
 
     def __enter__(self) -> "GraphStore":
         return self

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import enum
 import logging
+from graphsift.executor import ProcessRunner
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,6 +142,7 @@ class AutoVerifier:
     ) -> None:
         self.project_root = Path(project_root or ".").resolve()
         self.verifier = Verifier(project_root=str(self.project_root))
+        self._runner = ProcessRunner(cwd=str(self.project_root), timeout=600)
         self._graph = graph
 
         # Lazy-import TestImpactAnalyzer (only when tests actually run)
@@ -384,16 +386,14 @@ class AutoVerifier:
             # No tests directly impacted — run smoke test on this file
             cpu_count = _os.cpu_count() or 4
             workers = max(1, cpu_count - 1)
-            import subprocess  # noqa: PLC0415
-            test_result = subprocess.run(
+            test_result = self._runner.run_simple(
                 ["pytest", file_path,
                  f"-n={workers}", "--dist=loadscope",
                  "--timeout=120", "--timeout-method=thread",
                  "-x", "--tb=short", "-q"],
-                capture_output=True, text=True, timeout=300,
-                cwd=str(self.project_root),
+                timeout=300,
             )
-            passed = test_result.returncode == 0
+            passed = test_result.ok()
             return (
                 VerificationStage(
                     name="tests", passed=passed,
@@ -417,15 +417,13 @@ class AutoVerifier:
         cpu_count = _os.cpu_count() or 4
         workers = max(1, cpu_count - 1)
 
-        import subprocess  # noqa: PLC0415
-        test_result = subprocess.run(
+        test_result = self._runner.run(
             f"pytest {test_files_str} -n={workers} "
             f"--dist=loadscope --timeout=120 --timeout-method=thread "
-            f"--tb=short -q --no-header 2>&1",
-            capture_output=True, text=True, timeout=300,
-            cwd=str(self.project_root), shell=True,
+            f"--tb=short -q --no-header",
+            timeout=300, check=False,
         )
-        passed = test_result.returncode == 0
+        passed = test_result.ok()
         output = test_result.stdout + test_result.stderr
 
         from graphsift.test_impact import TestSnapshot  # noqa: PLC0415
@@ -465,20 +463,18 @@ class AutoVerifier:
         t0: float,
     ) -> tuple[VerificationStage, bool]:
         """Run full test suite and store baseline. Returns (stage, passed)."""
-        import os as _os
-        import subprocess  # noqa: PLC0415
+        import os as _os  # noqa: PLC0415
 
         cpu_count = _os.cpu_count() or 4
         workers = max(1, cpu_count - 1)
 
-        test_result = subprocess.run(
+        test_result = self._runner.run(
             f"pytest -n={workers} --dist=loadscope "
             f"--timeout=120 --timeout-method=thread "
-            f"--tb=short -q --no-header 2>&1",
-            capture_output=True, text=True, timeout=600,
-            cwd=str(self.project_root), shell=True,
+            f"--tb=short -q --no-header",
+            timeout=600, check=False,
         )
-        passed = test_result.returncode == 0
+        passed = test_result.ok()
         output = test_result.stdout + test_result.stderr
 
         from graphsift.test_impact import TestSnapshot  # noqa: PLC0415

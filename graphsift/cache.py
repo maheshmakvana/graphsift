@@ -8,7 +8,7 @@ Usage::
 
     from graphsift.cache import ASTCache
 
-    cache = ASTCache(max_memory=500, db_path="/tmp/ast_cache.db")
+    cache = ASTCache(max_memory=500, db_path=str(Path(tempfile.gettempdir()) / "ast_cache.db"))
     cached = cache.get("sha256hex")      # FileNode or None
     cache.set("sha256hex", file_node)
     cache.invalidate("src/*.py")        # glob-style pattern
@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import json
 import logging
 import sqlite3
@@ -135,7 +136,7 @@ class ASTCache:
 
     Typical usage for the ``ContextBuilder`` pipeline::
 
-        cache = ASTCache(max_memory=500, db_path="/tmp/ast_cache.db")
+        cache = ASTCache(max_memory=500, db_path=str(Path(tempfile.gettempdir()) / "ast_cache.db"))
 
         # During indexing
         fn = cache.get(file_sha256)

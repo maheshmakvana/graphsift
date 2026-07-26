@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 from graphsift.loop_engineering import MaturityLevel, PatternType, PATTERN_REGISTRY
 
 
@@ -80,7 +82,7 @@ class LoopConfig:
 		config_path = cls._config_path(project_root)
 		if config_path.exists():
 			try:
-				data = json.loads(config_path.read_text(encoding="utf-8"))
+				data = SafeFileIO.read_json(config_path)
 				return cls(**data)
 			except (json.JSONDecodeError, TypeError, KeyError):
 				pass
@@ -90,10 +92,7 @@ class LoopConfig:
 		"""Save config to ``.graphsift/loop-config.json``."""
 		config_path = self._config_path(project_root)
 		config_path.parent.mkdir(parents=True, exist_ok=True)
-		config_path.write_text(
-			json.dumps(self.to_dict(), indent=2, default=str),
-			encoding="utf-8",
-		)
+		SafeFileIO.write_json(config_path, self.to_dict())
 
 	def to_dict(self) -> dict[str, Any]:
 		"""Serialize to dict for JSON persistence."""

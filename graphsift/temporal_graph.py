@@ -32,8 +32,8 @@ from __future__ import annotations
 
 import logging
 import math
-import subprocess
 import threading
+from graphsift.executor import ProcessRunner
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -124,6 +124,7 @@ class TemporalGraph:
         self._file_history: dict[str, list[FileVersion]] = {}
         self._commits: list[CommitInfo] = []
         self._lock = threading.RLock()
+        self._runner = ProcessRunner(cwd=str(self.repo_path), timeout=60)
 
     # ------------------------------------------------------------------
     # Indexing
@@ -148,18 +149,16 @@ class TemporalGraph:
         file_hist: dict[str, list[FileVersion]] = {}
 
         try:
-            result = subprocess.run(
+            result = self._runner.run_simple(
                 [
                     "git", "-C", str(self.repo_path),
                     "log", f"-{max_commits}", branch,
                     "--name-status", "--find-renames",
                     "--format=%H|%an|%aI|%s",
                 ],
-                capture_output=True,
-                text=True,
                 timeout=60,
             )
-            if result.returncode != 0:
+            if not result.ok():
                 logger.warning("git log failed: %s", result.stderr)
                 return TemporalStats()
 
@@ -198,7 +197,7 @@ class TemporalGraph:
                         fv.filepath = new
                         fv.previous_path = old
                     file_hist.setdefault(fv.filepath, []).append(fv)
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        except Exception as exc:
             logger.warning("git not available: %s", exc)
             return TemporalStats()
 
@@ -314,18 +313,16 @@ class TemporalGraph:
     def diff_between(self, from_commit: str, to_commit: str) -> list[str]:
         """Return files changed between two commits (``git diff --name-only``)."""
         try:
-            result = subprocess.run(
+            result = self._runner.run_simple(
                 [
                     "git", "-C", str(self.repo_path),
                     "diff", "--name-only", from_commit, to_commit,
                 ],
-                capture_output=True,
-                text=True,
                 timeout=30,
             )
-            if result.returncode == 0:
+            if result.ok():
                 return [f for f in result.stdout.strip().split("\n") if f]
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except Exception:
             pass
         return []
 

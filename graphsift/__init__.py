@@ -263,6 +263,12 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "ToolBudget": (".tool_budgets", "ToolBudget"),
     # Read Cache
     "ReadCache": (".read_cache", "ReadCache"),
+    # SHA Cache
+    "compute_sha": (".sha_cache", "compute_sha"),
+    "has_changed": (".sha_cache", "has_changed"),
+    "load_sha_cache": (".sha_cache", "load_sha_cache"),
+    "save_sha_cache": (".sha_cache", "save_sha_cache"),
+    "sha_cache_path": (".sha_cache", "sha_cache_path"),
     # Verify Hooks
     "Verifier": (".verify_hooks", "Verifier"),
     "VerifyResult": (".verify_hooks", "VerifyResult"),

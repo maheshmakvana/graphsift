@@ -19,6 +19,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 _ANALYTICS_PATH = Path.home() / ".graphsift" / "analytics.json"
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ def _load(project_root: str | None = None) -> dict[str, Any]:
     _ = project_root  # kept for API consistency; data is global
     if _ANALYTICS_PATH.exists():
         try:
-            return json.loads(_ANALYTICS_PATH.read_text(encoding="utf-8"))
+            return SafeFileIO.read_json(_ANALYTICS_PATH)
         except (json.JSONDecodeError, OSError):
             pass
     return {
@@ -48,7 +50,7 @@ def _load(project_root: str | None = None) -> dict[str, Any]:
 
 def _save(data: dict[str, Any]) -> None:
     _ANALYTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _ANALYTICS_PATH.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    SafeFileIO.write_json(_ANALYTICS_PATH, data)
 
 
 # ---------------------------------------------------------------------------

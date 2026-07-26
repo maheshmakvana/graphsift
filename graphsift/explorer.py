@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from graphsift.executor import ProcessRunner
+from graphsift.read_cache import SafeFileIO
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +110,7 @@ class ConfigDiscoverer:
             if not config_path.exists():
                 continue
             try:
-                content = config_path.read_text(encoding="utf-8", errors="replace")
+                content = SafeFileIO.read(config_path)
             except Exception:
                 continue
 
@@ -176,6 +178,7 @@ class CoChangeDiscoverer:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._runner = ProcessRunner(cwd=str(self.root), timeout=30)
 
     def discover(
         self, changed_files: list[str], max_results: int = 10
@@ -188,13 +191,12 @@ class CoChangeDiscoverer:
 
         for cf in changed_files[:3]:
             try:
-                result = subprocess.run(
+                result = self._runner.run_simple(
                     [
                         "git", "log", "--all", "--name-only",
                         "--pretty=format:", "-n", "50", "--", cf,
                     ],
-                    capture_output=True, text=True, timeout=30,
-                    cwd=str(self.root),
+                    timeout=30,
                 )
                 co_counts: dict[str, int] = {}
                 for line in result.stdout.split("\n"):
@@ -221,8 +223,7 @@ class CoChangeDiscoverer:
                             ),
                             source=cf,
                         ))
-            except (subprocess.TimeoutExpired, subprocess.SubprocessError,
-                    FileNotFoundError):
+            except Exception:
                 pass
 
         return discoveries
@@ -258,7 +259,7 @@ class EnvDiscoverer:
                 try:
                     fpath = self.root / cf
                     if fpath.exists():
-                        source = fpath.read_text(encoding="utf-8", errors="replace")
+                        source = SafeFileIO.read(fpath)
                 except Exception:
                     continue
 

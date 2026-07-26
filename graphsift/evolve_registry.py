@@ -47,6 +47,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from graphsift.read_cache import SafeFileIO
+
 logger = logging.getLogger(__name__)
 
 
@@ -155,7 +157,7 @@ class EvolveRegistry:
         if not self._path.exists():
             return {}
         try:
-            raw = self._path.read_text(encoding="utf-8")
+            raw = SafeFileIO.read(self._path)
             if not raw.strip():
                 return {}
             data = json.loads(raw)
@@ -174,10 +176,7 @@ class EvolveRegistry:
             data: The full registry data dict to persist.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(data, indent=2, default=str, sort_keys=True),
-            encoding="utf-8",
-        )
+        SafeFileIO.write_json(self._path, data)
 
 
 __all__ = [
