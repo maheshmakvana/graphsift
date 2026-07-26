@@ -1,12 +1,31 @@
 # Changelog
 
-> **graphsift v4.5.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> **graphsift v4.6.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
 > Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 826+ tests, 50 modules, zero external dependencies.
 
 All notable changes to graphsift are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.6.0] — 2026-07-26
+
+### Documentation & SEO
+
+#### Added
+- **SEO-optimized README** — enhanced PyPI description, targeted keywords for search engine discoverability
+- **llms.txt** — AI crawler guidance file for LLM-based indexing and discovery
+- **Robots & Sitemap** — `robots.txt` and `sitemap.xml` for documentation site
+- **CITATION.cff** — citation metadata for academic reference
+- **Funding & Git attributes** — `FUNDING.yml` and `.gitattributes` for project health signals
+- **CONTRIBUTING & Guide** — improved contributing guide and new user documentation guide
+
+#### Changed
+- **pyproject.toml** — SEO-optimized description, reduced keyword stuffing, streamlined classifiers
+- **README.md** — restructured with clearer value proposition, SEO-optimized headings, and installation instructions
+
+#### Removed
+- **Redundant docs** — deleted outdated wiki_home.md, FEATURE_MATRIX.md, V3_UPGRADE_GUIDE.md, and architecture deep-dive to reduce documentation debt
 
 ## [4.5.0] — 2026-07-23
 
