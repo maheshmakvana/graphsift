@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -985,3 +986,159 @@ def get_template(name: str):
             f"(aliases: {list(_ALIASES)})"
         )
     return tpl
+
+
+# ---------------------------------------------------------------------------
+# ManualSelector — Task-Type-Driven Operation Manuals
+# ---------------------------------------------------------------------------
+
+
+class ManualSelector:
+    """Selects and loads operation manuals based on task type.
+
+    Each manual is a ``manual.json`` + ``prompt.md`` pair living under
+    ``graphsift/manuals/<task_type>/``.  Manuals can declare a *parent*
+    reference for hierarchical expansion (e.g. setting ``security_review``
+    auto-loads the ``dependency_audit`` parent).
+
+    Usage::
+
+        selector = ManualSelector()
+        active = selector.activate("security_review")
+        for m in active:
+            print(m["id"], m["prompt"])
+        print(selector.get_active_tools())
+
+    Attributes:
+        MANUALS_DIR: Path to the manuals directory.
+    """
+
+    MANUALS_DIR: Path = Path(__file__).parent / "manuals"
+
+    def __init__(self) -> None:
+        self._active: list[dict] = []
+        self._loaded: dict[str, dict] = {}
+        self._load_all()
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def _load_all(self) -> None:
+        """Discover and load every manual from disk.
+
+        Expects a directory-per-manual layout::
+
+            manuals/<id>/manual.json
+            manuals/<id>/prompt.md
+        """
+        self._loaded.clear()
+        if not self.MANUALS_DIR.is_dir():
+            return
+        for child in sorted(self.MANUALS_DIR.iterdir()):
+            if not child.is_dir():
+                continue
+            manifest_path = child / "manual.json"
+            prompt_path = child / "prompt.md"
+            if not manifest_path.is_file():
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            prompt_text = ""
+            if prompt_path.is_file():
+                prompt_text = prompt_path.read_text(encoding="utf-8")
+            manual_id = manifest.get("id", child.name)
+            self._loaded[manual_id] = {**manifest, "prompt": prompt_text}
+
+    # ------------------------------------------------------------------
+    # Querying
+    # ------------------------------------------------------------------
+
+    def list_manuals(self) -> list[dict]:
+        """Return all available manuals with metadata (no prompt text)."""
+        return [
+            {
+                "id": m["id"],
+                "name": m.get("name", ""),
+                "description": m.get("description", ""),
+                "parent": m.get("parent"),
+                "tools_enabled": m.get("tools_enabled", []),
+                "phases": m.get("phases", []),
+            }
+            for m in self._loaded.values()
+        ]
+
+    # ------------------------------------------------------------------
+    # Activation
+    # ------------------------------------------------------------------
+
+    def activate(self, task_type: str) -> list[dict]:
+        """Activate a manual by *task_type* (its ``id``).
+
+        Returns the resolved chain ``[manual, parent_manual, …]`` with the
+        manual itself first, followed by ancestors.  Parent expansion is
+        recursive (parent's parent is also loaded).  Duplicates are
+        skipped.
+
+        Raises:
+            ValueError: When *task_type* does not match any loaded manual.
+        """
+        if task_type not in self._loaded:
+            raise ValueError(
+                f"Unknown task type: {task_type!r}. "
+                f"Available: {list(self._loaded)}"
+            )
+
+        self._active.clear()
+        seen: set[str] = set()
+
+        def _resolve(mid: str) -> None:
+            if mid in seen:
+                return
+            seen.add(mid)
+            manual = self._loaded.get(mid)
+            if manual is None:
+                return
+            parent_id = manual.get("parent")
+            if parent_id:
+                _resolve(parent_id)
+            self._active.append(manual)
+
+        _resolve(task_type)
+        return list(self._active)
+
+    # ------------------------------------------------------------------
+    # Active-state accessors
+    # ------------------------------------------------------------------
+
+    def get_active_prompts(self) -> str:
+        """Return concatenated prompt text for all active manuals.
+
+        Each manual's prompt is prefixed with a heading so the LLM can
+        distinguish them.
+        """
+        parts: list[str] = []
+        for manual in self._active:
+            mid = manual["id"]
+            name = manual.get("name", mid)
+            prompt = manual.get("prompt", "")
+            if prompt:
+                parts.append(f"## Operation Manual: {name} ({mid})\n\n{prompt}")
+        return "\n\n---\n\n".join(parts)
+
+    def get_active_tools(self) -> list[str]:
+        """Return the unique, ordered union of tools from all active manuals."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for manual in self._active:
+            for tool in manual.get("tools_enabled", []):
+                if tool not in seen:
+                    seen.add(tool)
+                    result.append(tool)
+        return result
+
+    def clear(self) -> None:
+        """Clear all active manuals."""
+        self._active.clear()

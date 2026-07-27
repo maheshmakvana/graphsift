@@ -1,0 +1,8 @@
+{
+  "id": "architecture_review",
+  "name": "Architecture Review",
+  "description": "High-level architecture documentation and review",
+  "parent": null,
+  "tools_enabled": ["list_communities", "get_architecture_overview", "list_flows", "get_wiki_page"],
+  "phases": ["overview", "communities", "flows", "report"]
+}

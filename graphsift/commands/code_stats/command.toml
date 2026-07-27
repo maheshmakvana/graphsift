@@ -1,0 +1,8 @@
+id = "code_stats"
+name = "Code Statistics"
+version = "1.0.0"
+description = "Generate code statistics (line counts, language breakdown) using cloc"
+execution.binary = "cloc"
+execution.default_timeout_ms = 30000
+mutating = false
+network = false

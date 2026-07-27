@@ -72,6 +72,8 @@ def _err(req_id: Any, code: int, message: str) -> None:
 _store_lock = threading.RLock()
 _stores: dict[str, Any] = {}  # root_path -> GraphStore
 _roots_by_hash: dict[str, str] = {}  # repo_hash -> root_path (for MCP resource URI resolution)
+_manual_selectors: dict[str, Any] = {}  # root_path -> ManualSelector
+_plugin_registries: dict[str, Any] = {}  # root_path -> PluginRegistry
 
 
 def _db_path_for(root: str) -> str:
@@ -128,6 +130,26 @@ def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
             # Register reverse hash mapping for MCP resource URI resolution
             _roots_by_hash[hashlib.sha1(root.encode()).hexdigest()[:12]] = root
         return _builders[root], _source_maps[root]
+
+
+def _get_manual_selector(root: str) -> Any:
+    """Return (creating if absent) the ManualSelector for *root*."""
+    from graphsift.prompt_templates import ManualSelector
+
+    with _lock:
+        if root not in _manual_selectors:
+            _manual_selectors[root] = ManualSelector()
+        return _manual_selectors[root]
+
+
+def _get_plugin_registry(root: str) -> Any:
+    """Return (creating if absent) the PluginRegistry for *root*."""
+    from graphsift.commands.registry import PluginRegistry
+
+    with _lock:
+        if root not in _plugin_registries:
+            _plugin_registries[root] = PluginRegistry()
+        return _plugin_registries[root]
 
 
 # ---------------------------------------------------------------------------
@@ -1999,6 +2021,83 @@ def _tool_refactor_code(params: dict) -> dict:
     return {"prompt": prompt, "template": "refactor"}
 
 
+def _tool_set_task_type(params: dict) -> dict:
+    """Activate a task-type-driven operation manual for the current session.
+
+    Loads the manual matching *task_type*, expands its parent hierarchy
+    recursively, and returns the active manual chain with prompts and
+    enabled tools.  Subsequent tool calls can use ``list_manuals`` to
+    see what's available and ``get_active_prompts`` for the methodology
+    text.
+    """
+    from graphsift.prompt_templates import ManualSelector
+
+    root = params.get("root_path", os.getcwd())
+    task_type = params.get("task_type", "")
+
+    if not task_type:
+        return {"error": "task_type is required"}
+
+    selector = _get_manual_selector(root)
+
+    try:
+        chain = selector.activate(task_type)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    return {
+        "task_type": task_type,
+        "active_manuals": [
+            {
+                "id": m["id"],
+                "name": m.get("name", ""),
+                "description": m.get("description", ""),
+                "parent": m.get("parent"),
+                "phases": m.get("phases", []),
+            }
+            for m in chain
+        ],
+        "tools_enabled": selector.get_active_tools(),
+        "prompts": selector.get_active_prompts(),
+    }
+
+
+def _tool_list_manuals(params: dict) -> dict:
+    """List all available operation manuals with descriptions.
+
+    Returns every manual found under the ``manuals/`` directory
+    regardless of current activation state.
+    """
+    root = params.get("root_path", os.getcwd())
+    selector = _get_manual_selector(root)
+    manuals = selector.list_manuals()
+
+    return {"manuals": manuals, "total": len(manuals)}
+
+
+def _tool_list_plugins(params: dict) -> dict:
+    """List all registered external command plugins."""
+    root = params.get("root_path", os.getcwd())
+    registry = _get_plugin_registry(root)
+    plugins = registry.list_plugins()
+    return {"plugins": plugins, "total": len(plugins)}
+
+
+def _tool_run_plugin(params: dict) -> dict:
+    """Execute an external command plugin via JSON stdin/stdout protocol."""
+    root = params.get("root_path", os.getcwd())
+    plugin_id = params.get("plugin_id", "")
+    arguments = params.get("arguments", {})
+    timeout = params.get("timeout_ms", 30000)
+
+    if not plugin_id:
+        return {"success": False, "error": "Missing plugin_id"}
+
+    registry = _get_plugin_registry(root)
+    result = registry.execute(plugin_id, arguments, timeout_ms=timeout)
+    return result
+
+
 def _tool_terse_mode(params: dict) -> dict:
     """Generate terse-mode instructions for a given level."""
     level = params.get("level", "full")
@@ -2218,6 +2317,96 @@ def _tool_auto_verify_and_fix(params: dict) -> dict:
         return result
     except Exception:
         return {"file": file_path, "passed": True, "syntax_ok": True, "syntax_error": None}
+
+
+# ---------------------------------------------------------------------------
+# Batch analysis — run multiple graph commands in a single MCP call
+# ---------------------------------------------------------------------------
+
+
+def _run_batch_command(tool_name: str, cmd_params: dict) -> tuple[str, dict, dict]:
+    """Run a single tool command, returning (tool_name, original_params, result_dict).
+
+    All exceptions are caught and returned as error results — never propagates
+    so one failing command does not affect others in the same step.
+    """
+    if tool_name not in _TOOLS:
+        return tool_name, cmd_params, {"error": f"Unknown tool: {tool_name}"}
+
+    try:
+        result = _TOOLS[tool_name]["fn"](cmd_params)
+        return tool_name, cmd_params, result
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("batch command %s failed", tool_name)
+        return tool_name, cmd_params, {"error": str(exc)}
+
+
+def _tool_batch_analyze(params: dict) -> dict:
+    """Run multiple graph commands in one turn with step-based ordering.
+
+    Commands are grouped by *step* number — all commands in the same step
+    execute in parallel; steps execute sequentially (step 1 completes before
+    step 2 starts).  If one command in a step fails, the other commands in
+    that step still complete normally and the error is recorded in the results.
+
+    Supported commands: any registered MCP tool (detect_cycles, detect_dead_code,
+    get_impact, list_communities, list_flows, get_architecture_overview,
+    graph_status, list_files, get_impact_radius, get_affected_flows, …).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
+
+    root_path = params.get("root_path", "")
+    commands = params.get("commands", [])
+
+    if not commands:
+        return {"error": "No commands provided.", "results": {}}
+
+    # Group commands by step number
+    steps: dict[int, list[dict]] = {}
+    for cmd in commands:
+        step = int(cmd.get("step", 1))
+        steps.setdefault(step, []).append(cmd)
+
+    results: dict[str, list[dict]] = {}
+
+    for step_num in sorted(steps.keys()):
+        step_cmds = steps[step_num]
+
+        with ThreadPoolExecutor(max_workers=min(len(step_cmds), 8)) as executor:
+            futures = []
+            for cmd in step_cmds:
+                tool_name = cmd.get("tool", "")
+                cmd_params = dict(cmd.get("params", {}))
+
+                # Inject root_path default from batch-level root_path
+                if root_path:
+                    cmd_params.setdefault("root_path", root_path)
+
+                futures.append(
+                    executor.submit(_run_batch_command, tool_name, cmd_params)
+                )
+
+            for future in as_completed(futures):
+                try:
+                    tool_name_res, cmd_params_res, cmd_result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    # Should not happen — _run_batch_command catches everything
+                    tool_name_res = "unknown"
+                    cmd_params_res = {}
+                    cmd_result = {"error": f"Unexpected batch error: {exc}"}
+
+                entry = {
+                    "tool": tool_name_res,
+                    "params": cmd_params_res,
+                    "result": cmd_result,
+                }
+                results.setdefault(tool_name_res, []).append(entry)
+
+    return {
+        "results": results,
+        "total_commands": len(commands),
+        "total_steps": len(steps),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2907,6 +3096,46 @@ _TOOLS = {
             "required": ["target"],
         },
     },
+    "set_task_type": {
+        "fn": _tool_set_task_type,
+        "description": (
+            "Set the active task type to load the relevant operation manual(s). "
+            "Manuals provide methodology-specific prompts, tool enablement lists, "
+            "and phase guidance. Parent manuals are expanded recursively "
+            "(e.g. security_review also loads dependency_audit). "
+            "Use list_manuals to see available task types."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_type": {
+                    "type": "string",
+                    "description": (
+                        "Task type identifier — one of: dependency_audit, "
+                        "dead_code_audit, security_review, refactor_planning, "
+                        "architecture_review, performance_audit, code_review"
+                    ),
+                },
+                "root_path": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+            "required": ["task_type"],
+        },
+    },
+    "list_manuals": {
+        "fn": _tool_list_manuals,
+        "description": (
+            "List all available operation manuals and their descriptions. "
+            "Manuals are task-type-driven methodology guides with prompts, "
+            "tool enablement lists, and phase guidance. "
+            "Activate one with set_task_type."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+        },
+    },
     "terse_mode": {
         "fn": _tool_terse_mode,
         "description": "Generate terse-mode instructions for a given level. Preserves code/commands/errors, strips filler/hedging/politeness.",
@@ -2930,6 +3159,69 @@ _TOOLS = {
                 "threshold_pct": {"type": "integer", "description": "Threshold percentage (default 80)"},
             },
             "required": ["current_tokens"],
+        },
+    },
+    "batch_analyze": {
+        "fn": _tool_batch_analyze,
+        "description": (
+            "Run multiple graph commands in one turn. "
+            "Commands are grouped by step number — same-step commands run in parallel, "
+            "different steps execute sequentially. "
+            "If one command in a step fails, others in that step still complete. "
+            "Supports: detect_cycles, detect_dead_code, get_impact, list_communities, "
+            "list_flows, get_architecture_overview, graph_status, list_files, and more."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repository root path (provides default for all commands)"},
+                "commands": {
+                    "type": "array",
+                    "description": "List of commands to execute",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "description": "Tool name to call (any registered MCP tool)"},
+                            "params": {"type": "object", "description": "Parameters to pass to the tool"},
+                            "step": {"type": "integer", "description": "Step number for ordering (default: 1). Same-step commands run in parallel."},
+                        },
+                        "required": ["tool"],
+                    },
+                },
+            },
+            "required": ["commands"],
+        },
+    },
+    "list_plugins": {
+        "fn": _tool_list_plugins,
+        "description": (
+            "List all registered external command plugins. "
+            "Plugins are third-party analysis tools that register via "
+            "manifest-driven JSON stdin/stdout protocol."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root (default: cwd)"},
+            },
+        },
+    },
+    "run_plugin": {
+        "fn": _tool_run_plugin,
+        "description": (
+            "Execute an external command plugin via JSON stdin/stdout subprocess protocol. "
+            "The plugin receives a JSON request on stdin and returns JSON on stdout. "
+            "Returns success, output, error, and duration_ms."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_path": {"type": "string", "description": "Repo root (default: cwd)"},
+                "plugin_id": {"type": "string", "description": "Plugin ID to execute"},
+                "arguments": {"type": "object", "description": "Arguments to pass to the plugin"},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default: 30000)"},
+            },
+            "required": ["plugin_id"],
         },
     },
 }

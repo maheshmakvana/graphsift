@@ -1,0 +1,8 @@
+{
+  "id": "refactor_planning",
+  "name": "Refactor Planning",
+  "description": "Plan and analyze code refactoring opportunities",
+  "parent": "dependency_audit",
+  "tools_enabled": ["get_impact", "get_impact_radius", "get_context", "query_graph"],
+  "phases": ["discover", "impact", "plan", "verify"]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "security_review",
+  "name": "Security Review",
+  "description": "Security audit of codebase with vulnerability analysis",
+  "parent": "dependency_audit",
+  "tools_enabled": ["suggest_fixes", "check_evidence", "detect_dead_code", "query_graph"],
+  "phases": ["recon", "analyze", "verify", "report"]
+}

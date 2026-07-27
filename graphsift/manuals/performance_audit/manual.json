@@ -1,0 +1,8 @@
+{
+  "id": "performance_audit",
+  "name": "Performance Audit",
+  "description": "Identify performance bottlenecks and optimization opportunities",
+  "parent": null,
+  "tools_enabled": ["find_large_functions", "query_graph", "list_files"],
+  "phases": ["discover", "analyze", "recommend"]
+}

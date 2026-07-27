@@ -21,8 +21,11 @@ Usage::
 from __future__ import annotations
 
 import copy
+import datetime
 import logging
+import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -62,6 +65,31 @@ class CompactionStats:
     critical_facts_preserved: int = 0
     messages_removed: int = 0
     tool_results_masked: int = 0
+
+
+@dataclass
+class HandoffState:
+    """Tracks the current goal, progress, and next actions across compaction boundaries."""
+
+    goal: str = ""
+    completed: list[str] = field(default_factory=list)
+    incomplete: list[str] = field(default_factory=list)
+    deliverables: list[str] = field(default_factory=list)
+    affected_files: list[str] = field(default_factory=list)
+    validation_status: str = ""  # "passing", "failing", "untested"
+    next_steps: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WorkspaceSnapshot:
+    """Snapshot of the workspace state at compaction time."""
+
+    repo_root: str = ""
+    cwd: str = ""
+    graph_hash: str = ""
+    git_branch: str = ""
+    git_sha: str = ""
+    last_analysis: str = ""  # ISO timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -1028,3 +1056,531 @@ class AutonomousCompressor:
                 lines.append(f"- [{fact.fact_type}] {fact.content}")
 
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Structured compaction
+# ---------------------------------------------------------------------------
+
+
+def _compact_structured(
+    messages: list[dict],
+    token_budget: int,
+    preserve_last_n: int,
+    preserve_system: bool,
+) -> tuple[list[dict], CompactionStats]:
+    """Structured compaction strategy — injects handoff block + masks old tool results.
+
+    Wraps ``StructuredCompactor`` for compatibility with the strategy registry.
+    """
+    compactor = StructuredCompactor()
+    compacted = compactor.compact(messages, token_budget, preserve_last_n=preserve_last_n)
+    return compacted, compactor.stats
+
+
+class StructuredCompactor:
+    """Structured compaction that stores handoff state and workspace snapshots.
+
+    Principle: "Compaction is not a shorter chat transcript;
+    it is a runtime checkpoint."
+
+    Instead of simply deleting old messages, this compactor preserves structured
+    state (goal, progress, workspace context) and injects it as a machine-readable
+    block at the start of the compacted conversation.
+
+    Parameters
+    ----------
+    workspace_dir : str or None
+        Path to the workspace root. If None, auto-detects from cwd.
+    """
+
+    def __init__(self, workspace_dir: str | None = None) -> None:
+        self._handoff = HandoffState()
+        self._snapshot = WorkspaceSnapshot()
+        self._critical_facts: list[CriticalFact] = []
+        self._env_context: dict[str, str] = {}
+        self._workspace_dir = workspace_dir or os.getcwd()
+        self._last_stats: CompactionStats = CompactionStats()
+
+    # ------------------------------------------------------------------
+    # State management
+    # ------------------------------------------------------------------
+
+    def update_handoff(self, **kwargs) -> None:
+        """Update the handoff state fields.
+
+        Parameters
+        ----------
+        **kwargs
+            Any field of HandoffState: goal, completed, incomplete,
+            deliverables, affected_files, validation_status, next_steps.
+        """
+        for key, value in kwargs.items():
+            if hasattr(self._handoff, key):
+                setattr(self._handoff, key, value)
+
+    def update_snapshot(self, **kwargs) -> None:
+        """Update the workspace snapshot fields.
+
+        Parameters
+        ----------
+        **kwargs
+            Any field of WorkspaceSnapshot: repo_root, cwd, graph_hash,
+            git_branch, git_sha, last_analysis.
+        """
+        for key, value in kwargs.items():
+            if hasattr(self._snapshot, key):
+                setattr(self._snapshot, key, value)
+
+    def add_critical_fact(
+        self, content: str, fact_type: str, importance: float = 0.5
+    ) -> None:
+        """Add a critical fact to preserve across compaction.
+
+        Parameters
+        ----------
+        content : str
+            The fact text.
+        fact_type : str
+            One of "decision", "constraint", "preference", "gotcha".
+        importance : float
+            Importance score 0-1 (default 0.5).
+        """
+        self._critical_facts.append(
+            CriticalFact(
+                content=content,
+                fact_type=fact_type,
+                source_index=-1,
+                importance=importance,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    def compact(
+        self,
+        messages: list[dict],
+        token_budget: int,
+        preserve_last_n: int = 3,
+    ) -> list[dict]:
+        """Compact messages using structured handoff.
+
+        Injects a structured block (workspace snapshot + handoff state +
+        env context + critical facts) at the start of the conversation,
+        then compresses older tool outputs using observation masking.
+
+        Tool-call pairs (function_call + function_call_output) are preserved
+        to maintain a valid transcript format.
+
+        Parameters
+        ----------
+        messages : list[dict]
+            Conversation messages in OpenAI or Anthropic format.
+        token_budget : int
+            Maximum number of tokens for the compacted result.
+        preserve_last_n : int
+            Number of most recent turns to keep fully intact (default 3).
+
+        Returns
+        -------
+        list[dict]
+            Compacted message list with structured handoff block injected.
+        """
+        if not messages:
+            return messages
+
+        messages = copy.deepcopy(messages)
+        original_tokens = sum(_estimate_message_tokens(m) for m in messages)
+
+        # Auto-detect handoff state from messages if not manually set
+        if not self._handoff.goal:
+            self.detect_handoff(messages)
+
+        # Auto-populate workspace snapshot
+        self._auto_snapshot()
+
+        # Build structured block
+        structured_block = self._build_structured_block()
+        structured_message: dict = {
+            "role": _ROLE_SYSTEM,
+            "content": structured_block,
+        }
+
+        # Determine cutoff — preserve last N turns fully
+        turn_starts = _extract_turns(messages)
+        if len(turn_starts) > preserve_last_n:
+            cutoff = turn_starts[-preserve_last_n] if preserve_last_n > 0 else len(messages)
+        else:
+            cutoff = 0
+
+        compacted: list[dict] = []
+        pending_tool_ids: set[str] = set()
+
+        for i, msg in enumerate(messages):
+            if i >= cutoff:
+                # Keep everything intact past the cutoff
+                compacted.append(msg)
+                continue
+
+            role = msg.get("role", "")
+
+            # Always keep system messages
+            if role == _ROLE_SYSTEM:
+                compacted.append(msg)
+                continue
+
+            # Keep tool calls and track their IDs
+            if _is_tool_call(msg):
+                compacted.append(msg)
+                tcs = msg.get("tool_calls", [])
+                if isinstance(tcs, list):
+                    for tc in tcs:
+                        tid = tc.get("id", "")
+                        if tid:
+                            pending_tool_ids.add(tid)
+                continue
+
+            # Mask tool results (unless paired with a preserved call)
+            if _is_tool_result(msg):
+                tcid = msg.get("tool_call_id", "")
+                if tcid in pending_tool_ids:
+                    compacted.append(msg)
+                    pending_tool_ids.discard(tcid)
+                else:
+                    tname = _find_tool_call_name_for_result(messages, i) or "tool"
+                    orig_tok = _estimate_message_tokens(msg)
+                    compacted.append(
+                        {
+                            "role": _ROLE_TOOL if role == _ROLE_TOOL else _ROLE_USER,
+                            "content": _make_masked_result(tname, orig_tok),
+                            "tool_call_id": msg.get("tool_call_id", ""),
+                        }
+                    )
+                continue
+
+            # Keep user and assistant messages
+            compacted.append(msg)
+
+        # Prepend structured handoff block
+        compacted.insert(0, structured_message)
+
+        compacted_tokens = sum(_estimate_message_tokens(m) for m in compacted)
+
+        # If still over budget, remove masked results entirely
+        if compacted_tokens > token_budget:
+            surviving: list[dict] = []
+            for msg in compacted:
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.startswith("[masked:"):
+                    continue
+                surviving.append(msg)
+            if surviving:
+                compacted = surviving
+            compacted_tokens = sum(_estimate_message_tokens(m) for m in compacted)
+
+        self._last_stats = CompactionStats(
+            original_tokens=original_tokens,
+            compacted_tokens=compacted_tokens,
+            tokens_saved=original_tokens - compacted_tokens,
+            savings_ratio=_ratio(original_tokens, compacted_tokens),
+            strategy_used="structured",
+            critical_facts_preserved=len(self._critical_facts),
+        )
+
+        return compacted
+
+    def detect_handoff(self, messages: list[dict]) -> None:
+        """Parse existing messages to extract handoff state.
+
+        Scans messages for:
+        - Goal from the first user message
+        - File references from source paths
+        - Validation status from test results
+
+        Parameters
+        ----------
+        messages : list[dict]
+            Conversation messages to analyze.
+        """
+        if not messages:
+            return
+
+        goal_parts: list[str] = []
+        file_refs: set[str] = set()
+        has_tests = False
+        test_failures = False
+        found_first_user = False
+
+        for i, msg in enumerate(messages):
+            content = ConversationCompactor._get_text_content(msg)
+            if not content:
+                continue
+
+            # Goal from first user message (may not be at index 0)
+            if not found_first_user and msg.get("role") == _ROLE_USER:
+                goal_parts.append(content[:300])
+                found_first_user = True
+
+            # Detect file references
+            file_matches = re.findall(
+                r"(?:src|graphsift|tests?)/[\w./\\-]+\.(?:py|js|ts|go|rs|md|json|yaml|yml)",
+                content,
+            )
+            for f in file_matches:
+                file_refs.add(f)
+
+            # Detect test results
+            if re.search(
+                r"\b(pytest|test result|passed|failed|FAILED|ERROR|assert)", content, re.I
+            ):
+                has_tests = True
+                if re.search(r"\b(failed|FAILED|ERROR)\b", content):
+                    test_failures = True
+
+        if goal_parts:
+            self._handoff.goal = goal_parts[0]
+
+        if file_refs:
+            self._handoff.affected_files = sorted(file_refs)
+
+        if has_tests:
+            self._handoff.validation_status = "failing" if test_failures else "passing"
+        else:
+            self._handoff.validation_status = "untested"
+
+    def to_dict(self) -> dict:
+        """Serialize the structured state to a dict for storage.
+
+        Returns
+        -------
+        dict
+            Serializable representation of the structured state.
+        """
+        return {
+            "handoff": {
+                "goal": self._handoff.goal,
+                "completed": list(self._handoff.completed),
+                "incomplete": list(self._handoff.incomplete),
+                "deliverables": list(self._handoff.deliverables),
+                "affected_files": list(self._handoff.affected_files),
+                "validation_status": self._handoff.validation_status,
+                "next_steps": list(self._handoff.next_steps),
+            },
+            "snapshot": {
+                "repo_root": self._snapshot.repo_root,
+                "cwd": self._snapshot.cwd,
+                "graph_hash": self._snapshot.graph_hash,
+                "git_branch": self._snapshot.git_branch,
+                "git_sha": self._snapshot.git_sha,
+                "last_analysis": self._snapshot.last_analysis,
+            },
+            "critical_facts": [
+                {
+                    "content": f.content,
+                    "fact_type": f.fact_type,
+                    "source_index": f.source_index,
+                    "importance": f.importance,
+                }
+                for f in self._critical_facts
+            ],
+            "env_context": dict(self._env_context),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> StructuredCompactor:
+        """Deserialize structured state from a dict.
+
+        Parameters
+        ----------
+        data : dict
+            A dict previously returned by ``to_dict()``.
+
+        Returns
+        -------
+        StructuredCompactor
+            A new instance with the deserialized state.
+        """
+        compactor = cls()
+
+        # Restore handoff
+        handoff_data = data.get("handoff", {})
+        compactor._handoff = HandoffState(
+            goal=handoff_data.get("goal", ""),
+            completed=handoff_data.get("completed", []),
+            incomplete=handoff_data.get("incomplete", []),
+            deliverables=handoff_data.get("deliverables", []),
+            affected_files=handoff_data.get("affected_files", []),
+            validation_status=handoff_data.get("validation_status", ""),
+            next_steps=handoff_data.get("next_steps", []),
+        )
+
+        # Restore snapshot
+        snap_data = data.get("snapshot", {})
+        compactor._snapshot = WorkspaceSnapshot(
+            repo_root=snap_data.get("repo_root", ""),
+            cwd=snap_data.get("cwd", ""),
+            graph_hash=snap_data.get("graph_hash", ""),
+            git_branch=snap_data.get("git_branch", ""),
+            git_sha=snap_data.get("git_sha", ""),
+            last_analysis=snap_data.get("last_analysis", ""),
+        )
+
+        # Restore critical facts
+        for fact_data in data.get("critical_facts", []):
+            compactor._critical_facts.append(
+                CriticalFact(
+                    content=fact_data.get("content", ""),
+                    fact_type=fact_data.get("fact_type", ""),
+                    source_index=fact_data.get("source_index", -1),
+                    importance=fact_data.get("importance", 0.5),
+                )
+            )
+
+        # Restore env context
+        compactor._env_context = dict(data.get("env_context", {}))
+
+        return compactor
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_structured_block(self) -> str:
+        """Build the structured handoff block text in the specified format."""
+        lines: list[str] = [
+            "=== WORKSPACE SNAPSHOT ===",
+        ]
+        if self._snapshot.repo_root:
+            lines.append(f"Repo: {self._snapshot.repo_root}")
+        if self._snapshot.git_branch:
+            lines.append(f"Branch: {self._snapshot.git_branch}")
+        if self._snapshot.git_sha:
+            lines.append(f"Commit: {self._snapshot.git_sha}")
+        if self._snapshot.graph_hash:
+            lines.append(f"Graph hash: {self._snapshot.graph_hash}")
+        if self._snapshot.last_analysis:
+            lines.append(f"Last analysis: {self._snapshot.last_analysis}")
+        if self._snapshot.cwd:
+            lines.append(f"Cwd: {self._snapshot.cwd}")
+
+        lines.append("")
+        lines.append("=== HANDOFF STATE ===")
+        lines.append(f"Goal: {self._handoff.goal}")
+        if self._handoff.completed:
+            lines.append(f"Completed: {self._format_list(self._handoff.completed)}")
+        if self._handoff.incomplete:
+            lines.append(f"Incomplete: {self._format_list(self._handoff.incomplete)}")
+        if self._handoff.deliverables:
+            lines.append(f"Deliverables: {self._format_list(self._handoff.deliverables)}")
+        if self._handoff.affected_files:
+            lines.append(
+                f"Affected files: {self._format_list(self._handoff.affected_files)}"
+            )
+        if self._handoff.validation_status:
+            lines.append(f"Validation: {self._handoff.validation_status}")
+        if self._handoff.next_steps:
+            lines.append(f"Next steps: {self._format_list(self._handoff.next_steps)}")
+
+        lines.append("")
+        lines.append("=== ENVIRONMENT ===")
+        for key, value in sorted(self._env_context.items()):
+            lines.append(f"{key}: {value}")
+
+        if self._critical_facts:
+            lines.append("")
+            lines.append("=== CRITICAL FACTS ===")
+            for fact in self._critical_facts:
+                lines.append(f"- [{fact.fact_type}] {fact.content}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_list(items: list[str]) -> str:
+        """Format a list of strings for the structured block."""
+        if len(items) <= 3:
+            return ", ".join(items)
+        return ", ".join(items[:3]) + f", ... ({len(items)} total)"
+
+    def _auto_snapshot(self) -> None:
+        """Auto-populate workspace snapshot fields from the environment."""
+        if not self._snapshot.cwd:
+            self._snapshot.cwd = os.getcwd()
+
+        if not self._snapshot.repo_root:
+            self._snapshot.repo_root = self._workspace_dir
+
+        if not self._snapshot.last_analysis:
+            self._snapshot.last_analysis = datetime.datetime.now().isoformat()
+
+        # Try to get git info
+        git_info = self._get_git_info()
+        if git_info:
+            if not self._snapshot.git_branch and "branch" in git_info:
+                self._snapshot.git_branch = git_info["branch"]
+            if not self._snapshot.git_sha and "sha" in git_info:
+                self._snapshot.git_sha = git_info["sha"]
+
+    @staticmethod
+    def _get_git_info() -> dict[str, str]:
+        """Try to extract git branch and SHA from the repo."""
+        info: dict[str, str] = {}
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                info["branch"] = result.stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                info["sha"] = result.stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+
+        return info
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def stats(self) -> CompactionStats:
+        """CompactionStats from the most recent ``compact()`` call."""
+        return self._last_stats
+
+    @property
+    def handoff(self) -> HandoffState:
+        """Current handoff state."""
+        return self._handoff
+
+    @property
+    def snapshot(self) -> WorkspaceSnapshot:
+        """Current workspace snapshot."""
+        return self._snapshot
+
+    @property
+    def critical_facts(self) -> list[CriticalFact]:
+        """Critical facts preserved across compaction."""
+        return list(self._critical_facts)
+
+    @property
+    def env_context(self) -> dict[str, str]:
+        """Environment context dictionary."""
+        return dict(self._env_context)
+
+
+# Register the structured compaction strategy
+register_strategy("structured", _compact_structured)

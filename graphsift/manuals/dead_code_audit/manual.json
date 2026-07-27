@@ -1,0 +1,8 @@
+{
+  "id": "dead_code_audit",
+  "name": "Dead Code Audit",
+  "description": "Find and analyze unreachable code",
+  "parent": "dependency_audit",
+  "tools_enabled": ["detect_dead_code", "prune_refs", "query_graph"],
+  "phases": ["discover", "verify", "cleanup"]
+}

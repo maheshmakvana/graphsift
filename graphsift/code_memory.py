@@ -253,6 +253,39 @@ class CodeMemory:
                 )
                 return cur.rowcount > 0
 
+    def save_session_checkpoint(
+        self,
+        session_store: "SessionStore",  # noqa: F821
+        session_id: str,
+    ) -> str:
+        """Save current code memory state as a session snapshot.
+
+        Records active memory counts, average importance, and total
+        accesses as an analysis snapshot in the given session.
+
+        Args:
+            session_store: A :class:`~graphsift.memory.SessionStore` instance.
+            session_id: The session to attach the snapshot to.
+
+        Returns:
+            The assigned snapshot ID.
+        """
+        from graphsift.memory import SessionStore  # noqa: PLC0415
+
+        stats = self.stats
+        summary = (
+            f"CodeMemory checkpoint: {stats.active_memories} active memories "
+            f"({stats.total_memories} total), "
+            f"avg importance {stats.avg_importance:.2f}, "
+            f"{stats.total_accesses} total accesses"
+        )
+        return session_store.snapshot_analysis(
+            session_id=session_id,
+            analysis_type="code_memory_checkpoint",
+            result_summary=summary,
+            token_cost=stats.total_accesses,
+        )
+
     def decay(self) -> int:
         """Apply decay: soft-delete expired memories, reduce importance of survivors by 2%."""
         count = 0

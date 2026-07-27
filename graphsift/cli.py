@@ -2547,6 +2547,232 @@ def cmd_loop_reset_breaker(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# session commands  (durable session workspaces)
+# ---------------------------------------------------------------------------
+
+
+def _get_session_store():
+	"""Create and return a SessionStore instance."""
+	from graphsift.memory import SessionStore
+
+	return SessionStore()
+
+
+def _resolve_and_print(store, name_or_id):
+	"""Resolve a session by name-or-id, printing an error on failure."""
+	session = store.resolve_session(name_or_id)
+	if session is None:
+		print(f"[graphsift] Session not found: {name_or_id!r}", file=sys.stderr)
+		return None
+	return session
+
+
+def _format_session(session):
+	"""Format a SessionRecord for human-readable display."""
+	lines = [
+		f"  ID:          {session.session_id}",
+		f"  Name:        {session.name}",
+		f"  Description: {session.description or '(none)'}",
+		f"  Created:     {session.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+		f"  Updated:     {session.updated_at.strftime('%Y-%m-%d %H:%M:%S')}",
+		f"  Status:      {'Active' if session.is_active else 'Closed'}",
+		f"  Repo root:   {session.repo_root or '(none)'}",
+	]
+	g = session.graph_hash
+	if g:
+		gh = g[:16] + "..." if len(g) > 16 else g
+	else:
+		gh = "(none)"
+	lines.append(f"  Graph hash:  {gh}")
+	return "\n".join(lines)
+
+
+def cmd_session_create(args: argparse.Namespace) -> int:
+	"""Create a new named analysis session."""
+	store = _get_session_store()
+	session = store.create_session(
+		name=args.name,
+		description=args.description,
+		repo_root=args.repo if args.repo else "",
+	)
+	print(f"[graphsift] Session created:")
+	print(_format_session(session))
+	return 0
+
+
+def cmd_session_list(args: argparse.Namespace) -> int:
+	"""List all sessions."""
+	store = _get_session_store()
+	sessions = store.list_sessions(
+		active_only=args.active_only, limit=args.limit
+	)
+	if not sessions:
+		print("[graphsift] No sessions found.")
+		return 0
+
+	status_filter = "active" if args.active_only else "all"
+	print(
+		f"[graphsift] Sessions ({status_filter},"
+		f" up to {args.limit} shown):"
+	)
+	print()
+	print(f"  {'ID':<38} {'Name':<24} {'Status':<8} {'Updated':<22}")
+	print(f"  {'-' * 92}")
+	for s in sessions:
+		sid_short = s.session_id[:12] + "..."
+		status = "Active" if s.is_active else "Closed"
+		updated = s.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+		print(
+			f"  {sid_short:<38} {s.name:<24} {status:<8} {updated:<22}"
+		)
+	print()
+	print(f"  Total: {len(sessions)} session(s)")
+	return 0
+
+
+def cmd_session_show(args: argparse.Namespace) -> int:
+	"""Show session details."""
+	store = _get_session_store()
+	session = _resolve_and_print(store, args.name_or_id)
+	if session is None:
+		return 1
+
+	print("[graphsift] Session details:")
+	print(_format_session(session))
+	print()
+
+	if args.snapshots:
+		snapshots = store.get_session_snapshots(session.session_id)
+		if not snapshots:
+			print("  No snapshots recorded.")
+		else:
+			print(f"  Snapshots ({len(snapshots)}):")
+			print()
+			for snap in snapshots:
+				files = snap["files_affected"]
+				files_str = ", ".join(files[:5])
+				if len(files) > 5:
+					files_str += f" ... (+{len(files) - 5} more)"
+				print(
+					f"    [{snap['analysis_type']}]"
+					f" {snap['result_summary'][:120]}"
+				)
+				print(f"      Snapshot ID: {snap['snapshot_id'][:12]}...")
+				print(f"      Time:        {snap['created_at']}")
+				print(f"      Token cost:  {snap['token_cost']}")
+				print(f"      Files:       {files_str or '(none)'}")
+				print()
+	return 0
+
+
+def cmd_session_close(args: argparse.Namespace) -> int:
+	"""Mark a session as inactive (soft-close)."""
+	store = _get_session_store()
+	session = _resolve_and_print(store, args.name_or_id)
+	if session is None:
+		return 1
+
+	store.close_session(session.session_id)
+	print(
+		f"[graphsift] Session closed: {session.name}"
+		f" ({session.session_id[:12]}...)"
+	)
+	return 0
+
+
+def cmd_session_delete(args: argparse.Namespace) -> int:
+	"""Permanently delete a session."""
+	store = _get_session_store()
+	session = _resolve_and_print(store, args.name_or_id)
+	if session is None:
+		return 1
+
+	store.delete_session(session.session_id)
+	print(
+		f"[graphsift] Session deleted: {session.name}"
+		f" ({session.session_id[:12]}...)"
+	)
+	return 0
+
+
+def cmd_session_compare(args: argparse.Namespace) -> int:
+	"""Compare two sessions."""
+	store = _get_session_store()
+	sa = _resolve_and_print(store, args.session_a)
+	if sa is None:
+		return 1
+	sb = _resolve_and_print(store, args.session_b)
+	if sb is None:
+		return 1
+
+	result = store.compare_sessions(sa.session_id, sb.session_id)
+
+	print("[graphsift] Session comparison:")
+	print()
+	print(
+		f"  Session A: {sa.name} ({sa.session_id[:12]}...)"
+	)
+	print(
+		f"  Session B: {sb.name} ({sb.session_id[:12]}...)"
+	)
+	print()
+
+	common = result.get("common_fields", {})
+	if common:
+		print("  Common fields:")
+		for field, value in common.items():
+			print(f"    {field}: {value}")
+		print()
+
+	counts = result.get("snapshot_counts", {})
+	print(
+		f"  Snapshot counts:  A={counts.get('a', 0)},"
+		f"  B={counts.get('b', 0)}"
+	)
+
+	files_only_a = result.get("files_only_in_a", [])
+	files_only_b = result.get("files_only_in_b", [])
+	files_both = result.get("files_in_both", [])
+
+	if files_only_a:
+		print(f"  Files only in A:  {len(files_only_a)}")
+		for f in files_only_a[:10]:
+			print(f"    - {f}")
+		if len(files_only_a) > 10:
+			print(f"    ... and {len(files_only_a) - 10} more")
+	if files_only_b:
+		print(f"  Files only in B:  {len(files_only_b)}")
+		for f in files_only_b[:10]:
+			print(f"    - {f}")
+		if len(files_only_b) > 10:
+			print(f"    ... and {len(files_only_b) - 10} more")
+	if files_both:
+		print(f"  Files in both:    {len(files_both)}")
+		for f in files_both[:10]:
+			print(f"    - {f}")
+		if len(files_both) > 10:
+			print(f"    ... and {len(files_both) - 10} more")
+	return 0
+
+
+def cmd_session_prune(args: argparse.Namespace) -> int:
+	"""Delete oldest sessions beyond keep count."""
+	store = _get_session_store()
+	deleted = store.prune_old_sessions(keep_count=args.keep)
+	if deleted == 0:
+		print(
+			f"[graphsift] No sessions to prune"
+			f" (keeping {args.keep} most recent)."
+		)
+	else:
+		print(
+			f"[graphsift] Pruned {deleted} old session(s)"
+			f" (keeping {args.keep} most recent)."
+		)
+	return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -2857,6 +3083,55 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # evolve clear
     evolve_sub.add_parser("clear", help="Clear all cached evolution results.")
+
+    # -----------------------------------------------------------------------
+    # session command  (durable session workspaces)
+    # -----------------------------------------------------------------------
+    session_parser = sub.add_parser(
+        "session",
+        help="Manage durable analysis sessions (create, list, show, close, delete, compare, prune)",
+    )
+    session_sub = session_parser.add_subparsers(dest="session_action", required=True)
+
+    # session create
+    p_sess_create = session_sub.add_parser("create", help="Create a new named analysis session")
+    p_sess_create.add_argument("name", help="Session name")
+    p_sess_create.add_argument("--description", "-d", default="", help="Session description")
+    p_sess_create.add_argument("--repo", "-r", default="", help="Repository root path")
+    p_sess_create.set_defaults(func=cmd_session_create)
+
+    # session list
+    p_sess_list = session_sub.add_parser("list", help="List all sessions")
+    p_sess_list.add_argument("--active-only", action="store_true", help="Show only active sessions")
+    p_sess_list.add_argument("--limit", type=int, default=50, help="Max sessions to show (default: 50)")
+    p_sess_list.set_defaults(func=cmd_session_list)
+
+    # session show
+    p_sess_show = session_sub.add_parser("show", help="Show session details")
+    p_sess_show.add_argument("name_or_id", help="Session name or ID")
+    p_sess_show.add_argument("--snapshots", action="store_true", help="Include snapshot history")
+    p_sess_show.set_defaults(func=cmd_session_show)
+
+    # session close
+    p_sess_close = session_sub.add_parser("close", help="Mark a session as inactive (soft-close)")
+    p_sess_close.add_argument("name_or_id", help="Session name or ID")
+    p_sess_close.set_defaults(func=cmd_session_close)
+
+    # session delete
+    p_sess_delete = session_sub.add_parser("delete", help="Permanently delete a session")
+    p_sess_delete.add_argument("name_or_id", help="Session name or ID")
+    p_sess_delete.set_defaults(func=cmd_session_delete)
+
+    # session compare
+    p_sess_compare = session_sub.add_parser("compare", help="Compare two sessions")
+    p_sess_compare.add_argument("session_a", help="First session name or ID")
+    p_sess_compare.add_argument("session_b", help="Second session name or ID")
+    p_sess_compare.set_defaults(func=cmd_session_compare)
+
+    # session prune
+    p_sess_prune = session_sub.add_parser("prune", help="Delete oldest sessions beyond keep count")
+    p_sess_prune.add_argument("--keep", type=int, default=30, help="Number of sessions to keep (default: 30)")
+    p_sess_prune.set_defaults(func=cmd_session_prune)
 
     # -----------------------------------------------------------------------
     # loop command  (loop-engineering)

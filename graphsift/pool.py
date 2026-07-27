@@ -75,9 +75,12 @@ class DatabasePool:
         self._in_use: dict[int, sqlite3.Connection] = {}
         self._conn_timestamps: dict[int, float] = {}  # conn id -> last checkin time
         self._closed = False
+        self._recovery_attempted = False
 
         # Ensure parent directory exists
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        # Remove stale WAL/SHM files from previous crashed processes
+        self._cleanup_stale_wal()
 
     def __repr__(self) -> str:
         return (
@@ -113,10 +116,14 @@ class DatabasePool:
                 try:
                     conn = self._available.get(timeout=30.0)
                 except Empty:
-                    raise RuntimeError(
-                        f"DatabasePool: all {self._max_connections} connections "
-                        f"in use, timed out waiting"
-                    ) from None
+                    if self._recovery_attempted:
+                        raise RuntimeError(
+                            f"DatabasePool: all {self._max_connections} connections "
+                            f"in use, timed out waiting (recovery already attempted)"
+                        ) from None
+                    self._recovery_attempted = True
+                    # Fall through to _recover() outside the lock
+                    conn = None
             else:
                 # Try to get an available connection first
                 try:
@@ -127,7 +134,15 @@ class DatabasePool:
                     with self._lock:
                         self._all_conns.add(conn)
 
-        # Validate the connection
+        if conn is None:
+            # Recovery path: all connections were stuck — force-reclaim
+            logger.warning(
+                "DatabasePool: all %d connections stuck, attempting auto-recovery",
+                self._max_connections,
+            )
+            conn = self._force_recover()
+
+        # Validate the connection (applies to both normal and recovery paths)
         if not self._is_connection_alive(conn):
             logger.debug("graphsift: DatabasePool replacing stale connection")
             self._discard_connection(conn)
@@ -157,6 +172,87 @@ class DatabasePool:
             if conn in self._all_conns:
                 self._conn_timestamps[conn_id] = time.monotonic()
                 self._available.put(conn)
+
+    # ------------------------------------------------------------------
+    # Stale-file cleanup & recovery
+    # ------------------------------------------------------------------
+
+    def _cleanup_stale_wal(self) -> None:
+        """Remove orphaned WAL/SHM files from previous crashed processes.
+
+        In WAL journal mode, if the owning process crashes, ``.db-wal`` and
+        ``.db-shm`` files persist on disk.  A new pool starting up will try
+        to replay (or checkpoint) the stale WAL, which can block SQLite
+        operations indefinitely and exhaust the connection pool.
+
+        We only remove files *older than 60 seconds* to avoid interfering
+        with a concurrently running graphsift process (the typical case is
+        that the previous process died seconds or minutes ago).
+        """
+        wal = Path(self._db_path + "-wal")
+        shm = Path(self._db_path + "-shm")
+        now = time.time()
+
+        for p in (wal, shm):
+            try:
+                mtime = p.stat().st_mtime
+                age = now - mtime
+                if age > 60.0:
+                    p.unlink()
+                    logger.info(
+                        "graphsift: removed stale %s (age=%.0fs)",
+                        p.name,
+                        age,
+                    )
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug("graphsift: could not remove %s", p)
+
+    def _force_recover(self) -> sqlite3.Connection:
+        """Force-reclaim all pool connections and recover from exhaustion.
+
+        1. Close every tracked connection (in-use + available).
+        2. Remove stale WAL/SHM files.
+        3. Open a single fresh connection.
+
+        This is a last resort triggered when ``acquire()`` has waited 30
+        seconds and no connection became free.  Recovery is attempted at
+        most once per pool lifetime.
+        """
+        with self._lock:
+            tracked = set(self._all_conns)
+            self._in_use.clear()
+            self._all_conns.clear()
+
+        while not self._available.empty():
+            try:
+                tracked.add(self._available.get_nowait())
+            except Empty:
+                break
+
+        for conn in tracked:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+        self._cleanup_stale_wal()
+
+        try:
+            fresh = self._create_connection()
+            with self._lock:
+                self._all_conns.add(fresh)
+            logger.info("graphsift: DatabasePool recovered successfully")
+            return fresh
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"DatabasePool: recovery failed — {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def execute(
         self,

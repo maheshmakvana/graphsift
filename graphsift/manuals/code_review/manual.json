@@ -1,0 +1,8 @@
+{
+  "id": "code_review",
+  "name": "Code Review",
+  "description": "Review code changes with dependency-aware context",
+  "parent": "dependency_audit",
+  "tools_enabled": ["get_context", "get_review_context", "minimal_context", "check_evidence"],
+  "phases": ["context", "review", "verify"]
+}

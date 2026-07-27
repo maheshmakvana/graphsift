@@ -1,12 +1,17 @@
 # Changelog
 
-> **graphsift v4.6.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> **graphsift v4.6.1** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
 > Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 826+ tests, 50 modules, zero external dependencies.
 
 All notable changes to graphsift are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.6.1] — 2026-07-27
+
+### Fixed
+- **compact_context.py** — improve compaction principle 
 
 ## [4.6.0] — 2026-07-26
 

@@ -1,0 +1,8 @@
+id = "scan_dependencies"
+name = "Dependency Scanner"
+version = "1.0.0"
+description = "Scan Python dependencies for known vulnerabilities using safety"
+execution.binary = "safety"
+execution.default_timeout_ms = 60000
+mutating = false
+network = true
