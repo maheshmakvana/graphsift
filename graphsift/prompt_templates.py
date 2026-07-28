@@ -61,11 +61,23 @@ use **[UNKNOWN]** — do not fabricate evidence.
 
 ## Output Evidence Enforcement (AUTO-VERIFIED)
 Every file:line claim in your output MUST reference a real file on disk.
-Before returning output, verify every file:line reference against the actual filesystem.
 Unverifiable claims MUST be marked [UNKNOWN] — do not fabricate evidence.
-Output will be scanned by EvidenceChecker after generation.
-Every file:line reference will be validated against the actual filesystem.
 Invalid references will be flagged. You are responsible for accuracy.
+"""
+
+_CODE_GEN_SAFETY = """
+## Code Generation Safety
+- **Evidence** — tag every claim with [VERIFIED-REAL] (from context) or [UNKNOWN]
+- **Don't Hallucinate** — never invent API signatures, library features, or error types
+- **Fallback First** — specify failure handling BEFORE the happy path
+- **Validation Theater** — do NOT test generated code with generated data and report "100% pass"
+- **File Accuracy** — every file:line reference MUST point to a real file; mark unknowns [UNKNOWN]
+
+## Self-Check (Pre-Output)
+1. Does the implementation match the interfaces defined? If not, REVISE.
+2. Are there contradictions between phases? If yes, REVISE.
+3. Any unimplemented stubs marked TODO? Finish or mark [UNKNOWN].
+4. Does the code handle stated failure modes? If not, REVISE.
 """
 
 _ANTI_HALLUCINATION_RULES = """
@@ -438,6 +450,25 @@ class FixBugTemplate:
                 "Every fix must include a regression test that reproduces the bug",
             ]
 
+        # Build dynamic schema from actual bug/file
+        test_file = file.replace(".py", "_test.py").rsplit("/", 1)[-1]
+        if not test_file.endswith(".py"):
+            test_file = "tests/test_" + test_file
+
+        schema_example = json.dumps({
+            "root_cause": f"[VERIFIED-REAL] Root cause of: {bug[:100]}",
+            "fix": {
+                "file": file,
+                "diff": f"Fix for: {bug[:120]}",
+                "reason": "Explanation of why this fix resolves the root cause without side effects",
+            },
+            "test_change": {
+                "file": f"tests/{test_file}",
+                "scenario": f"Reproduce: {bug[:120]}",
+            },
+            "self_review": "Fix verified: no side effects, regression test covers the exact bug. Safe to apply.",
+        }, indent=2)
+
         lines: list[str] = [
             f"# Role: {self.role}",
             "",
@@ -461,32 +492,19 @@ class FixBugTemplate:
 
         lines += [
             "",
-            "--- INCREMENTAL APPROACH ---",
-            "  Step 1: Root cause analysis (hypothesis → evidence → conclusion)",
-            "  Step 2: Fix implementation (minimal change, no scope creep)",
-            "  Step 3: Regression test (reproduces the exact bug)",
-            "  Step 4: Self-review (does the fix match the root cause?)",
+            "--- APPROACH ---",
+            "  Step 1: Read the current file to understand the code around the bug",
+            "  Step 2: Root cause analysis (hypothesis → evidence → conclusion)",
+            "  Step 3: Fix implementation (minimal change, no scope creep)",
+            "  Step 4: Regression test that reproduces the exact bug",
+            "  Step 5: Self-review (does the fix match the root cause?)",
             "",
-            _EVIDENCE_MARKER_INSTRUCTION.strip(),
-            "",
-            _GRAPHSIFT_SOURCE_RULES.strip(),
-            "",
-            _ANTI_HALLUCINATION_RULES.strip(),
-            "",
-            _COHERENCE_GUARD.strip(),
+            _CODE_GEN_SAFETY.strip(),
             "",
             _OUTPUT_SCHEMA_INSTRUCTION.strip(),
             "",
             "### Output Schema",
-            """```json
-{
-  "root_cause": "[VERIFIED-REAL] explanation",
-  "fix": {"file": "...", "diff": "...", "reason": "..."},
-  "test_change": "...",
-  "self_review": "No side effects confirmed | [UNKNOWN] risk of ...",
-  "evidence": ["..."]
-}
-```""",
+            f"```json\n{schema_example}\n```",
         ]
         return "\n".join(lines)
 
@@ -520,6 +538,27 @@ class AddFeatureTemplate:
                 "Public API must be documented",
             ]
 
+        # Build dynamic schema from actual feature/files
+        changes = []
+        for f in (files or ["src/feature.py"]):
+            changes.append({
+                "file": f,
+                "phase": "types|impl|tests",
+                "diff": f"Add implementation for: {feature[:80]}",
+            })
+        tests = (acceptance_criteria or [
+            "Test that feature works correctly",
+            "Test error handling and edge cases",
+        ])
+
+        schema_example = json.dumps({
+            "approach": f"{feature[:120]} [VERIFIED-REAL]",
+            "changes": changes,
+            "tests": tests,
+            "coherence_failed": False,
+            "unknowns": [],
+        }, indent=2)
+
         lines: list[str] = [
             f"# Role: {self.role}",
             "",
@@ -542,34 +581,19 @@ class AddFeatureTemplate:
         lines += [
             "",
             "--- PHASED GENERATION ---",
-            "  Phase 1: Types and interfaces",
-            "  Phase 2: Function signatures and contracts",
-            "  Phase 3: Implementation",
-            "  Phase 4: Error handling for every failure mode",
-            "  Phase 5: Tests covering acceptance criteria",
+            "  Phase 1: Read existing files to understand current patterns",
+            "  Phase 2: Types and interfaces",
+            "  Phase 3: Function signatures and contracts",
+            "  Phase 4: Implementation",
+            "  Phase 5: Error handling for every failure mode",
+            "  Phase 6: Tests covering acceptance criteria",
             "",
-            _EVIDENCE_MARKER_INSTRUCTION.strip(),
-            "",
-            _GRAPHSIFT_SOURCE_RULES.strip(),
-            "",
-            _ANTI_HALLUCINATION_RULES.strip(),
-            "",
-            _COHERENCE_GUARD.strip(),
+            _CODE_GEN_SAFETY.strip(),
             "",
             _OUTPUT_SCHEMA_INSTRUCTION.strip(),
             "",
             "### Output Schema",
-            """```json
-{
-  "approach": "description [VERIFIED-REAL]",
-  "changes": [
-    {"file": "...", "phase": "types|impl|tests", "diff": "..."}
-  ],
-  "tests": ["..."],
-  "coherence_failed": false,
-  "unknowns": []
-}
-```""",
+            f"```json\n{schema_example}\n```",
         ]
         return "\n".join(lines)
 
@@ -603,6 +627,22 @@ class RefactorTemplate:
                 "If a deprecation path is needed, include migration instructions",
             ]
 
+        # Build dynamic schema from actual target/files
+        changes = []
+        for f in (files or [target.replace(" ", "_").lower() + ".py"]):
+            changes.append({
+                "file": f,
+                "before": f"Current implementation of {target}",
+                "after": f"Refactored: {goal or 'improved structure'}",
+            })
+        schema_example = json.dumps({
+            "changes": changes,
+            "verification": f"All callers updated. Input/output unchanged. [VERIFIED-REAL]",
+            "risk": "low|medium|high",
+            "coherence_checked": True,
+            "unknown_callers": [],
+        }, indent=2)
+
         lines: list[str] = [
             f"# Role: {self.role}",
             "",
@@ -623,33 +663,18 @@ class RefactorTemplate:
         lines += [
             "",
             "--- REFACTOR PHASES ---",
-            "  Phase 1: Map all callers and dependencies",
-            "  Phase 2: Apply change",
-            "  Phase 3: Update all references",
-            "  Phase 4: Verify no behavior change",
+            "  Phase 1: Read all files to understand current structure and callers",
+            "  Phase 2: Map all callers and dependencies",
+            "  Phase 3: Apply change",
+            "  Phase 4: Update all references across the project",
+            "  Phase 5: Verify no behavior change",
             "",
-            _EVIDENCE_MARKER_INSTRUCTION.strip(),
-            "",
-            _GRAPHSIFT_SOURCE_RULES.strip(),
-            "",
-            _ANTI_HALLUCINATION_RULES.strip(),
-            "",
-            _COHERENCE_GUARD.strip(),
+            _CODE_GEN_SAFETY.strip(),
             "",
             _OUTPUT_SCHEMA_INSTRUCTION.strip(),
             "",
             "### Output Schema",
-            """```json
-{
-  "changes": [
-    {"file": "...", "before": "...", "after": "..."}
-  ],
-  "verification": "[VERIFIED-REAL] behavior preserved: ...",
-  "risk": "low|medium|high",
-  "coherence_checked": true,
-  "unknown_callers": []
-}
-```""",
+            f"```json\n{schema_example}\n```",
         ]
         return "\n".join(lines)
 

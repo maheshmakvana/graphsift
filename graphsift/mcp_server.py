@@ -1977,48 +1977,235 @@ def _tool_check_evidence(params: dict) -> dict:
     }
 
 
-def _tool_fix_bug(params: dict) -> dict:
-    """Generate a structured bug-fix prompt."""
+def _tool_generate_fix_prompt(params: dict) -> dict:
+    """PLANNING TOOL — reads the buggy file, returns a step-by-step execution
+    plan with verification. YOU MUST EXECUTE each step in order. Does NOT
+    modify files automatically."""
     from graphsift.prompt_templates import FixBugTemplate
+    from pathlib import Path
+
+    bug = params.get("bug", "")
+    file = params.get("file", "")
+    line = params.get("line")
+
+    # Read actual file for context
+    file_context = ""
+    file_path = Path(file)
+    if file_path.exists():
+        try:
+            content = file_path.read_text(encoding="utf-8")
+            lines = content.split("\n")
+            start = max(0, (line or 1) - 15)
+            end = min(len(lines), (line or 1) + 15)
+            file_context = "\n".join(lines[start:end])
+        except Exception:
+            file_context = "(could not read file)"
+
+    # Build the test file name
+    test_file = file.replace(".py", "_test.py").rsplit("/", 1)[-1]
+    if not test_file.endswith(".py"):
+        test_file = "test_" + test_file
 
     tpl = FixBugTemplate()
     prompt = tpl.render(
-        bug=params.get("bug", ""),
-        file=params.get("file", ""),
-        line=params.get("line"),
+        bug=bug,
+        file=file,
+        line=line,
         expected=params.get("expected", ""),
         actual=params.get("actual", ""),
     )
 
-    return {"prompt": prompt, "template": "fix"}
+    return {
+        "status": "PLAN_READY",
+        "action_required": True,
+        "plan_summary": f"Fix bug in {file}: {bug[:80]}",
+        "execution_steps": [
+            {
+                "step": 1,
+                "action": "read",
+                "target": file,
+                "instruction": f"Read {file} around line {line or 'the relevant area'} to understand the code structure",
+            },
+            {
+                "step": 2,
+                "action": "edit",
+                "target": file,
+                "instruction": f"Apply the fix for: {bug[:200]}. Use Edit to modify the file.",
+            },
+            {
+                "step": 3,
+                "action": "write",
+                "target": f"tests/{test_file}",
+                "instruction": f"Add a regression test that reproduces the bug and confirms the fix",
+            },
+            {
+                "step": 4,
+                "action": "verify",
+                "target": "ALL",
+                "instruction": "Read back the modified file(s). Confirm the fix is correct and no side effects were introduced. Check the test captures the original bug.",
+            },
+        ],
+        "verification_criteria": [
+            f"The bug is fixed in {file}",
+            "No public API signatures changed",
+            "Regression test exists that reproduces the original bug",
+            "No new imports or dependencies added without justification",
+        ],
+        "context": {
+            "file": file,
+            "file_exists": file_path.exists(),
+            "surrounding_code": file_context,
+        },
+        "implementation_prompt": prompt,
+    }
 
 
-def _tool_add_feature(params: dict) -> dict:
-    """Generate a structured feature-addition prompt."""
+def _tool_generate_feature_prompt(params: dict) -> dict:
+    """PLANNING TOOL — reads target files, returns a step-by-step execution
+    plan with verification. YOU MUST EXECUTE each step in order. Does NOT
+    create files automatically."""
     from graphsift.prompt_templates import AddFeatureTemplate
+    from pathlib import Path
+
+    file_list = params.get("files") or []
+    feature = params.get("feature", "")
+
+    # Read existing files for context
+    file_contexts = {}
+    for f in file_list:
+        fp = Path(f)
+        if fp.exists():
+            try:
+                file_contexts[f] = fp.read_text(encoding="utf-8")[:3000]
+            except Exception:
+                file_contexts[f] = "(could not read file)"
+        else:
+            file_contexts[f] = "(file does not exist yet — will be created)"
 
     tpl = AddFeatureTemplate()
     prompt = tpl.render(
-        feature=params.get("feature", ""),
-        files=params.get("files"),
+        feature=feature,
+        files=file_list,
         acceptance_criteria=params.get("acceptance_criteria"),
     )
 
-    return {"prompt": prompt, "template": "add"}
+    return {
+        "status": "PLAN_READY",
+        "action_required": True,
+        "plan_summary": f"Add feature: {feature[:100]}",
+        "execution_steps": [
+            {
+                "step": 1,
+                "action": "read",
+                "target": ", ".join(file_list),
+                "instruction": f"Read existing files to understand current code patterns before writing",
+            },
+            {
+                "step": 2,
+                "action": "edit",
+                "target": file_list[0] if file_list else "(new file)",
+                "instruction": f"Implement {feature[:200]} following the patterns identified in step 1",
+            },
+            {
+                "step": 3,
+                "action": "write" if len(file_list) > 1 else "verify",
+                "target": file_list[1] if len(file_list) > 1 else "",
+                "instruction": f"Create/modify additional files as needed for the feature",
+            },
+            {
+                "step": 4,
+                "action": "verify",
+                "target": "ALL",
+                "instruction": "Read back modified files. Confirm the feature works and meets all acceptance criteria. Check error handling and edge cases.",
+            },
+        ],
+        "verification_criteria": [
+            f"Feature is implemented: {feature[:80]}",
+            "All target files exist with correct content",
+            "Error handling covers empty, null, error, and edge cases",
+            "No breaking changes to existing public APIs",
+        ],
+        "context": {
+            "files": file_list,
+            "file_contents": file_contexts,
+        },
+        "implementation_prompt": prompt,
+    }
 
 
-def _tool_refactor_code(params: dict) -> dict:
-    """Generate a structured refactoring prompt."""
+def _tool_generate_refactor_prompt(params: dict) -> dict:
+    """PLANNING TOOL — reads target files, returns a step-by-step execution
+    plan with verification. YOU MUST EXECUTE each step in order. Does NOT
+    modify files automatically."""
     from graphsift.prompt_templates import RefactorTemplate
+    from pathlib import Path
+
+    file_list = params.get("files") or []
+    target = params.get("target", "")
+    goal = params.get("goal", "")
+
+    # Read existing files for context
+    file_contexts = {}
+    for f in file_list:
+        fp = Path(f)
+        if fp.exists():
+            try:
+                file_contexts[f] = fp.read_text(encoding="utf-8")[:3000]
+            except Exception:
+                file_contexts[f] = "(could not read file)"
+        else:
+            file_contexts[f] = "(file does not exist)"
 
     tpl = RefactorTemplate()
     prompt = tpl.render(
-        target=params.get("target", ""),
-        goal=params.get("goal", ""),
-        files=params.get("files"),
+        target=target,
+        goal=goal,
+        files=file_list,
     )
 
-    return {"prompt": prompt, "template": "refactor"}
+    return {
+        "status": "PLAN_READY",
+        "action_required": True,
+        "plan_summary": f"Refactor {target}: {goal[:100] if goal else 'improve structure'}",
+        "execution_steps": [
+            {
+                "step": 1,
+                "action": "read",
+                "target": ", ".join(file_list),
+                "instruction": f"Read all files to understand current structure, callers, and dependencies",
+            },
+            {
+                "step": 2,
+                "action": "edit",
+                "target": file_list[0] if file_list else target,
+                "instruction": f"Apply the refactoring: {goal[:200]}. Use Edit to modify files while preserving behavior.",
+            },
+            {
+                "step": 3,
+                "action": "edit" if len(file_list) > 1 else "verify",
+                "target": file_list[1] if len(file_list) > 1 else "",
+                "instruction": "Update all callers and references across affected files",
+            },
+            {
+                "step": 4,
+                "action": "verify",
+                "target": "ALL",
+                "instruction": "Read back all modified files. Confirm behavior is preserved. Check no references are broken. Verify all callers updated.",
+            },
+        ],
+        "verification_criteria": [
+            f"Refactoring complete: {target}",
+            "Behavior is preserved — no API signature changes",
+            "All existing callers are updated to use new code",
+            "No dead code or stale references remain",
+            "Tests still pass (if applicable)",
+        ],
+        "context": {
+            "files": file_list,
+            "file_contents": file_contexts,
+        },
+        "implementation_prompt": prompt,
+    }
 
 
 def _tool_set_task_type(params: dict) -> dict:
@@ -3055,9 +3242,9 @@ _TOOLS = {
             "required": ["text"],
         },
     },
-    "fix_bug": {
-        "fn": _tool_fix_bug,
-        "description": "Generate a structured bug-fix prompt using the fix template. Outputs JSON with root_cause, fix, file, line.",
+    "generate_fix_prompt": {
+        "fn": _tool_generate_fix_prompt,
+        "description": "PLANNING TOOL — reads the buggy file, returns a step-by-step execution plan with 4 steps: [read→edit→write test→verify]. YOU MUST EXECUTE each step in order using Write/Edit and verify before reporting done.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3070,9 +3257,9 @@ _TOOLS = {
             "required": ["bug", "file"],
         },
     },
-    "add_feature": {
-        "fn": _tool_add_feature,
-        "description": "Generate a structured feature-addition prompt. Outputs JSON with approach, changes, tests.",
+    "generate_feature_prompt": {
+        "fn": _tool_generate_feature_prompt,
+        "description": "PLANNING TOOL — reads target files, returns a step-by-step execution plan with 4 steps: [read→edit→write→verify]. YOU MUST EXECUTE each step in order using Write/Edit and verify before reporting done.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3083,9 +3270,9 @@ _TOOLS = {
             "required": ["feature"],
         },
     },
-    "refactor_code": {
-        "fn": _tool_refactor_code,
-        "description": "Generate a structured refactoring prompt. Outputs JSON with changes, verification, risk level.",
+    "generate_refactor_prompt": {
+        "fn": _tool_generate_refactor_prompt,
+        "description": "PLANNING TOOL — reads target files, returns a step-by-step execution plan with 4 steps: [read→edit→update→verify]. YOU MUST EXECUTE each step in order using Edit and verify before reporting done.",
         "inputSchema": {
             "type": "object",
             "properties": {
