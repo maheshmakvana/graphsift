@@ -1,12 +1,44 @@
 # Changelog
 
-> **graphsift v4.8.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> **graphsift v4.9.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
 > Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 826+ tests, 50 modules, zero external dependencies.
 
 All notable changes to graphsift are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.9.0] — 2026-07-29
+
+### Added
+- **`graphsift daemon` CLI** — new subcommand group (`start|stop|status|cache-stats|cache-clear`) for managing the persistent Python daemon directly from the terminal.
+- **Windows path normalization** — auto-configure now converts MSYS2/Cygwin paths (`/c/Users/...`) to Windows native (`C:\Users\...`) when writing `.claude/settings.json` hook commands. Fixes broken PreToolUse/SessionStart hooks on Windows with Git Bash.
+- **Daemon atexit cleanup** — daemon process auto-stops on parent exit via `atexit.register`, preventing orphan processes.
+- **CWD support** — daemon `chdir`s into the requested working directory before code execution and restores `sys.path` afterward.
+
+### Fixed
+- **Windows `select.select()` crash** — `_readline_with_timeout()` used `select.select()` which only works with sockets on Windows, not pipe handles. Replaced with thread-based timed read — daemon now starts and works correctly on Windows.
+- **Daemon start verification** — `start()` now uses connect timeout + responsive ping check before returning success. Failed starts kill the orphan process and report failure instead of silently returning "started".
+- **BrokenPipeError recovery** — `exec_code()` and `sleep()` now catch `BrokenPipeError` and auto-restart the daemon instead of crashing.
+- **Protocol desync protection** — `_drain_daemon_pipe()` drains stale data after protocol errors to prevent cascading parse failures.
+- **Cache eviction edge case** — added try/except around `min()` on empty cache during eviction.
+- **Stale cache on restart** — `_RESULT_CACHE.clear()` now called on daemon restart to prevent returning stale cached results.
+- **Division by zero in progress bar** — added `progress_interval > 0` guard in cli.py progress display.
+
+### Changed
+- **daemon.py** — full rewrite for thread safety (`RLock` instead of `Lock`), read timeouts, `BrokenPipeError` handling, cwd support, restricted exec globals, and atexit cleanup. 13 functions, 458 lines (+19 lines from v4.8.0).
+- **hooks.py** — smarter pattern matching: Windows `cd /d` support, chained-command detection (passes through to shell when post-Python cleanup exists), `re.fullmatch` for sleep.
+- **__init__.py** — project-scoped config lock (per-project instead of machine-wide), `sys.executable` directly, MSYS2 path normalization.
+- **cli.py** — added `cmd_daemon` for daemon management, progress bar division-by-zero fix.
+
+### Security
+- **Restricted exec globals** — daemon now uses `exec(code, restricted_globals, {})` instead of bare `exec(code)`. Blocks `eval`, `compile`, `open`, and other dangerous builtins while preserving `print`, `len`, `sum`, `import`, etc.
+- **No daemon internals leak** — executed code cannot access `_cache`, `_DAEMON_PROCESS`, or any daemon module state.
+
+### Performance
+- **35× cache speedup** — successful command results cached in-process + daemon side. Cold exec: 0.65ms, Hot exec: 0.02ms (vs 3.78ms/3.79ms before, where cache was broken).
+- **Burst throughput 8.6× faster** — 20 sequential commands: 124ms → 14ms (0.72ms avg vs 6.2ms).
+- **Concurrent threads fixed** — 10 concurrent threads: 10 errors → 0 errors (RLock prevents deadlock).
 
 ## [4.8.0] — 2026-07-29
 

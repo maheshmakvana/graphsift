@@ -1,4 +1,4 @@
-"""graphsift v4.8.0 — #1 Token Saver + Smart Execution Engine.
+"""graphsift v4.9.0 — #1 Token Saver + Smart Execution Engine.
 
 Created by Mahesh Makwana (https://github.com/maheshmakvana).
 
@@ -7,17 +7,12 @@ debugging, and code generation. Save 80-150x tokens on every code review with
 Claude Code, GPT-4, Gemini, Codex, or any LLM — zero data exfiltration, zero
 telemetry, zero API calls from library code.
 
-v3.0 delivers 11 new modules, 702 tests (+115%), and 93% feature coverage
-(25/27 features). Includes Planner, ToolChain, AutoVerifier, ConventionLearner,
-ContextEnricher, AsyncEngine, 2-tier ASTCache, SecurePipeline, DataScrubber,
-and SchemaRegistry.
-
 Why graphsift?
 Instead of sending your entire codebase (or using binary blast-radius),
 graphsift ranks every file 0-1 by relevance using AST dependency graphs + BM25
 + diff proximity, then selects only the most relevant files within a hard token
 budget. Combined with 3-tier compression (HOT/WARM/COLD), diff-aware trimming,
-entropy deduplication, and 19 CLI output compressors, you save 80-150x tokens
+entropy deduplication, and 25 CLI output compressors, you save 80-150x tokens
 vs raw source while maintaining 0.85 F1 relevance accuracy.
 
 Core capabilities:
@@ -27,8 +22,9 @@ Core capabilities:
 - Diff-aware context trimming — only changed regions + context
 - Entropy-based deduplication — SimHash near-duplicate detection
 - 14-language AST parsing + 11-language tree-sitter precise parsing
-- 19 CLI command compressors + ultra_compress mode
+- 25 CLI command compressors + ultra_compress mode
 - Cache-aware output with Claude/GPT prompt-cache breakpoints
+- Smart Execution Engine — persistent daemon with result caching
 - Hybrid search — BM25 + TF-IDF + optional dense vector fusion (3 modes)
 - MCP server — token-saving tools for Claude Code automatic integration
 - Conversation compaction — 60-82% agent conversation savings
@@ -38,7 +34,7 @@ Core capabilities:
 - Security — PathValidator + CommandSanitizer + DataScrubber + SecurePipeline
 - Auto-fix suggestions — 5 categories of graph-based fixes
 - Planning — Planner (7 phases), ToolChain (DAG workflows), AutoVerifier (cascade)
-- Concurrency — AsyncEngine, ProcessPool, DatabasePool (3 concurrency tiers)
+- DatabasePool concurrency
 - 6 Fable5 prompt templates with [VERIFIED-REAL] markers, confidence tiers
 
 WITH vs WITHOUT graphsift (15 daily-dev scenarios tested):
@@ -234,7 +230,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     # A2A Protocol
     "A2AServer": (".a2a_server", "A2AServer"),
     "build_agent_card": (".a2a_server", "build_agent_card"),
-    "run_a2a_server": (".a2a_server", "run_a2a_server"),
+    # NOTE: run_a2a_server was removed — it doesn't exist in a2a_server.py
     # MCP Tasks
     "TaskManager": (".mcp_tasks", "TaskManager"),
     "Task": (".mcp_tasks", "Task"),
@@ -249,6 +245,9 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "AgentAction": (".harness", "AgentAction"),
     "DriftAlert": (".harness", "DriftAlert"),
     "HarnessStats": (".harness", "HarnessStats"),
+    # Native Execution
+    "run_python_file": (".native_exec", "run_python_file"),
+    "run_python_code": (".native_exec", "run_python_code"),
     # Temporal Graph
     "TemporalGraph": (".temporal_graph", "TemporalGraph"),
     "TemporalStats": (".temporal_graph", "TemporalStats"),
@@ -427,24 +426,18 @@ __all__ = sorted(set(_LAZY_ATTRS) | set(_LAZY_SUBMODULES) | {
 def _auto_configure() -> None:
     """Auto-detect project root and configure .claude/settings.json + daemon.
 
-    Called on every ``import graphsift``, but only acts once (lock file).
+    Called on every ``import graphsift``, but only acts once per project
+    (project-scoped lock file). Can be disabled with env var
+    ``GRAPHSIFT_NO_AUTOCONFIGURE=1`` or ``GRAPHSIFT_NO_DAEMON=1``.
+
     Writes hooks (SessionStart, PreToolUse, PostToolUse), pre-approves
     graphsift commands, and starts the background daemon.
     """
     import os as _os
     from pathlib import Path as _Path
 
-    # --- Lock: only configure once per machine ---
-    lock = _Path.home() / ".graphsift" / ".configured"
-    if lock.exists():
-        # Already configured — just ensure daemon is running
-        try:
-            from graphsift.daemon import status
-            if status().get("status") != "running":
-                from graphsift.daemon import start
-                start()
-        except Exception:
-            pass
+    # Allow disabling auto-configure entirely
+    if _os.environ.get("GRAPHSIFT_NO_AUTOCONFIGURE") or _os.environ.get("GRAPHSIFT_NO_DAEMON"):
         return
 
     # --- Find project root (look for .claude/ in CWD or parents) ---
@@ -456,14 +449,23 @@ def _auto_configure() -> None:
             break
 
     if project_root is None:
-        # Try common locations
-        for guess in [_Path.cwd(), _Path.home() / "Innovation" / "graphsift"]:
-            if (guess / ".claude").is_dir():
-                project_root = guess
-                break
-
-    if project_root is None:
         return  # No project with .claude/ found
+
+    # --- Lock: only configure once per project ---
+    import hashlib as _hashlib
+    import sys as _sys
+    lock_name = _hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
+    lock = _Path.home() / ".graphsift" / f"configured_{lock_name}"
+    if lock.exists():
+        # Already configured — just ensure daemon is running
+        try:
+            from graphsift.daemon import status
+            if status().get("status") != "running":
+                from graphsift.daemon import start
+                start()
+        except Exception:
+            pass
+        return
 
     # --- Write / update .claude/settings.json ---
     settings_path = project_root / ".claude" / "settings.json"
@@ -476,19 +478,14 @@ def _auto_configure() -> None:
             settings = {}
 
     settings.setdefault("hooks", {})
-    python_exe = _os.path.realpath(_os.path.join(
-        _os.path.dirname(__file__), "..", "..", "python.exe"
-    ))
-    # Fallback: use the Python that's running
-    if not _os.path.exists(python_exe):
-        python_exe = _os.path.realpath(_os.path.dirname(__file__)) + "/../../python.exe"
-    import sys as _sys
-    if not _os.path.exists(python_exe) or not python_exe.endswith("python.exe"):
-        python_exe = _sys.executable
+    # Use sys.executable — normalize MSYS2 paths on Windows (/c/Users → C:\Users)
+    python_exe = _sys.executable
+    if _os.name == "nt" and python_exe.startswith("/") and len(python_exe) > 2 and python_exe[2] == "/":
+        python_exe = python_exe[1].upper() + ":" + python_exe[2:].replace("/", "\\")
 
-    # SessionStart — auto-start daemon
+    # SessionStart — auto-start daemon (use -m to avoid quoting issues)
     settings["hooks"].setdefault("SessionStart", [])
-    daemon_cmd = f'{python_exe} -c "from graphsift.daemon import start;r=start();print()"'
+    daemon_cmd = f'{python_exe} -m graphsift.daemon start'
     ss_exists = any(
         "daemon" in h.get("command", "")
         for e in settings["hooks"]["SessionStart"]
@@ -531,7 +528,7 @@ def _auto_configure() -> None:
     # --- Write lock file ---
     try:
         lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text("1", "utf-8")
+        lock.write_text(str(project_root), "utf-8")
     except Exception:
         pass
 

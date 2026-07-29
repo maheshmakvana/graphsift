@@ -557,7 +557,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
                     bar = "█" * filled + "░" * (bar_len - filled)
                     print(f"        [{bar}] {pct:>3}% | Processing file {i:>6}/{total_files} | ETA: {remaining:>5.0f}s")
 
-            if total_files == 0 or total_files % progress_interval != 0:
+            if total_files == 0 or (progress_interval > 0 and total_files % progress_interval != 0):
                 elapsed = time.monotonic() - t_parse_start
                 rate = total_files / elapsed if elapsed > 0 else 0
                 bar_len = 20
@@ -1593,6 +1593,42 @@ def cmd_bash_wrapper(args: argparse.Namespace) -> int:
     """
     from .hooks import get_bash_wrapper_script
     print(get_bash_wrapper_script(python_path=_python_executable()))
+    return 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Manage the persistent Python daemon (start/stop/status/cache)."""
+    action = getattr(args, 'daemon_action', None) or 'status'
+    from graphsift.daemon import start, stop, status, cache_stats, cache_clear
+
+    actions = {
+        'start': lambda: start(),
+        'stop': lambda: stop(),
+        'status': lambda: status(),
+        'cache-stats': lambda: cache_stats(),
+        'cache-clear': lambda: cache_clear(),
+    }
+
+    result_fn = actions.get(action)
+    if result_fn is None:
+        print(f"[graphsift] Unknown daemon action: {action}")
+        print("  Available: start, stop, status, cache-stats, cache-clear")
+        return 1
+
+    result = result_fn()
+    if action == 'status':
+        st = result.get('status', 'unknown')
+        pid = result.get('pid', '')
+        if st == 'running':
+            print(f"[graphsift] Daemon is RUNNING (pid {pid})")
+        else:
+            print("[graphsift] Daemon is STOPPED")
+    elif action == 'cache-stats':
+        print(f"[graphsift] In-process cache: {result.get('in_process', '?')} entries")
+        print(f"[graphsift] Daemon cache:     {result.get('daemon', '?')}")
+    else:
+        st = result.get('status', result.get('ok', False))
+        print(f"[graphsift] Daemon {action}: {st}")
     return 0
 
 
@@ -2971,6 +3007,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # bash-wrapper
     sub.add_parser("bash-wrapper", help="Print bash wrapper script for transparent command compression")
+
+    # daemon — manage persistent Python daemon
+    p_daemon = sub.add_parser("daemon", help="Manage the persistent Python daemon (start/stop/status)")
+    daemon_sub = p_daemon.add_subparsers(dest="daemon_action")
+    daemon_sub.add_parser("start", help="Start the background Python daemon")
+    daemon_sub.add_parser("stop", help="Stop the background Python daemon")
+    daemon_sub.add_parser("status", help="Check if daemon is running")
+    daemon_sub.add_parser("cache-stats", help="Show daemon cache statistics")
+    daemon_sub.add_parser("cache-clear", help="Clear daemon caches")
+    p_daemon.set_defaults(func=cmd_daemon)
 
     # detect-cycles
     p_cycles = sub.add_parser(

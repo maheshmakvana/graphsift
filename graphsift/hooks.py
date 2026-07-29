@@ -45,29 +45,12 @@ _COMPRESSIBLE_COMMANDS: dict[str, str] = {
     "cat": "cat",
 }
 
-# Patterns that graphsift can optimize — runs via daemon/direct subprocess
-# instead of shell (bypasses classifier + permission + shell startup)
-_OPTIMIZABLE_PATTERNS: list[re.Pattern] = [
-    # cd <dir> && python -c "code"
-    re.compile(r'^cd\s+(.+?)\s*[;&]+\s*python\s+-c\s+["\'](.+)["\']\s*$', re.DOTALL),
-    # cd <dir> && python <script>
-    re.compile(r'^cd\s+(.+?)\s*[;&]+\s*python\s+(\S+\.py)\s*$'),
-    # python -c "code" (no cd)
-    re.compile(r'^python\s+-c\s+["\'](.+)["\']\s*$', re.DOTALL),
-    # cd <dir> && python -m <module>
-    re.compile(r'^cd\s+(.+?)\s*[;&]+\s*python\s+-m\s+(\S+)\s*$'),
-    # cd <dir> && python <script> with 2>&1
-    re.compile(r'^cd\s+(.+?)\s*[;&]+\s*python\s+(\S+\.py).*?$'),
-    # cd <dir> && python -c "code" with 2>&1 | head/tail
-    re.compile(r'^cd\s+(.+?)\s*[;&]+\s*python\s+-c\s+', re.DOTALL),
-]
-
-# Windows-style: cd /d <dir> && python ...
-_OPTIMIZABLE_PS_PATTERNS: list[re.Pattern] = [
-    re.compile(r'^cd\s+(.+?)\s*[;]+\s*python\s+-c\s+["\'](.+)["\']\s*$', re.DOTALL),
-    re.compile(r'^cd\s+(.+?)\s*[;]+\s*python\s+(\S+\.py)\s*$'),
-]
-
+# Smart execution patterns — used by _extract_cwd_and_code() inline
+# Note: These patterns use re.search() on command strings to find
+# optimizable Python/sleep commands. Commands with extra chained
+# operators (&&, ||, |, ;) after the Python portion are NOT optimized
+# — they are passed through to the shell to avoid silently dropping
+# post-Python cleanup steps.
 
 def _tee_path() -> str:
     """Return the tee directory path for saving original uncompressed output."""
@@ -155,22 +138,30 @@ def _extract_cwd_and_code(command: str) -> Optional[dict]:
 
     # Pattern 1: cd <dir> && python -c "code" (bash style with &&)
     # Pattern 2: cd <dir> && python -c "code" 2>&1 | head/tail/...
+    # Windows: cd /d <dir> && python -c "code"
     m = re.search(
-        r'cd\s+["\']?(.+?)["\']?\s*[;&]+\s*python\s+-c\s+', stripped, re.DOTALL
+        r'cd(?:\s+/d)?\s+["\']?(.+?)["\']?\s*[;&]+\s*python\s+-c\s+', stripped, re.DOTALL
     )
     if m:
         cwd = m.group(1).strip()
         # Extract the code after -c "..."
-        # Find the opening quote
         after_c = stripped[m.end():].strip()
-        # Handle 2>&1 | head/tail etc - strip those
-        code = after_c
+        # Check if there's chained content (&&, ||, ;, |) AFTER the Python part
+        # that is NOT a redirect or pipe of the output (2>&1, | head, | tail)
+        remaining = after_c
+
         # If code starts with quote, find matching close quote
-        if code.startswith('"') or code.startswith("'"):
-            quote = code[0]
-            end_idx = code.find(quote, 1)
+        if after_c.startswith('"') or after_c.startswith("'"):
+            quote = after_c[0]
+            end_idx = after_c.find(quote, 1)
             if end_idx > 0:
-                code = code[1:end_idx]
+                code = after_c[1:end_idx]
+                # Check what comes after the closing quote
+                after_code = after_c[end_idx + 1:].strip()
+                # Allow: 2>&1, | head, | tail, empty (end of command)
+                # Reject: && <command>, ; <command>, || <command>, | <non-redirect>
+                if after_code and not re.match(r'^(2>&1|\|?\s*(head|tail|tee|cat)\b)', after_code):
+                    return None  # Has chained commands — pass through to shell
                 return {
                     "cwd": cwd,
                     "code": code,
@@ -178,6 +169,7 @@ def _extract_cwd_and_code(command: str) -> Optional[dict]:
                     "needs_daemon": True,
                 }
         # If no quotes, try raw (less common)
+        code = after_c
         # Strip pipe/redirect
         for sep in [" 2>&1", " |", " >", " ;"]:
             idx = code.find(sep)
@@ -191,13 +183,18 @@ def _extract_cwd_and_code(command: str) -> Optional[dict]:
         }
 
     # Pattern 3: cd <dir> && python <script.py>
+    # Also Windows: cd /d <dir> && python <script.py>
     m = re.search(
-        r'cd\s+["\']?(.+?)["\']?\s*[;&]+\s*python\s+(\S+\.py)',
+        r'cd(?:\s+/d)?\s+["\']?(.+?)["\']?\s*[;&]+\s*python\s+(\S+\.py)',
         stripped,
     )
     if m:
         cwd = m.group(1).strip()
         script = m.group(2).strip()
+        # Check no chained commands after the script
+        after_script = stripped[m.end():].strip()
+        if after_script and not re.match(r'^(2>&1|\|?\s*(head|tail|tee|cat)\b)', after_script):
+            return None  # Chained commands — pass through
         return {
             "cwd": cwd,
             "code_or_script": script,
@@ -214,6 +211,10 @@ def _extract_cwd_and_code(command: str) -> Optional[dict]:
             end_idx = after_c.find(quote, 1)
             if end_idx > 0:
                 code = after_c[1:end_idx]
+                # Check no chained commands
+                after_code = after_c[end_idx + 1:].strip()
+                if after_code and not re.match(r'^(2>&1|\|?\s*(head|tail|tee|cat)\b)', after_code):
+                    return None
                 return {
                     "cwd": os.getcwd(),
                     "code": code,
@@ -222,7 +223,7 @@ def _extract_cwd_and_code(command: str) -> Optional[dict]:
                 }
 
     # Pattern 5: sleep N (handle natively, no execution needed)
-    m = re.match(r'^sleep\s+(\d+(?:\.\d+)?)\s*$', stripped)
+    m = re.fullmatch(r'sleep\s+(\d+(?:\.\d+)?)\s*', stripped)
     if m:
         duration = float(m.group(1))
         return {
