@@ -1,6 +1,6 @@
 # GraphSift Architecture Guide
 
-> **graphsift v4.5.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).  
+> **graphsift v4.8.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).  
 > Token optimization engine for Claude, GPT-5 & Gemini. 80-150× reduction, F1 0.85.
 
 ---

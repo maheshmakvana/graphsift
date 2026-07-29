@@ -1,6 +1,6 @@
 # graphsift API Reference
 
-> **Version:** 3.0.0 · Created by [Mahesh Makwana](https://github.com/maheshmakvana) · [Source](https://github.com/maheshmakvana/graphsift/tree/master/graphsift)
+> **Version:** 4.8.0 · Created by [Mahesh Makwana](https://github.com/maheshmakvana) · [Source](https://github.com/maheshmakvana/graphsift/tree/master/graphsift)
 >
 > *Save Claude tokens. Reduce GPT costs. Optimize Gemini context windows. 80-150x token reduction.*
 
@@ -184,10 +184,27 @@
 | Class / Function | Description | Source |
 |---|---|---|
 | `CommandExecutor` | Safe command execution with guards | [`executor.py`](../graphsift/executor.py) |
+| `ProcessRunner` | Cross-platform runner with tiered fallback | [`executor.py`](../graphsift/executor.py) |
 | `SilentRunner` | Silent command runner (PowerShell fallback) | [`executor.py`](../graphsift/executor.py) |
 | `AutoPipeline` | Auto-configuring execution pipeline | [`executor.py`](../graphsift/executor.py) |
 | `PipelineResult` | Result from a pipeline run | [`executor.py`](../graphsift/executor.py) |
 | `CommandResult` | Result from a single command | [`executor.py`](../graphsift/executor.py) |
+
+## Smart Execution (v4.8.0+)
+
+| Class / Function | Description | Source |
+|---|---|---|
+| `Daemon` | Persistent Python daemon — keeps modules loaded + caches results | [`daemon.py`](../graphsift/daemon.py) **NEW** |
+| `hooks.pre_bash_hook` | PreToolUse hook — intercepts Bash/PowerShell, routes through daemon | [`hooks.py`](../graphsift/hooks.py) |
+| `daemon.start()` / `stop()` | Start/stop the background Python daemon | [`daemon.py`](../graphsift/daemon.py) |
+| `daemon.exec_code()` | Run Python code in cached daemon process (modules stay imported) | [`daemon.py`](../graphsift/daemon.py) |
+
+The Smart Execution Engine auto-starts on `import graphsift` and works transparently:
+- `pip install graphsift` → package installs
+- First `import graphsift` → auto-configures `.claude/settings.json` + starts daemon
+- Bash/PowerShell commands containing `cd <dir> && python ...` → intercepted → daemon runs them → ~0ms
+- Non-Python commands (git, npm) → pass through unchanged
+- `sleep N` → handled natively without Python execution
 
 ---
 

@@ -150,7 +150,7 @@ def cmd_install(args: argparse.Namespace) -> int:
 
         settings.setdefault("hooks", {})
 
-        # SessionStart - prime Claude with graph awareness
+        # SessionStart — auto-start daemon + prime graph awareness
         settings["hooks"].setdefault("SessionStart", [])
         session_hook = {
             "matcher": "",
@@ -159,9 +159,14 @@ def cmd_install(args: argparse.Namespace) -> int:
                     "type": "command",
                     "command": (
                         f"{_python_executable()} -c \""
-                        "import graphsift, os; "
-                        "print('[graphsift] Knowledge graph available. "
-                        "Use build_graph tool to index repo, then get_context for token-efficient code context.')"
+                        "import graphsift; "
+                        "try: "
+                        "  from graphsift.daemon import start; "
+                        "  r = start(); "
+                        "  print(f'[graphsift] Daemon ready (pid {r.get(\\\"pid\\\",\\\"?\\\")})'); "
+                        "except Exception as e: "
+                        "  print(f'[graphsift] Ready — daemon unavailable: {e}'); "
+                        "print('[graphsift] Use build_graph tool to index repo, then get_context for token-efficient context.')"
                         "\""
                     ),
                 }
@@ -223,6 +228,39 @@ def cmd_install(args: argparse.Namespace) -> int:
         }
         if not any("graphsift.compress" in h.get("command", "") for entry in settings["hooks"]["PostToolUse"] for h in entry.get("hooks", [])):
             settings["hooks"]["PostToolUse"].append(bash_post_hook)
+
+        # PreToolUse — auto-route Bash/PowerShell through daemon (smart execution)
+        settings["hooks"].setdefault("PreToolUse", [])
+        pre_hook = {
+            "matcher": "Bash|PowerShell",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        f"{_python_executable()} -m graphsift.hooks pre-bash-hook"
+                    ),
+                }
+            ],
+        }
+        existing_pre = [
+            h.get("command", "")
+            for entry in settings["hooks"]["PreToolUse"]
+            for h in entry.get("hooks", [])
+        ]
+        if not any("pre-bash-hook" in c for c in existing_pre):
+            settings["hooks"]["PreToolUse"].append(pre_hook)
+            print(f"[graphsift] Installed PreToolUse hook (auto-route Python commands through daemon)")
+
+        # Pre-approve all graphsift commands — zero permission prompts
+        settings.setdefault("allow", [])
+        graphsift_patterns = [
+            "graphsift *",
+            "python -m graphsift.*",
+        ]
+        for pat in graphsift_patterns:
+            if pat not in settings["allow"]:
+                settings["allow"].append(pat)
+        print(f"[graphsift] Pre-approved graphsift commands (no permission prompts)")
 
         SafeFileIO.write_json(settings_path, settings)
         print(f"[graphsift] Wrote hooks -> {settings_path}")
