@@ -356,6 +356,16 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "StruggleDetector": (".loop_engineering", "StruggleDetector"),
     # MCP server
     "run_server": (".mcp_server", "run_server"),
+    # Trading-strategy hallucination guard (v4.10+)
+    "StrategyGuard": (".guard", "StrategyGuard"),
+    "StrategyClaim": (".guard", "StrategyClaim"),
+    "GuardReport": (".guard", "GuardReport"),
+    "MarketDataProvider": (".guard", "MarketDataProvider"),
+    "JsonBacktestProvider": (".guard", "JsonBacktestProvider"),
+    "ClaimType": (".guard", "ClaimType"),
+    "ClaimStatus": (".guard", "ClaimStatus"),
+    "extract_claims": (".guard", "extract_claims"),
+    "guard_strategy": (".guard", "guard_strategy"),
 }
 
 # Also allow access to submodules as direct attributes (e.g. `graphsift.models`)
@@ -367,6 +377,7 @@ _LAZY_SUBMODULES: dict[str, str] = {
     "memory": ".memory",
     "analytics": ".analytics",
     "adapters": ".adapters",
+    "guard": ".guard",
 }
 
 
@@ -451,6 +462,33 @@ def _auto_configure() -> None:
     if project_root is None:
         return  # No project with .claude/ found
 
+    # --- Write / update .mcp.json (upgrade-safe MCP registration) ---
+    # Register via ``python -m graphsift.mcp_server``, NOT the console-script
+    # exe. On Windows a running MCP server holds the pip-managed console script
+    # open, so ``pip install -U graphsift`` fails with WinError 32 (file in
+    # use). A ``python -m`` process only locks python.exe (never replaced by
+    # pip), so upgrades succeed even while the server is running. Runs on every
+    # import (idempotent: only writes when the desired entry differs) so it
+    # stays correct if the interpreter changes.
+    try:
+        import sys as _sys
+        import json as _json
+        python_exe = _sys.executable
+        if _os.name == "nt" and python_exe.startswith("/") and len(python_exe) > 2 and python_exe[2] == "/":
+            python_exe = python_exe[1].upper() + ":" + python_exe[2:].replace("/", "\\")
+        mcp_cmd, mcp_args = python_exe, ["-m", "graphsift.mcp_server"]
+        mcp_path = project_root / ".mcp.json"
+        mcp_cfg: dict = {}
+        if mcp_path.exists():
+            mcp_cfg = _json.loads(mcp_path.read_text("utf-8"))
+        mcp_cfg.setdefault("mcpServers", {})
+        desired = {"command": mcp_cmd, "args": mcp_args, "env": {}}
+        if mcp_cfg["mcpServers"].get("graphsift") != desired:
+            mcp_cfg["mcpServers"]["graphsift"] = desired
+            mcp_path.write_text(_json.dumps(mcp_cfg, indent=2), "utf-8")
+    except Exception:
+        pass  # Never fail on auto-configure
+
     # --- Lock: only configure once per project ---
     import hashlib as _hashlib
     import sys as _sys
@@ -485,7 +523,7 @@ def _auto_configure() -> None:
 
     # SessionStart — auto-start daemon (use -m to avoid quoting issues)
     settings["hooks"].setdefault("SessionStart", [])
-    daemon_cmd = f'{python_exe} -m graphsift.daemon start'
+    daemon_cmd = f'"{python_exe}" -m graphsift.daemon start'
     ss_exists = any(
         "daemon" in h.get("command", "")
         for e in settings["hooks"]["SessionStart"]
@@ -499,7 +537,7 @@ def _auto_configure() -> None:
 
     # PreToolUse — intercept Bash/PowerShell
     settings["hooks"].setdefault("PreToolUse", [])
-    pre_cmd = f'{python_exe} -m graphsift.hooks pre-bash-hook'
+    pre_cmd = f'"{python_exe}" -m graphsift.hooks pre-bash-hook'
     pre_exists = any(
         "pre-bash-hook" in h.get("command", "")
         for e in settings["hooks"]["PreToolUse"]

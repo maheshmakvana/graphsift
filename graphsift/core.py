@@ -1811,7 +1811,8 @@ class ContextSelector:
         v1 = int(fp1, 16)
         v2 = int(fp2, 16)
         xor = v1 ^ v2
-        return xor.bit_count()
+        # int.bit_count() is 3.10+; bin().count("1") works on 3.9.
+        return bin(xor).count("1")
 
     def _is_duplicate(self, source: str, seen_fingerprints: set[str]) -> bool:
         """Check if *source* is a near-duplicate of already-seen content.

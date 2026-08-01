@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — LLM Token Optimization Engine for Claude, GPT-5 & Gemini" width="600" style="max-width:100%;height:auto">
 </p>
 
-<h1 align="center">graphsift v4.9.0</h1>
+<h1 align="center">graphsift v4.11.0</h1>
 <p align="center">
   <strong>Token Saver for Claude, GPT-5, Gemini & Every LLM —<br>
   80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 826+ Tests, Zero External Dependencies<br>
@@ -32,6 +32,65 @@
   <img src="https://img.shields.io/badge/CLIs-7%20supported-success" alt="Supported CLIs">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="GitHub Stars"></a>
 </p>
+
+## 🛡️ NEW in v4.11 — Trading-Strategy Hallucination Guard
+
+Stop AI from quoting a spectacular **backtested** profit as if it were a real, live result — the "Rs.44,00,000 profit" that collapses to "Rs.4,00,000" when you ask for real-time proven examples.
+
+**Why it matters.** When you ask an LLM to generate option strategies, it confidently invents returns (44 lakh), win rates (99%), and guarantees. Asked for a *real-time proven* example, the number collapses to a fraction of the claim. The guard catches that collapse *before* the strategy reaches a user or an order router.
+
+**How it works.** `graphsift.guard` extracts every factual claim from AI strategy text and verifies it against **real-time proven** reference data (your live/paper P&L — not backtests):
+
+| Claim status | Meaning |
+|---|---|
+| `verified` | matches real-time proven reference (e.g. Rs.4,00,000 live P&L) |
+| `synthetic` | true as a **backtest** output, but NOT live-proven (e.g. Rs.44,15,988 2X WINNERS simulation) |
+| `contradicted` | exceeds real-time proven data with no source — likely fabricated |
+| `unverifiable` | no way to check (e.g. a live signal) |
+
+Every claim contributes to a **0-100 hallucination score** and a HIGH / MEDIUM / LOW risk level.
+
+```bash
+# Audit AI strategy text for fabricated claims
+graphsift guard audit --text "Iron Condor GUARANTEED Rs.44,00,000 profit, 99% win rate"
+
+# Enforce: mark [CONTRADICTED]/[UNVERIFIED] or strip risky claims
+graphsift guard enforce --text "...strategy..." --mode strip
+
+# Point at YOUR real reference data (live P&L / backtest JSON)
+graphsift guard audit --text "...strategy..." --reference ./angelbot_reference.json
+
+# Build an anti-hallucination grounding prompt for the next generation call
+graphsift guard prompt --text "Generate a BANKNIFTY Iron Condor strategy"
+
+# Comparison benchmark: unguarded vs guarded AI against real data
+python scripts/guard_benchmark.py          # built-in 44L->4L scenario
+python scripts/guard_benchmark.py --live   # calls a real LLM (needs API key)
+```
+
+**From Python / MCP:**
+
+```python
+from graphsift import StrategyGuard, JsonBacktestProvider
+guard = StrategyGuard(provider=JsonBacktestProvider())  # or your real reference
+report = guard.audit("GUARANTEED Rs.44,00,000 profit, 99% win rate")
+print(report.hallucination_score, report.risk_level)   # 100.0, HIGH...
+cleaned, _ = guard.enforce(text, mode="mark")          # rewrite
+```
+
+MCP tools: `audit_strategy_claims`, `guard_strategy_text`, `build_strategy_prompt`.
+
+**Automatic flagging (opt-in hook):** add to `.claude/settings.json` and Claude Code will warn whenever a tool's output looks like a hallucinated trading strategy:
+
+```json
+{"hooks": {"PostToolUse": [
+  {"matcher": "*", "hooks": [
+    {"type": "command", "command": "python -m graphsift.hooks guard-hook"}
+  ]}
+]}}
+```
+
+Real reference data ships in `graphsift/guard_data/angelbot_reference.json` (live-vs-backtest split). Point `--reference` at your own live P&L file to calibrate the guard to your application.
 
 ## v4.5.0 — Performance Acceleration: 12 Optimizations, Zero External Dependencies
 
@@ -441,6 +500,29 @@ graphsift install --cursor                           # Install for any CLI
 ### New MCP Tools
 
 - **prune_refs** — Scan for stale references to deleted files. `fix=true` to auto-remove imports with `.bak` backup.
+
+### 🛠️ MCP Server Setup — Just `pip install`
+
+**`pip install graphsift` — that's it.** No manual steps, no `graphsift install`, no editing config.
+
+- pip creates the portable **`graphsift-mcp`** console script (works with any Python / venv / conda — **no absolute interpreter path**).
+- On first use in a project, graphsift **auto-registers** the MCP server into `.mcp.json` plus its hooks — zero manual config.
+
+**What it writes for you:**
+```json
+{ "mcpServers": { "graphsift": { "command": "graphsift-mcp", "args": [], "env": {} } } }
+```
+
+**Verify:** `graphsift-mcp` should respond to a JSON-RPC `initialize` handshake:
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | graphsift-mcp
+```
+
+**Power users:** run `graphsift install` to explicitly re-register, or copy the `.mcp.json` block above into Claude Code / Cursor / Windsurf / Continue.dev manually.
+
+**🔧 Troubleshooting:**
+- If MCP shows **failed**, check the server version reported in `initialize` — should be **≥ 4.10.0**. On Windows, older versions crashed writing tool descriptions containing **"→"** due to a non-UTF-8 stdout codec — fixed in **4.9.0**.
+- **Upgrading on Windows:** auto-registration uses `python -m graphsift.mcp_server`, which is safe to upgrade while running. If you registered the server via the `graphsift-mcp` console script manually, **close Claude Code before `pip install -U graphsift`** — a running MCP server locks the console-script `.exe`, so pip can't replace it (WinError 32).
 
 ### Production Safeguards
 

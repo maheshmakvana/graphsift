@@ -19,3 +19,5 @@ docs/gen_images.py
 *.claude/
 .pypirc
 .mcp.json
+# Generated benchmark report (output artifact — not for release)
+scripts/guard_benchmark_report.md

@@ -145,6 +145,7 @@ dev = [
 
 [project.scripts]
 graphsift = "graphsift.cli:main"
+graphsift-mcp = "graphsift.mcp_server:run_server"
 
 [project.urls]
 Homepage = "https://github.com/maheshmakvana/graphsift"
@@ -157,6 +158,11 @@ Download = "https://pypi.org/project/graphsift/"
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "venv*", "dist*", "build*"]
+
+# Ship reference data (strategy-guard baseline JSON) with the installed package
+# so `graphsift guard` works out-of-the-box for public users.
+[tool.setuptools.package-data]
+"graphsift.guard_data" = ["*.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "graphsift._version.__version__" }

@@ -1,0 +1,15 @@
+{
+  "name": "Angelbot paper-trading P&L (baseline)",
+  "mode": "paper",
+  "net_pnl": 400000,
+  "win_rate_pct": 59.3,
+  "roi_pct": 200.0,
+  "capital": 200000,
+  "total_trades": 59,
+  "avg_trade": 2166,
+  "backtest_pnl": 2626665,
+  "backtest_2x_pnl": 4415988,
+  "backtest_win_rate_pct": 64.0,
+  "backtest_roi_pct": 1313.3,
+  "note": "PROVENANCE: net_pnl = user-reported cumulative live/paper P&L as of 2026-07-31 (re-verify against live tracker). win_rate/total_trades/avg_trade = 6-day realised sample (Jul 22-29 backtest run), treated as live proxy. roi_pct = conservative estimate. backtest_* = EXACT matches to Angelbot source files (ALL-23 60-day and 2X WINNERS backtests, 2026-07-29). Backtests are SIMULATED — never present them as live results."
+}

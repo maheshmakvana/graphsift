@@ -113,6 +113,7 @@ def _run_via_direct(cmd: list[str], cwd: str = "") -> dict:
         proc = subprocess.run(
             cmd,
             capture_output=True, text=True, cwd=cwd or None,
+            encoding="utf-8", errors="replace",
             timeout=60,
         )
         return {
@@ -598,6 +599,95 @@ def get_post_tool_use_config(project_root: str, python_path: str) -> dict:
     }
 
 
+def _extract_text(resp: object) -> str:
+    """Pull the text payload out of a tool response, handling MCP shapes.
+
+    Supports: plain string, dict with ``content``/``text``/``output``, and
+    MCP-style content as a list of blocks (``[{"type": "text", "text": ...}]``).
+    Never raises.
+    """
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        content = resp.get("content") or resp.get("text") or resp.get("output") or ""
+        return _extract_text(content)
+    if isinstance(resp, list):
+        parts = []
+        for item in resp:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(p for p in parts if p)
+    return str(resp) if resp else ""
+
+
+def guard_hook() -> str:
+    """PostToolUse hook: flag hallucinated trading-strategy claims in output.
+
+    Reads the Claude Code hook event (JSON) from stdin, extracts the tool's
+    text response, and runs the trading-strategy guard in report mode. If the
+    hallucination score is HIGH, emits a visible warning. Non-destructive —
+    it never rewrites the response, only warns.
+
+    Wire into ``.claude/settings.json``::
+
+        {
+          "hooks": {
+            "PostToolUse": [
+              {
+                "matcher": "*",
+                "hooks": [
+                  {"type": "command",
+                   "command": "python -m graphsift.hooks guard-hook"}
+                ]
+              }
+            ]
+          }
+        }
+    """
+    try:
+        import json as _json
+
+        raw = sys.stdin.read()
+        event = _json.loads(raw) if raw.strip() else {}
+        resp = event.get("tool_response") or event.get("response") or {}
+        text = _extract_text(resp)
+
+        from graphsift.guard import JsonBacktestProvider, StrategyGuard
+
+        guard = StrategyGuard(provider=JsonBacktestProvider())
+        report = guard.audit(text)
+        if report.hallucination_score < 50:
+            return ""
+        risky = [c.raw for c in report.contradicted_claims + report.synthetic_claims][:8]
+        detail = "; ".join(risky) if risky else "unverifiable claims present"
+        return (
+            f"\n[guard-hook] WARNING: tool output looks like a trading strategy "
+            f"with hallucination_score={report.hallucination_score:.0f}/100 "
+            f"(HIGH). Risky claims: {detail}. Verify against real-time proven "
+            f"data before acting. Run `graphsift guard audit --text ...` for full report.\n"
+        )
+    except Exception as exc:  # never break the hook pipeline
+        return f"\n[guard-hook] skipped: {exc}\n"
+
+
+def get_guard_post_tool_use_config(python_path: str = "python") -> dict:
+    """Return a PostToolUse hook config dict that runs the strategy guard.
+
+    Append to the ``PostToolUse`` array in ``.claude/settings.json``.
+    """
+    return {
+        "matcher": "*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": f"{python_path} -m graphsift.hooks guard-hook",
+            }
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI entry: python -m graphsift.hooks <command>
 # ---------------------------------------------------------------------------
@@ -624,6 +714,13 @@ if __name__ == "__main__":
             path = sys.argv[3] if len(sys.argv) > 3 else "python"
             result = json.dumps(get_post_tool_use_config(project, path), indent=2)
             sys.stdout.write(result)
+        elif cmd == "guard-hook":
+            result = guard_hook()
+            sys.stdout.write(result)
+        elif cmd == "guard-hook-config":
+            path = sys.argv[2] if len(sys.argv) > 2 else "python"
+            result = json.dumps(get_guard_post_tool_use_config(path), indent=2)
+            sys.stdout.write(result)
         else:
             print("Usage: python -m graphsift.hooks <command>")
             print()
@@ -633,5 +730,7 @@ if __name__ == "__main__":
             print("  bash-wrapper [path]   Print bash wrapper script")
             print("  pre-tool-use-config [path]  Print PreToolUse hook config")
             print("  post-tool-use-config [proj path] Print PostToolUse hook config")
+            print("  guard-hook            PostToolUse: flag hallucinated trading-strategy claims")
+            print("  guard-hook-config [path]  Print guard PostToolUse hook config")
     else:
         print("Usage: python -m graphsift.hooks <command>")

@@ -212,6 +212,7 @@ class PluginRegistry:
                 input=json.dumps(request),
                 capture_output=True,
                 text=True,
+                encoding="utf-8", errors="replace",
                 timeout=effective_timeout / 1000,
             )
 

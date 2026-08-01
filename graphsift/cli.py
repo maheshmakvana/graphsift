@@ -111,6 +111,20 @@ def _python_executable() -> str:
     return sys.executable
 
 
+def _mcp_server_command() -> tuple[str, list[str]]:
+    """(command, args) used to launch the graphsift MCP server.
+
+    Uses ``python -m graphsift.mcp_server`` rather than the ``graphsift-mcp``
+    console script. On Windows a running MCP server holds the pip-managed
+    console script open, so ``pip install -U graphsift`` fails with
+    WinError 32 (file in use). A ``python -m`` process only locks python.exe
+    (never replaced by pip), so upgrades succeed even while the server runs.
+    The interpreter is resolved to the current env at write time; the
+    auto-configure refreshes it idempotently on later imports.
+    """
+    return sys.executable, ["-m", "graphsift.mcp_server"]
+
+
 # ---------------------------------------------------------------------------
 # install command
 # ---------------------------------------------------------------------------
@@ -130,9 +144,10 @@ def cmd_install(args: argparse.Namespace) -> int:
 
     # Top-level key is "mcpServers" per Claude Code spec
     mcp_config.setdefault("mcpServers", {})
+    mcp_cmd, mcp_args = _mcp_server_command()
     mcp_config["mcpServers"]["graphsift"] = {
-        "command": _python_executable(),
-        "args": ["-m", "graphsift.mcp_server"],
+        "command": mcp_cmd,
+        "args": mcp_args,
         "env": {},
     }
     SafeFileIO.write_json(mcp_path, mcp_config)
@@ -158,7 +173,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                 {
                     "type": "command",
                     "command": (
-                        f"{_python_executable()} -c \""
+                        f"\"{_python_executable()}\" -c \""
                         "import graphsift; "
                         "try: "
                         "  from graphsift.daemon import start; "
@@ -189,7 +204,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                 {
                     "type": "command",
                     "command": (
-                        f"{_python_executable()} -m graphsift.cli update "
+                        f"\"{_python_executable()}\" -m graphsift.cli update "
                         f"--project-root \"{project_root}\" 2>{os.devnull} || true"
                     ),
                 }
@@ -210,7 +225,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                 {
                     "type": "command",
                     "command": (
-                        f"{_python_executable()} -c \""
+                        f"\"{_python_executable()}\" -c \""
                         "import sys, os; "
                         "from graphsift.compress import compress; "
                         "from graphsift.analytics import record_call; "
@@ -237,7 +252,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                 {
                     "type": "command",
                     "command": (
-                        f"{_python_executable()} -m graphsift.hooks pre-bash-hook"
+                        f"\"{_python_executable()}\" -m graphsift.hooks pre-bash-hook"
                     ),
                 }
             ],
@@ -265,9 +280,10 @@ def cmd_install(args: argparse.Namespace) -> int:
         SafeFileIO.write_json(settings_path, settings)
         print(f"[graphsift] Wrote hooks -> {settings_path}")
 
-    # 3. Write skill files
+    # 3. Write skill files (project-scoped only — never user-global)
     if not args.no_skills:
         _write_skills(project_root)
+        _cleanup_legacy_global_skills()
 
     # 4. Install bash wrapper (auto-compress commands)
     if args.bash_wrapper:
@@ -306,6 +322,7 @@ def _print_cli_instructions(args: argparse.Namespace, project_root: Path) -> Non
         targets = ["claude-code", "claude-desktop", "cursor", "windsurf", "continue", "codex", "copilot"]
 
     mcp_path = _find_mcp_json(project_root)
+    mcp_cmd, mcp_args = _mcp_server_command()
 
     instructions = {
         "claude-code": (
@@ -318,8 +335,9 @@ def _print_cli_instructions(args: argparse.Namespace, project_root: Path) -> Non
             "                 1. Open Claude Desktop → Settings → Developer → Edit Config\n"
             "                 2. Add to claude_desktop_config.json:\n"
             '                   { "mcpServers": { "graphsift": {'
-            f' "command": "{_python_executable()}",'
-            ' "args": ["-m", "graphsift.mcp_server"] } } }\n'
+            f' "command": "{mcp_cmd}",'
+            f' "args": {json.dumps(mcp_args)}'
+            " } } }\n"
             "                 3. Restart Claude Desktop\n"
             "                 4. No auto-hooks — run manually:\n"
             "                    'Build the graphsift graph' then use prune_refs tool"
@@ -899,13 +917,14 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"[graphsift] Warning: could not update {mcp_path}: {exc}")
 
-    # Remove skills
+    # Remove skills (project + any stale user-global leftovers)
     skills_dir = project_root / ".claude" / "skills"
     for skill_dir in ["graphsift-build", "graphsift-review", "graphsift-impact", "graphsift-compress"]:
         import shutil
         target = skills_dir / skill_dir
         if target.exists():
             shutil.rmtree(target)
+    _cleanup_legacy_global_skills()
     print("[graphsift] Removed skill files.")
 
     # Remove manifest
@@ -922,6 +941,23 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Skill file writer
 # ---------------------------------------------------------------------------
+
+def _cleanup_legacy_global_skills() -> None:
+    """Remove stale user-global graphsift skills left by older versions.
+
+    Older releases installed skills into ``~/.claude/skills`` (and commands),
+    so the same slash commands appeared twice — once user-global, once
+    project-scoped. Current releases only install project-scoped skills; this
+    removes the legacy global leftovers for anyone upgrading.
+    """
+    import shutil
+    for base in (Path.home() / ".claude" / "skills", Path.home() / ".claude" / "commands"):
+        if base.is_dir():
+            for name in ["graphsift-build", "graphsift-compress", "graphsift-impact", "graphsift-review"]:
+                target = base / name
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+
 
 def _write_skills(project_root: Path) -> None:
     skills_root = project_root / ".claude" / "skills"
@@ -2164,6 +2200,69 @@ def cmd_evidence(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# guard command  (trading-strategy hallucination guard)
+# ---------------------------------------------------------------------------
+
+def cmd_guard(args: argparse.Namespace) -> int:
+    """Audit / enforce AI-generated trading strategy text for hallucinated claims.
+
+    Detects fabricated profit, win-rate, ROI, and guarantee claims by
+    comparing them against real-time proven reference data (a real backtest
+    or live P&L). This is the "44 lakh profit → 4 lakh real" collapse catcher.
+    """
+    from graphsift.guard import JsonBacktestProvider, StrategyGuard
+
+    guard = StrategyGuard(provider=JsonBacktestProvider(args.reference))
+
+    if args.action == "prompt":
+        # Build the anti-hallucination grounding prompt (no audit).
+        sys.stdout.write(guard.build_grounding_prompt(strategy_request=args.text))
+        sys.stdout.write("\n")
+        return 0
+
+    if not args.text:
+        print("error: --text is required for audit/enforce", file=sys.stderr)
+        return 2
+
+    if args.action == "audit":
+        report = guard.audit(args.text)
+        if args.json:
+            import json as _json
+            sys.stdout.write(_json.dumps(report.to_dict(), indent=2))
+            sys.stdout.write("\n")
+            return 1 if report.hallucination_score >= 50 else 0
+        print(f"Claims found : {report.total_claims}")
+        print(f"  verified   : {len(report.verified_claims)}")
+        print(f"  synthetic  : {len(report.synthetic_claims)} (backtest, not live)")
+        print(f"  contradicted: {len(report.contradicted_claims)}")
+        print(f"  unverifiable: {len(report.unverifiable_claims)}")
+        print(f"Hallucination score: {report.hallucination_score:.1f}/100")
+        print(f"Risk level  : {report.risk_level}")
+        if report.claims:
+            print()
+            print("Claims:")
+            for c in report.claims:
+                val = f"{c.value:,.0f}{c.unit}" if c.value is not None else "-"
+                print(f"  [{c.status:13s}] {c.type:10s} {val:>12}  {c.raw!r}")
+        return 1 if report.hallucination_score >= 50 else 0
+
+    # enforce (mark / strip / enforce)
+    cleaned, report = guard.enforce(args.text, mode=args.action)
+    if args.json:
+        import json as _json
+        data = report.to_dict()
+        data["rewritten_text"] = cleaned
+        sys.stdout.write(_json.dumps(data, indent=2))
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(cleaned)
+        if not cleaned.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stderr.write(report.summary() + "\n")
+    return 1 if report.hallucination_score >= 50 else 0
+
+
+# ---------------------------------------------------------------------------
 # claude-md command  (auto-generate CLAUDE.md with project topology)
 # ---------------------------------------------------------------------------
 
@@ -3118,6 +3217,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--text", required=True, help="Text to check for citations")
     p_ev.add_argument("--project-root", default=_cwd(), help="Project root (default: cwd)")
 
+    # guard — trading-strategy hallucination guard
+    p_guard = sub.add_parser(
+        "guard",
+        help="Audit AI-generated trading strategy text for hallucinated "
+             "claims (fake profit/win-rate/ROI vs real-time proven data). "
+             "Catches the '44 lakh profit → 4 lakh real' collapse.",
+    )
+    p_guard.add_argument(
+        "action", nargs="?",
+        choices=["audit", "mark", "strip", "enforce", "prompt"],
+        default="audit",
+        help="audit (report only, default) | mark [UNVERIFIED]/[CONTRADICTED] | "
+             "strip risky claims | enforce (strip + report) | prompt (build "
+             "grounding prompt)",
+    )
+    p_guard.add_argument("--text", default="", help="AI-generated strategy text to audit")
+    p_guard.add_argument(
+        "--reference", default=None,
+        help="Path to reference JSON (real backtest / live P&L stats). "
+             "Defaults to built-in demo reference.",
+    )
+    p_guard.add_argument("--json", action="store_true", help="Output JSON report")
+
     # test-impact — smart selective test runner
     p_ti = sub.add_parser(
         "test-impact",
@@ -3279,6 +3401,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Ensure stdout/stdin handle arbitrary UTF-8 on all platforms. Windows
+    # defaults to the locale codec (e.g. cp1252), which cannot encode
+    # non-ASCII and crashes compress/output commands on those characters.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     gc.freeze()  # freeze pre-import objects — GC never rescans them
     parser = _build_parser()
     args = parser.parse_args()
@@ -3410,6 +3539,7 @@ def main() -> None:
         "tool-budgets": cmd_tool_budgets,
         "read-cache": cmd_read_cache,
         "evidence": cmd_evidence,
+        "guard": cmd_guard,
         "claude-md": cmd_claude_md,
         "guide": cmd_guide,
     }

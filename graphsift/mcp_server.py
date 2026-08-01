@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from graphsift.read_cache import SafeFileIO
+from graphsift._version import __version__ as _GRAPHSIFT_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -1977,6 +1978,76 @@ def _tool_check_evidence(params: dict) -> dict:
     }
 
 
+def _tool_audit_strategy_claims(params: dict) -> dict:
+    """Audit AI-generated trading strategy text for hallucinated claims.
+
+    Extracts profit / win-rate / ROI / signal / guarantee claims and verifies
+    them against real-time proven reference data. Catches the classic
+    hallucination where a backtested figure (e.g. Rs.44,00,000) is presented
+    as a live/proven result when the real proven P&L is far lower
+    (e.g. Rs.4,00,000). Returns per-claim status (verified | synthetic |
+    contradicted | unverifiable) plus a 0-100 hallucination score.
+    """
+    from graphsift.guard import JsonBacktestProvider, StrategyGuard
+
+    text = params.get("text", "")
+    reference = params.get("reference", "")
+
+    if not text:
+        return {"error": "text parameter is required"}
+
+    guard = StrategyGuard(provider=JsonBacktestProvider(reference or None))
+    report = guard.audit(text)
+    data = report.to_dict()
+    data["summary"] = report.summary()
+    return data
+
+
+def _tool_guard_strategy_text(params: dict) -> dict:
+    """Enforce the strategy guard: rewrite text to neutralize risky claims.
+
+    mode="mark" appends [UNVERIFIED]/[CONTRADICTED] to risky claims;
+    mode="strip" removes them; mode="report" leaves text unchanged and only
+    returns the audit. Returns rewritten_text + full audit report.
+    """
+    from graphsift.guard import JsonBacktestProvider, StrategyGuard
+
+    text = params.get("text", "")
+    reference = params.get("reference", "")
+    mode = params.get("mode", "mark")
+
+    if not text:
+        return {"error": "text parameter is required"}
+
+    guard = StrategyGuard(provider=JsonBacktestProvider(reference or None))
+    rewritten, report = guard.enforce(text, mode=mode)
+    data = report.to_dict()
+    data["rewritten_text"] = rewritten
+    return data
+
+
+def _tool_build_strategy_prompt(params: dict) -> dict:
+    """Build an anti-hallucination grounding prompt for strategy generation.
+
+    Prepend the returned prompt to a strategy-generation call so the AI is
+    forced to: only quote real/sourced figures, label every number
+    [VERIFIED-REAL] or [UNKNOWN], never guarantee returns, give
+    best/expected/worst scenarios, and refuse to inflate beyond reference data.
+    """
+    from graphsift.guard import JsonBacktestProvider, StrategyGuard
+
+    strategy_request = params.get("strategy_request", "")
+    reference = params.get("reference", "")
+    include_reference = params.get("include_reference", True)
+
+    guard = StrategyGuard(provider=JsonBacktestProvider(reference or None))
+    prompt = guard.build_grounding_prompt(
+        strategy_request=strategy_request,
+        include_reference=bool(include_reference),
+    )
+    return {"prompt": prompt, "characters": len(prompt)}
+
+
 def _tool_generate_fix_prompt(params: dict) -> dict:
     """PLANNING TOOL — reads the buggy file, returns a step-by-step execution
     plan with verification. YOU MUST EXECUTE each step in order. Does NOT
@@ -3242,6 +3313,43 @@ _TOOLS = {
             "required": ["text"],
         },
     },
+    "audit_strategy_claims": {
+        "fn": _tool_audit_strategy_claims,
+        "description": "Audit AI-generated trading strategy text for hallucinated claims. Extracts profit/win-rate/ROI/signal/guarantee claims and verifies them against real-time proven reference data. Catches the '44 lakh backtest presented as live 4 lakh' collapse. Returns per-claim status (verified|synthetic|contradicted|unverifiable) and a 0-100 hallucination score.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "AI-generated trading strategy text to audit"},
+                "reference": {"type": "string", "description": "Path to reference JSON (real backtest/live P&L stats). Optional — defaults to built-in demo reference."},
+            },
+            "required": ["text"],
+        },
+    },
+    "guard_strategy_text": {
+        "fn": _tool_guard_strategy_text,
+        "description": "Enforce the strategy guard on text. mode=mark appends [UNVERIFIED]/[CONTRADICTED] to risky claims; mode=strip removes them; mode=report returns audit only. Returns rewritten_text + full audit report.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "AI-generated trading strategy text"},
+                "reference": {"type": "string", "description": "Path to reference JSON (optional)"},
+                "mode": {"type": "string", "enum": ["mark", "strip", "report", "enforce"], "description": "Enforcement mode (default: mark)"},
+            },
+            "required": ["text"],
+        },
+    },
+    "build_strategy_prompt": {
+        "fn": _tool_build_strategy_prompt,
+        "description": "Build an anti-hallucination grounding prompt for strategy generation. Forces the AI to only quote real/sourced figures, label every number [VERIFIED-REAL]/[UNKNOWN], never guarantee returns, and give best/expected/worst scenarios. Prepend to a strategy-generation call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "strategy_request": {"type": "string", "description": "The strategy-generation request to embed"},
+                "reference": {"type": "string", "description": "Path to reference JSON (optional)"},
+                "include_reference": {"type": "boolean", "description": "Embed the reference stats in the prompt (default true)"},
+            },
+        },
+    },
     "generate_fix_prompt": {
         "fn": _tool_generate_fix_prompt,
         "description": "PLANNING TOOL — reads the buggy file, returns a step-by-step execution plan with 4 steps: [read→edit→write test→verify]. YOU MUST EXECUTE each step in order using Write/Edit and verify before reporting done.",
@@ -3429,7 +3537,7 @@ def _handle_initialize(req_id: Any, params: dict) -> None:
     _ok(req_id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-        "serverInfo": {"name": "graphsift", "version": "1.4.0"},
+        "serverInfo": {"name": "graphsift", "version": _GRAPHSIFT_VERSION},
     })
 
 
@@ -4060,9 +4168,15 @@ def run_server() -> None:
         stream=sys.stderr,
     )
 
-    # Ensure stdout is line-buffered text
+    # Ensure stdout is line-buffered text that can carry arbitrary UTF-8.
+    # On Windows the locale codec (e.g. cp1252) cannot encode tool
+    # descriptions containing chars like '→' (->), which crashes
+    # tools/list and makes the whole server unresponsive to the MCP client.
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+        sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
+    # stdin may also deliver non-ASCII arguments from the client.
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()

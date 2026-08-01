@@ -467,6 +467,8 @@ class CommandExecutor:
                     _exec_tier_args(tier, safe_cmd),
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     cwd=self._cwd,
                     timeout=self._timeout,
                 )

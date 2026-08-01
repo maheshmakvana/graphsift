@@ -1,12 +1,39 @@
 # Changelog
 
-> **graphsift v4.9.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
+> **graphsift v4.10.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
 > Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 826+ tests, 50 modules, zero external dependencies.
 
 All notable changes to graphsift are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.11.0] — 2026-08-01
+
+### Added
+- **Trading-strategy hallucination guard** — new `graphsift/guard.py` module that audits AI-generated option/trading strategy text for fabricated claims (fake profit, win rate, ROI, "guaranteed returns"). Detects the classic failure where a spectacular *backtested* figure (e.g. Rs.44,00,000) is presented as a live/proven result when the real-time proven P&L is a fraction (e.g. Rs.4,00,000). Every claim is classified `verified | synthetic(backtest) | contradicted | unverifiable` against a pluggable `MarketDataProvider` (default: real Angelbot live-vs-backtest reference), with a 0-100 hallucination score and HIGH/MEDIUM/LOW risk level.
+  - `graphsift guard audit|mark|strip|enforce|prompt` CLI subcommand
+  - MCP tools `audit_strategy_claims`, `guard_strategy_text`, `build_strategy_prompt`
+  - Opt-in PostToolUse hook `python -m graphsift.hooks guard-hook` to flag hallucinated strategy output automatically
+  - `scripts/guard_benchmark.py` — comparison benchmark (unguarded vs guarded AI) against real reference data
+  - Lazy exports `graphsift.StrategyGuard`, `graphsift.GuardReport`, etc.
+
+## [4.10.0] — 2026-08-01
+
+### Fixed
+- **MCP server crash on Windows** — `tools/list` raised `UnicodeEncodeError` because `sys.stdout` used the locale codec (cp1252) and could not encode `→` in tool descriptions, causing Claude Code to report the MCP server as failed. `run_server()` now forces UTF-8 on stdout/stdin. `serverInfo` also reports the real library version.
+- **Python 3.9 compatibility** — added `from __future__ import annotations` where `X | Y` unions were used, and replaced `int.bit_count()` (3.10+) with a 3.9-safe popcount in `core.py`.
+- **Non-UTF-8 subprocess decoding** — `subprocess.run(..., text=True)` sites in `executor.py`, `hooks.py`, `native_exec.py`, and `commands/registry.py` now decode with `encoding="utf-8", errors="replace"`; `graphsift` CLI reconfigures stdout/stdin to UTF-8 so `compress`/output commands no longer crash on non-ASCII on Windows.
+- **Hook commands with spaces** — Python paths in generated `.claude/settings.json` hooks are now quoted, fixing paths like `C:\Users\First Last\` or `Program Files`.
+
+### Added
+- **`graphsift-mcp` console script** — portable MCP entry point (no absolute interpreter path in config); works with any Python/venv/conda.
+- **Auto MCP registration** — `import graphsift` now writes a portable `.mcp.json` (idempotent, refreshed each import), so `pip install graphsift` is the only setup step.
+- **`graphsift install` portability** — prefers the `graphsift-mcp` console script, falls back to `python -m` for source checkouts.
+- **Legacy global-skill cleanup** — install/uninstall now remove stale `~/.claude/skills/graphsift-*` left by older versions (previously caused duplicated slash commands).
+
+### Docs
+- README "MCP Server Setup — Just `pip install`" section, committed `.mcp.json.example`, portable `scripts/mcp_server.cmd`/`.sh` launchers.
 
 ## [4.9.0] — 2026-07-29
 

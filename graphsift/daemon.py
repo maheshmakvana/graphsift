@@ -15,6 +15,8 @@ Features:
     - **CWD support**: daemon chdir's into the requested working directory
 """
 
+from __future__ import annotations
+
 import atexit
 import hashlib
 import json

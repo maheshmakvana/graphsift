@@ -17,7 +17,8 @@ def run_python_file(path: str, cwd: str = "", max_lines: int = 200, timeout: int
     try:
         proc = subprocess.run(
             [sys.executable, str(script)],
-            capture_output=True, text=True, cwd=resolved_cwd, timeout=timeout
+            capture_output=True, text=True, cwd=resolved_cwd, timeout=timeout,
+            encoding="utf-8", errors="replace",
         )
         stdout_lines = proc.stdout.splitlines()[:max_lines]
         return {
@@ -35,7 +36,8 @@ def run_python_code(code: str, cwd: str = "", max_lines: int = 200):
     try:
         proc = subprocess.run(
             [sys.executable, '-c', code],
-            capture_output=True, text=True, cwd=resolved_cwd, timeout=30
+            capture_output=True, text=True, cwd=resolved_cwd, timeout=30,
+            encoding="utf-8", errors="replace",
         )
         stdout_lines = proc.stdout.splitlines()[:max_lines]
         return {
