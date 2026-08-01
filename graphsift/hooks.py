@@ -300,6 +300,78 @@ def optimize_command(command: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Command rewriting — the modern smart-execution path
+# ---------------------------------------------------------------------------
+
+
+def _tmp_codefile(code: str) -> str:
+    """Write *code* to a temp file and return its path.
+
+    The code is handed to the launcher via a file (not argv) so arbitrary
+    quoting in the shell command can never break it.
+    """
+    import hashlib
+
+    tmp_dir = Path.home() / ".graphsift" / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+    path = tmp_dir / f"code_{key}.py"
+    if not path.exists():
+        try:
+            path.write_text(code, encoding="utf-8")
+        except OSError:
+            return ""
+    return str(path)
+
+
+def _rewrite_command(command: str, shell: str = "bash") -> Optional[str]:
+    """Rewrite an optimizable command to run through the launcher.
+
+    Returns the rewritten shell command string, or None when the command is
+    not optimizable or no launcher is available (callers pass through to the
+    shell unchanged).
+
+    The Bash/PowerShell tool then runs the (native, ~50ms) launcher directly,
+    so the model sees a normal successful tool result — no denial and no
+    workaround behavior.
+    """
+    info = _extract_cwd_and_code(command)
+    if info is None:
+        return None
+
+    from graphsift.launcher import build_launcher_command  # noqa: PLC0415
+
+    cwd = info["cwd"]
+    mode = info["mode"]
+
+    if mode == "sleep":
+        return build_launcher_command(
+            sleep_seconds=info.get("duration", 1.0), shell=shell
+        )
+
+    if mode == "script":
+        script = info["code_or_script"]
+        if not os.path.isabs(script):
+            script = os.path.join(cwd, script)
+        return build_launcher_command(script=script, cwd=cwd, shell=shell)
+
+    if mode == "daemon":
+        # Ensure the daemon is reachable before we hand off to the launcher.
+        try:
+            from graphsift.daemon import start as _dstart, status as _dstatus  # noqa: PLC0415
+            if _dstatus().get("status") != "running":
+                _dstart()
+        except ImportError:
+            return None
+        codefile = _tmp_codefile(info["code"])
+        if not codefile:
+            return None
+        return build_launcher_command(codefile=codefile, cwd=cwd, shell=shell)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # PreToolUse hook — auto-route Bash/PowerShell through daemon
 # ---------------------------------------------------------------------------
 
@@ -344,44 +416,59 @@ def pre_bash_hook() -> str:
         data = json.loads(raw)
         command = ""
 
-        # Handle different input formats
+        # Handle different input formats.
+        #
+        # Claude Code documents the tool input under ``tool_input`` as a dict:
+        #   {"tool_name": "Bash", "tool_input": {"command": "...", ...}}
+        # Some hosts/older versions pass ``input`` (dict or bare string).
+        # Normalize all of them so ``command`` is always the command string
+        # when one is present. The previous implementation checked ``input``
+        # first as a bare string, so the real ``{"command": ...}`` value was
+        # never extracted and smart execution silently never fired.
         if isinstance(data, dict):
-            if "input" in data:
-                command = data["input"]
-            elif "command" in data:
+            raw_input = data.get("tool_input")
+            if raw_input is None:
+                raw_input = data.get("input")
+            if isinstance(raw_input, dict):
+                command = raw_input.get("command", "") or ""
+            elif isinstance(raw_input, str):
+                command = raw_input
+            elif isinstance(data.get("command"), str):
                 command = data["command"]
-            elif isinstance(data.get("input"), dict):
-                command = data["input"].get("command", "")
 
         if not command:
             return raw  # pass through unchanged
 
-        # Try to optimize
-        result = optimize_command(command)
-        if result is None:
-            return raw  # not optimizable, pass through
+        # Try to optimize: rewrite the command to run through the launcher.
+        shell = "powershell" if data.get("tool_name") == "PowerShell" else "bash"
+        rewritten = _rewrite_command(command, shell=shell)
+        if rewritten is None:
+            return raw  # not optimizable / launcher unavailable — pass through
 
-        # Build response — tell Claude Code to skip the Bash tool
-        # and use our result directly.
-        output = result.get("stdout", "") or ""
-        stderr = result.get("stderr", "") or ""
+        # Modern Claude Code hook protocol: rewrite the command via
+        # updatedInput so the Bash/PowerShell tool runs the (native, ~50ms)
+        # launcher and the model sees a normal, successful tool result —
+        # no denial, no workaround behavior. The daemon stays warm between
+        # commands, so module imports and the result cache persist.
+        tool_input = data.get("tool_input")
+        if isinstance(tool_input, dict):
+            new_input = dict(tool_input)
+            new_input["command"] = rewritten
+        else:
+            new_input = {"command": rewritten}
 
-        # Format as tool output
-        response = output
-        if stderr:
-            response += ("\n" + stderr) if output else stderr
-
-        # Return instruction to cancel Bash and use our result
-        skip_response = {
-            "skip": True,
-            "response": response.strip(),
+        hook_response = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": new_input,
+            },
             "_graphsift": {
-                "optimized": True,
-                "method": result.get("method", "unknown"),
-                "cwd": result.get("cwd", ""),
+                "rewritten": True,
+                "to": rewritten[:200],
             },
         }
-        return json.dumps(skip_response)
+        return json.dumps(hook_response)
 
     except json.JSONDecodeError:
         return raw  # not JSON, pass through

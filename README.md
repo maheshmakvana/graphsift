@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — LLM Token Optimization Engine for Claude, GPT-5 & Gemini" width="600" style="max-width:100%;height:auto">
 </p>
 
-<h1 align="center">graphsift v4.11.0</h1>
+<h1 align="center">graphsift v4.12.0</h1>
 <p align="center">
   <strong>Token Saver for Claude, GPT-5, Gemini & Every LLM —<br>
   80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 826+ Tests, Zero External Dependencies<br>
@@ -32,6 +32,24 @@
   <img src="https://img.shields.io/badge/CLIs-7%20supported-success" alt="Supported CLIs">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="GitHub Stars"></a>
 </p>
+
+## ⚡ NEW in v4.12 — Smart Execution Engine Actually Works
+
+The Smart Execution Engine (v4.8) is rebuilt on a **real persistent daemon + native launcher**, and the two silent bugs that stopped it from ever firing are fixed.
+
+**What was broken.** The PreToolUse hook never read the command (Claude Code sends it under `tool_input`, not `input`), and it returned a legacy `skip`/`response` shape that current Claude Code ignores — so **no command was ever optimized**, and every Bash/PowerShell command paid ~300–500 ms of hook overhead for nothing.
+
+**What's new.**
+
+| Piece | What it does |
+|---|---|
+| `daemon_server.py` | Detached **TCP server** on `127.0.0.1` (token-auth, request caps, idle shutdown) that survives its parent — module imports and the result cache persist across commands. |
+| `launcher.py` | A compiled shim **auto-built on first use** (C# via the Windows .NET Framework `csc.exe`, no toolchain to install). Runs `python -c`/`python script.py`/`sleep` in **~50 ms**. |
+| `launcher_fallback.py` | Python fallback so every platform works even without a compiler (just not as fast). |
+| Hook rewrite | The hook now rewrites the command via `updatedInput` + `permissionDecision: "allow"` — the Bash tool runs the launcher, and the model sees a **normal successful tool result** (no denial, no workaround). |
+| Auto-cleanup | The daemon records its version; on upgrade it is **stopped and replaced automatically**, and orphaned leftover daemon processes are swept. `pip install -U graphsift` needs no manual cleanup. |
+
+**Still zero-config.** `pip install graphsift` is the only step: first import writes the hooks, starts the daemon, and builds the launcher.
 
 ## 🛡️ NEW in v4.11 — Trading-Strategy Hallucination Guard
 

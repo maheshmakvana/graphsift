@@ -8,6 +8,54 @@ All notable changes to graphsift are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.12.0] — 2026-08-01
+
+### Fixed — Smart Execution Engine now actually works
+
+The Smart Execution Engine's PreToolUse hook (added in v4.8) had two
+silent bugs that meant **fast execution never fired** — and worse, the hook
+added ~300–500 ms of Python-startup overhead to *every* Bash/PowerShell
+command for zero benefit:
+
+1. **Command was never extracted** — the hook read `data["input"]` as a
+   bare string, but Claude Code sends the command at
+   `data["tool_input"]["command"]`. Fixed in `graphsift/hooks.py`; the
+   hook now also handles legacy `input` dict/string shapes.
+2. **The optimized result was discarded** — the hook returned the legacy
+   `{"skip": true, "response": ...}` shape, which current Claude Code
+   ignores, so the Bash tool re-ran the command anyway. Verified against
+   the hook protocol docs: there is **no** PreToolUse channel that can
+   present replacement output as a *successful* tool result (`deny` +
+   reason frames it as a failure and the model works around it; the
+   `intercept` decision is an unimplemented upstream proposal).
+
+### Added — a real persistent daemon + native launcher
+
+Instead of fighting the hook protocol, the command is now **rewritten** via
+`hookSpecificOutput.updatedInput` so the Bash tool runs a tiny native
+launcher that talks to a genuinely persistent daemon:
+
+- **`graphsift/daemon_server.py`** — a detached TCP server on `127.0.0.1`
+  (token-authenticated, capped request size, idle auto-shutdown) that
+  survives its parent process, so module imports and the result cache
+  persist across commands.
+- **`graphsift/launcher.py`** — a compiled shim auto-built on first use
+  (C# via the Windows .NET Framework `csc.exe`; no toolchain to install).
+  Rebuilds automatically on upgrade. Connects to the daemon, executes, and
+  propagates stdout/stderr/exit code in ~50 ms.
+- **`graphsift/launcher_fallback.py`** — a Python fallback so commands work
+  on platforms without a compiler (just not as fast).
+- **Version-aware auto-cleanup** — the daemon records its graphsift version
+  in `~/.graphsift/daemon.json`; any client that finds a stale-version
+  server stops it and starts a fresh one automatically. Orphaned leftover
+  daemon processes are swept, so upgrading `pip install -U graphsift`
+  requires no manual cleanup.
+- The PreToolUse hook now emits `permissionDecision: "allow"` +
+  `updatedInput`, so the model sees a normal successful tool result — no
+  denial, no workaround behavior.
+
+`pip install graphsift` remains the only setup step.
+
 ## [4.11.0] — 2026-08-01
 
 ### Added

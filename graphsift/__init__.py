@@ -495,12 +495,17 @@ def _auto_configure() -> None:
     lock_name = _hashlib.sha256(str(project_root).encode()).hexdigest()[:16]
     lock = _Path.home() / ".graphsift" / f"configured_{lock_name}"
     if lock.exists():
-        # Already configured — just ensure daemon is running
+        # Already configured — just ensure daemon is running and warm the launcher
         try:
             from graphsift.daemon import status
             if status().get("status") != "running":
                 from graphsift.daemon import start
                 start()
+        except Exception:
+            pass
+        try:
+            from graphsift.launcher import ensure_launcher_async
+            ensure_launcher_async()
         except Exception:
             pass
         return
@@ -554,6 +559,16 @@ def _auto_configure() -> None:
     for pat in ["graphsift *", "python -m graphsift.*"]:
         if pat not in settings["allow"]:
             settings["allow"].append(pat)
+    # Pre-approve the native launcher so rewritten commands never prompt.
+    try:
+        from graphsift.launcher import ensure_launcher
+        launcher = ensure_launcher()
+        if launcher:
+            pat = launcher.replace("\\", "/") + " *"
+            if pat not in settings["allow"]:
+                settings["allow"].append(pat)
+    except Exception:
+        pass
 
     # Write settings.json
     try:

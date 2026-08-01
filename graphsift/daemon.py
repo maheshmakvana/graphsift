@@ -1,27 +1,31 @@
-"""Persistent Python daemon — keeps modules loaded between commands + caches results.
+"""Persistent daemon client for graphsift.
 
-Usage:
-    pip install graphsift  → auto-starts daemon on first import
-    Then: every ``cd <dir> && python ...`` runs through daemon automatically.
-    No user action needed after install.
+The daemon worker now lives in :mod:`graphsift.daemon_server` — a detached
+TCP server bound to ``127.0.0.1`` that **survives its parent process**. This
+module is the *client*: it spawns the server on demand, locates it via
+``~/.graphsift/daemon.json`` (port + auth token), and talks to it over a
+short-lived TCP connection per request.
 
-Features:
-    - **Persistent process**: modules import ONCE, stay cached for life
-    - **Result caching**: identical commands return cached results (0ms)
-    - **Sleep handling**: ``sleep N`` commands handled natively (no exec)
-    - **Timeout safety**: all reads have configurable timeout (default 30s)
-    - **Thread safety**: all public functions hold _DAEMON_LOCK
-    - **Auto-cleanup**: daemon stops on parent exit via atexit
-    - **CWD support**: daemon chdir's into the requested working directory
+Public API is unchanged from the legacy per-process daemon::
+
+    start() / stop() / status()
+    exec_code(code, cwd="") / sleep(duration) / cache_clear() / cache_stats()
+
+Features preserved from the original design:
+  - **Result caching**: identical commands return cached results (server-side).
+  - **Sleep handling**: ``sleep N`` handled server-side (no Python exec).
+  - **Thread safety**: all public functions hold ``_LOCK``.
+  - **Env switches**: ``GRAPHSIFT_NO_DAEMON=1`` refuses to start the server.
+  - **CLI**: ``python -m graphsift.daemon start|stop|status|exec|sleep|
+    cache-clear|cache-stats``.
 """
 
 from __future__ import annotations
 
-import atexit
-import hashlib
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -30,431 +34,518 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_DAEMON_PROCESS = None
-_DAEMON_LOCK = threading.RLock()  # RLock prevents reentrant deadlock
+_DAEMON_DIR = Path.home() / ".graphsift"
+_HOST = "127.0.0.1"
+_CONNECT_TIMEOUT = float(os.environ.get("GRAPHSIFT_DAEMON_CONNECT_TIMEOUT", "10"))
+_READ_TIMEOUT = float(os.environ.get("GRAPHSIFT_DAEMON_TIMEOUT", "30"))
+_LOCK = threading.RLock()
 
-# In-process result cache: {sha256(code+cwd): {"result": ..., "ts": ...}}
-_RESULT_CACHE: dict[str, dict] = {}
+_NO_DAEMON_ERROR = {"status": "failed", "error": "GRAPHSIFT_NO_DAEMON=1 is set"}
 
-# Read from env or default: max seconds to wait for daemon response
-_DAEMON_READ_TIMEOUT = float(os.environ.get("GRAPHSIFT_DAEMON_TIMEOUT", "30"))
-_DAEMON_CONNECT_TIMEOUT = float(os.environ.get("GRAPHSIFT_DAEMON_CONNECT_TIMEOUT", "10"))
-_CACHE_TTL = 300.0  # 5 minutes
-_CACHE_MAX = 256
 
-DAEMON_SCRIPT = r"""
-import sys, json, io, traceback, time, hashlib, os
-
-# In-daemon result cache
-_cache = {}
-_cache_ttl = 300.0
-
-def _exec_code(code, cwd=None):
-    # Check cache first
-    cache_key = hashlib.sha256(f"{code}|{cwd}".encode()).hexdigest()
-    cached = _cache.get(cache_key)
-    if cached and (time.time() - cached['ts']) < _cache_ttl:
-        cached['hits'] = cached.get('hits', 0) + 1
-        result = dict(cached['result'])
-        result['_cached'] = True
-        result['_hits'] = cached['hits']
-        return result
-
-    # Change to the requested working directory
-    if cwd:
-        try:
-            os.chdir(cwd)
-        except OSError:
-            pass  # best effort; caller can catch via stderr
-        # Save and restore sys.path around the insertion to avoid import hijacking
-        _old_path = sys.path.copy()
-        sys.path.insert(0, cwd)
-
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
+def _current_version() -> str:
+    """The installed graphsift version."""
     try:
-        # Use restricted globals — no access to daemon internals
-        safe_builtins = {"print": print, "__builtins__": {
-            "print": print, "len": len, "str": str, "int": int, "float": float,
-            "bool": bool, "list": list, "dict": dict, "tuple": tuple, "set": set,
-            "range": range, "enumerate": enumerate, "zip": zip, "map": map,
-            "filter": filter, "sorted": sorted, "reversed": reversed,
-            "min": min, "max": max, "sum": sum, "abs": abs, "any": any, "all": all,
-            "hasattr": hasattr, "getattr": getattr, "setattr": setattr,
-            "type": type, "isinstance": isinstance, "issubclass": issubclass,
-            "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
-            "IndexError": IndexError, "AttributeError": AttributeError,
-            "ImportError": ImportError, "Exception": Exception,
-            "True": True, "False": False, "None": None,
-            "__import__": __import__,  # Allow imports but deny daemon pipe access
-        }}
-        exec(code, {"__builtins__": safe_builtins["__builtins__"]}, {})
-        stdout = sys.stdout.getvalue()
-        stderr = sys.stderr.getvalue()
-        result = {"ok": True, "stdout": stdout, "stderr": stderr, "_cached": False}
-    except Exception:
-        result = {"ok": False, "stdout": "", "stderr": traceback.format_exc(), "_cached": False}
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        if cwd:
-            sys.path = _old_path  # Restore original sys.path
+        from graphsift._version import __version__ as _v  # noqa: PLC0415
 
-    # Cache successful results
-    if result.get('ok') and result.get('stdout'):
-        _cache[cache_key] = {'result': result, 'ts': time.time()}
-        # Simple eviction: pop oldest when full
-        if len(_cache) > 256:
-            try:
-                oldest_key = min(_cache.keys(), key=lambda k: _cache[k]['ts'])
-                del _cache[oldest_key]
-            except (ValueError, KeyError):
-                pass  # best-effort eviction
+        return str(_v)
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
-    return result
 
-# Main loop: read JSON from stdin, execute, write JSON result to stdout
-for line in sys.stdin:
+def _version_ok(info: dict | None) -> bool:
+    """True if the recorded server version matches the installed version."""
+    if not info:
+        return False
+    recorded = info.get("version")
+    if recorded is None:
+        return False  # pre-version info file (old server) — treat as stale
+    return recorded == _current_version()
+
+
+# ---------------------------------------------------------------------------
+# Info-file helpers
+# ---------------------------------------------------------------------------
+
+
+def _info_path() -> Path:
+    """Path to the daemon info file (overridable for tests)."""
+    env = os.environ.get("GRAPHSIFT_DAEMON_FILE")
+    if env:
+        return Path(env)
+    return _DAEMON_DIR / "daemon.json"
+
+
+def _read_info() -> dict | None:
+    """Read the daemon info file (port + token + pid) if present."""
     try:
-        req = json.loads(line.strip())
-        cmd = req.get('cmd', '')
-        if cmd == 'exit':
-            break
-        elif cmd == 'sleep':
-            duration = float(req.get('duration', 1))
-            capped = min(duration, 30)
-            time.sleep(capped)
-            print(json.dumps({'ok': True, 'stdout': '', 'stderr': '', '_sleep': duration}), flush=True)
-        elif cmd == 'cache_clear':
-            _cache.clear()
-            print(json.dumps({'ok': True, 'stdout': 'cache cleared', 'stderr': ''}), flush=True)
-        elif cmd == 'cache_stats':
-            print(json.dumps({'ok': True, 'stdout': f'{len(_cache)} entries', 'stderr': ''}), flush=True)
-        else:
-            result = _exec_code(req.get('code', ''), req.get('cwd'))
-            print(json.dumps(result), flush=True)
-    except Exception as e:
-        print(json.dumps({'ok': False, 'stdout': '', 'stderr': str(e)}), flush=True)
-"""
+        info_file = _info_path()
+        if info_file.exists():
+            data = json.loads(info_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("port"):
+                return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
 
 
-def _daemon_alive() -> bool:
-    """Check if daemon process is running without acquiring the lock (internal use)."""
-    global _DAEMON_PROCESS
-    return _DAEMON_PROCESS is not None and _DAEMON_PROCESS.poll() is None
-
-
-def _readline_with_timeout(stream, timeout: float) -> str:
-    """Read a line from *stream*, raising TimeoutError if *timeout* seconds elapse.
-
-    Uses a daemon thread for the blocking read so this works on Windows
-    (where ``select.select`` only supports sockets, not pipe handles).
-    """
-    import threading as _threading
-    import queue as _queue
-
-    if timeout <= 0:
-        return stream.readline()
-
-    q: _queue.Queue = _queue.Queue()
-    t = _threading.Thread(target=lambda: q.put(stream.readline()), daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        raise TimeoutError(f"Daemon did not respond within {timeout}s")
-    return q.get_nowait()
-
-
-def _read_daemon_response(timeout: float | None = None) -> dict:
-    """Read one JSON response line from daemon stdout with timeout."""
-    global _DAEMON_PROCESS
-    if _DAEMON_PROCESS is None:
-        return {"ok": False, "stdout": "", "stderr": "Daemon not running"}
-    t = timeout if timeout is not None else _DAEMON_READ_TIMEOUT
+def _cleanup_info_file() -> None:
     try:
-        result_line = _readline_with_timeout(_DAEMON_PROCESS.stdout, t)
-        if not result_line:
-            # EOF — daemon likely crashed
-            return {"ok": False, "stdout": "", "stderr": "Daemon connection closed (process died)"}
-        return json.loads(result_line.strip())
-    except json.JSONDecodeError:
-        # Protocol desync: drain any remaining stale data from the pipe
-        _drain_daemon_pipe()
-        return {"ok": False, "stdout": "", "stderr": f"Daemon returned invalid JSON"}
-    except TimeoutError as e:
-        _drain_daemon_pipe()
-        return {"ok": False, "stdout": "", "stderr": str(e)}
-
-
-def _drain_daemon_pipe():
-    """Drain any leftover data from daemon stdout to prevent protocol desync.
-
-    Uses a short non-blocking read loop with threading so it works on Windows.
-    """
-    global _DAEMON_PROCESS
-    if _DAEMON_PROCESS is None or _DAEMON_PROCESS.stdout is None:
-        return
-    try:
-        import threading as _threading
-        import queue as _queue
-
-        def _drain() -> None:
-            while True:
-                try:
-                    line = _DAEMON_PROCESS.stdout.readline()
-                    if not line:
-                        break
-                except Exception:
-                    break
-
-        q: _queue.Queue = _queue.Queue()
-        t = _threading.Thread(target=lambda: q.put(None) or _drain(), daemon=True)
-        t.start()
-        t.join(0.2)
-    except Exception:
+        info_file = _info_path()
+        if info_file.exists():
+            info_file.unlink()
+    except OSError:
         pass
 
 
+def _ping(port: int | None, timeout: float = 1.0) -> bool:
+    """Return True if a server responds on *port* (raw connect probe).
+
+    Retries briefly so a single transient connect failure never causes an
+    unnecessary respawn (which would churn the info file and bounce
+    requests between servers).
+    """
+    if not port:
+        return False
+    for attempt in range(3):
+        try:
+            with socket.create_connection((_HOST, int(port)), timeout=timeout):
+                return True
+        except OSError:
+            if attempt < 2:
+                time.sleep(0.1)
+    return False
+
+
+def _acquire_start_lock(timeout: float = 5.0):
+    """Serialize server spawns across processes (O_EXCL lock file)."""
+    lock_path = _info_path().with_suffix(".start.lock")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return lock_path
+        except FileExistsError:
+            time.sleep(0.05)
+        except OSError:
+            return None  # cannot create the lock — proceed anyway
+    return None
+
+
+def _release_start_lock(lock_path) -> None:
+    if lock_path is None:
+        return
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Server lifecycle
+# ---------------------------------------------------------------------------
+
+
 def start() -> dict:
-    """Start a persistent Python daemon process.
+    """Spawn the persistent server (if not already reachable) and return status.
+
+    Uses a cross-process lock so concurrent ``start()`` calls (auto-config
+    on import, SessionStart hook, CLI) spawn at most one server.
 
     Returns:
-        dict with keys: status ("started"/"already_running"/"failed"), pid, error
+        dict with keys: status ("started"/"already_running"/"failed"),
+        pid, port, error.
     """
-    global _DAEMON_PROCESS
-    with _DAEMON_LOCK:
-        if _daemon_alive():
-            return {"status": "already_running", "pid": _DAEMON_PROCESS.pid}
+    with _LOCK:
+        info = _read_info()
+        if info and _ping(info.get("port")) and _version_ok(info):
+            _sweep_orphans()
+            return {
+                "status": "already_running",
+                "pid": info.get("pid"),
+                "port": info.get("port"),
+            }
 
-        _DAEMON_PROCESS = subprocess.Popen(
-            [sys.executable, '-c', DAEMON_SCRIPT],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        if os.environ.get("GRAPHSIFT_NO_DAEMON"):
+            return dict(_NO_DAEMON_ERROR)
 
-        # Clear in-process cache when starting fresh (avoids stale cache after restart)
-        _RESULT_CACHE.clear()
-
-        # Verify daemon is responsive within connect timeout
+        lock = _acquire_start_lock()
         try:
-            r = _read_daemon_response.__wrapped__ = _read_daemon_response
-            # Send a ping via exec_code
-            req = json.dumps({"cmd": "exec", "code": "print('daemon:ready')", "cwd": ""})
-            _DAEMON_PROCESS.stdin.write(req + "\n")
-            _DAEMON_PROCESS.stdin.flush()
+            # Re-check after acquiring the lock — another process may have
+            # finished starting the server while we waited.
+            info = _read_info()
+            if info and _ping(info.get("port")) and _version_ok(info):
+                return {
+                    "status": "already_running",
+                    "pid": info.get("pid"),
+                    "port": info.get("port"),
+                }
+            if os.environ.get("GRAPHSIFT_NO_DAEMON"):
+                return dict(_NO_DAEMON_ERROR)
 
-            raw = _readline_with_timeout(_DAEMON_PROCESS.stdout, _DAEMON_CONNECT_TIMEOUT)
-            if raw:
-                resp = json.loads(raw.strip())
-                if resp.get("ok") and "ready" in resp.get("stdout", ""):
-                    return {"status": "started", "pid": _DAEMON_PROCESS.pid}
-            # Daemon responded but not as expected — still probably ok
-            return {"status": "started", "pid": _DAEMON_PROCESS.pid}
-        except Exception as e:
-            # Verification failed — kill the process and report error
+            # A stale-version (or orphaned) server is responding — shut it down.
+            if info and _ping(info.get("port")):
+                _shutdown_server(info)
+
+            # Clean up leftover daemon processes from older versions / crashes.
+            _cleanup_orphans()
+
             try:
-                _DAEMON_PROCESS.kill()
-            except Exception:
-                pass
-            _DAEMON_PROCESS = None
-            return {"status": "failed", "error": str(e)}
+                kwargs: dict = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = (
+                        subprocess.CREATE_NEW_PROCESS_GROUP
+                        | subprocess.DETACHED_PROCESS
+                    )
+                else:
+                    kwargs["start_new_session"] = True
+                # The server must NOT run graphsift's import-time auto-config:
+                # that would call daemon.start() recursively and spawn a
+                # cascade of servers until one writes the info file.
+                env = os.environ.copy()
+                env["GRAPHSIFT_NO_AUTOCONFIGURE"] = "1"
+                subprocess.Popen(
+                    [sys.executable, "-m", "graphsift.daemon_server"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    env=env,
+                    **kwargs,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("daemon start failed: %s", exc)
+                return {"status": "failed", "error": str(exc)}
 
-
-def exec_code(code: str, cwd: str = "") -> dict:
-    """Send code to the daemon and get result. Module imports stay cached.
-
-    Thread-safe: holds _DAEMON_LOCK for the entire request/response cycle.
-
-    Args:
-        code: Python code to execute.
-        cwd: Working directory (daemon chdir's into this before execution).
-
-    Returns:
-        dict with keys: ok, stdout, stderr, _cached (True if from cache)
-    """
-    global _DAEMON_PROCESS
-    global _RESULT_CACHE
-
-    with _DAEMON_LOCK:
-        # In-process cache check
-        cache_key = hashlib.sha256(f"{code}|{cwd}".encode()).hexdigest()
-        cached = _RESULT_CACHE.get(cache_key)
-        if cached and (time.time() - cached["ts"]) < _CACHE_TTL:
-            result = dict(cached["result"])
-            result["_cached"] = True
-            return result
-
-        if not _daemon_alive():
-            start()
-            if not _daemon_alive():
-                return {"ok": False, "stdout": "", "stderr": "Failed to start daemon"}
-
-        req = json.dumps({"cmd": "exec", "code": code, "cwd": cwd})
-        try:
-            _DAEMON_PROCESS.stdin.write(req + "\n")
-            _DAEMON_PROCESS.stdin.flush()
-        except BrokenPipeError:
-            # Daemon died between poll() and write — restart
-            start()
-            if not _daemon_alive():
-                return {"ok": False, "stdout": "", "stderr": "Daemon crashed and restart failed"}
-            _DAEMON_PROCESS.stdin.write(req + "\n")
-            _DAEMON_PROCESS.stdin.flush()
-
-        result = _read_daemon_response()
-
-        # Cache successful results (with output) in-process as well
-        if result.get("ok") and result.get("stdout"):
-            _RESULT_CACHE[cache_key] = {"result": result, "ts": time.time()}
-            while len(_RESULT_CACHE) > _CACHE_MAX:
-                try:
-                    oldest = min(_RESULT_CACHE.keys(), key=lambda k: _RESULT_CACHE[k]["ts"])
-                    del _RESULT_CACHE[oldest]
-                except (ValueError, KeyError):
-                    break
-
-        return result
-
-
-def sleep(duration: float = 1.0) -> dict:
-    """Handle sleep natively (no Python execution needed).
-
-    Thread-safe: holds _DAEMON_LOCK.
-    """
-    global _DAEMON_PROCESS
-    with _DAEMON_LOCK:
-        if not _daemon_alive():
-            start()
-
-        try:
-            req = json.dumps({"cmd": "sleep", "duration": duration})
-            _DAEMON_PROCESS.stdin.write(req + "\n")
-            _DAEMON_PROCESS.stdin.flush()
-        except BrokenPipeError:
-            start()
-            _DAEMON_PROCESS.stdin.write(req + "\n")
-            _DAEMON_PROCESS.stdin.flush()
-
-        return _read_daemon_response()
-
-
-def cache_clear() -> dict:
-    """Clear both in-process and daemon caches.
-
-    Thread-safe: holds _DAEMON_LOCK.
-    """
-    global _RESULT_CACHE
-    with _DAEMON_LOCK:
-        _RESULT_CACHE.clear()
-        if _daemon_alive():
-            try:
-                _DAEMON_PROCESS.stdin.write(json.dumps({"cmd": "cache_clear"}) + "\n")
-                _DAEMON_PROCESS.stdin.flush()
-                _read_daemon_response(timeout=5)
-            except Exception:
-                pass
-    return {"ok": True}
-
-
-def cache_stats() -> dict:
-    """Get cache stats from both in-process and daemon caches.
-
-    Thread-safe: holds _DAEMON_LOCK.
-    """
-    with _DAEMON_LOCK:
-        stats = {"in_process": len(_RESULT_CACHE), "daemon": "unknown"}
-        if _daemon_alive():
-            try:
-                _DAEMON_PROCESS.stdin.write(json.dumps({"cmd": "cache_stats"}) + "\n")
-                _DAEMON_PROCESS.stdin.flush()
-                resp = _read_daemon_response(timeout=5)
-                stats["daemon"] = resp.get("stdout", "unknown")
-            except Exception:
-                pass
-        return {"ok": True, **stats}
-
-
-def stop():
-    """Stop the daemon process and clear caches.
-
-    Thread-safe: holds _DAEMON_LOCK.
-    """
-    global _DAEMON_PROCESS
-    global _RESULT_CACHE
-    with _DAEMON_LOCK:
-        if _daemon_alive():
-            try:
-                _DAEMON_PROCESS.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
-                _DAEMON_PROCESS.stdin.flush()
-                _DAEMON_PROCESS.wait(timeout=5)
-            except Exception:
-                try:
-                    _DAEMON_PROCESS.kill()
-                except Exception:
-                    pass
-            _DAEMON_PROCESS = None
-        _RESULT_CACHE.clear()
+            deadline = time.monotonic() + _CONNECT_TIMEOUT
+            while time.monotonic() < deadline:
+                info = _read_info()
+                if info and _ping(info.get("port")):
+                    return {
+                        "status": "started",
+                        "pid": info.get("pid"),
+                        "port": info.get("port"),
+                    }
+                time.sleep(0.05)
+            return {
+                "status": "failed",
+                "error": "daemon did not become reachable",
+            }
+        finally:
+            _release_start_lock(lock)
 
 
 def status() -> dict:
-    """Check if daemon is running.
+    """Check if the persistent server is running (never spawns)."""
+    info = _read_info()
+    if info and _ping(info.get("port"), timeout=1.0):
+        return {"status": "running", "pid": info.get("pid"), "port": info.get("port")}
+    return {"status": "stopped"}
 
-    Thread-safe: holds _DAEMON_LOCK.
+
+def stop() -> dict:
+    """Gracefully shut down the server and remove the info file."""
+    with _LOCK:
+        info = _read_info()
+        _shutdown_server(info)
+        _cleanup_orphans()
+        _cleanup_info_file()
+        return {"ok": True}
+
+
+def _shutdown_server(info: dict | None) -> None:
+    """Ask the server described by *info* to shut down, then wait briefly."""
+    if not info or not _ping(info.get("port")):
+        return
+    try:
+        _request(
+            {"token": info.get("token", ""), "cmd": "shutdown"},
+            timeout=5.0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # Give it a moment to remove the info file / close.
+    for _ in range(20):
+        if not _ping(info.get("port"), timeout=0.3):
+            break
+        time.sleep(0.1)
+
+
+_last_sweep = 0.0
+
+
+def _sweep_orphans() -> None:
+    """Throttled orphan sweep on the healthy-server fast path."""
+    global _last_sweep
+    now = time.monotonic()
+    if now - _last_sweep < 60.0:
+        return
+    _last_sweep = now
+    _cleanup_orphans()
+
+
+def _cleanup_orphans() -> None:
+    """Kill leftover graphsift daemon-server processes.
+
+    Handles automatic cleanup when the user upgrades: an old-version server
+    (or one orphaned by a crash) that is no longer the registered server is
+    terminated so only one daemon exists.
     """
-    with _DAEMON_LOCK:
-        if _daemon_alive():
-            return {"status": "running", "pid": _DAEMON_PROCESS.pid}
-        return {"status": "stopped"}
+    current_pid = None
+    info = _read_info()
+    if info:
+        current_pid = info.get("pid")
+
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                    "Where-Object { $_.CommandLine -like '*graphsift.daemon_server*' } | "
+                    "ForEach-Object { $_.ProcessId }",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            for token in out.stdout.split():
+                if not token.strip().isdigit():
+                    continue
+                pid = int(token)
+                if pid == current_pid:
+                    continue
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/F"],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            out = subprocess.run(
+                ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=10
+            )
+            for line in out.stdout.splitlines():
+                if "graphsift.daemon_server" not in line:
+                    continue
+                try:
+                    pid = int(line.split()[0])
+                except ValueError:
+                    continue
+                if pid == current_pid:
+                    continue
+                try:
+                    os.kill(pid, 9)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
-# ── Auto-cleanup on parent exit ──────────────────────────────────────
-
-@atexit.register
-def _cleanup():
-    """Stop the daemon on parent process exit. Registered via atexit."""
-    global _DAEMON_PROCESS
-    if _DAEMON_PROCESS is not None:
-        try:
-            if _DAEMON_PROCESS.poll() is None:
-                _DAEMON_PROCESS.stdin.write(json.dumps({"cmd": "exit"}) + "\n")
-                _DAEMON_PROCESS.stdin.flush()
-                _DAEMON_PROCESS.wait(timeout=3)
-        except Exception:
-            try:
-                _DAEMON_PROCESS.kill()
-            except Exception:
-                pass
+# ---------------------------------------------------------------------------
+# RPC
+# ---------------------------------------------------------------------------
 
 
-if __name__ == '__main__':
+def _request(payload: dict, timeout: float | None = None) -> dict:
+    """Send one request to the server and return its JSON response.
+
+    Never raises — returns an error dict on any transport failure.
+    """
+    info = _read_info()
+    if not info:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": "daemon not running (no info file)",
+            "exit_code": 1,
+        }
+    try:
+        with socket.create_connection(
+            (_HOST, int(info["port"])),
+            timeout=min(5.0, timeout or _CONNECT_TIMEOUT),
+        ) as sock:
+            sock.settimeout(timeout or _READ_TIMEOUT)
+            sock.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            if not buf:
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": "no response from daemon",
+                    "exit_code": 1,
+                }
+            return json.loads(buf.decode("utf-8", errors="replace").strip())
+    except (OSError, socket.timeout, ValueError) as exc:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": f"daemon unreachable: {exc}",
+            "exit_code": 1,
+        }
+
+
+def _ensure_running() -> bool:
+    """Return True if a *current-version* server is reachable, else (re)start."""
+    if status().get("status") == "running":
+        info = _read_info()
+        if _version_ok(info):
+            return True
+        # Running server is a stale version — start() will replace it.
+    return start().get("status") in ("started", "already_running")
+
+
+def _is_transport_error(resp: dict) -> bool:
+    """True if *resp* is a stale/broken server result (restart-worthy).
+
+    Includes client-side transport failures AND a token rejection — the
+    latter means the server on the info-file port is a leftover from an
+    older run whose token no longer matches the info file.
+    """
+    if not isinstance(resp, dict) or "ok" not in resp:
+        return True
+    marker = (resp.get("stderr") or "").lower()
+    return (
+        "daemon unreachable" in marker
+        or "no response from daemon" in marker
+        or "daemon returned invalid json" in marker
+        or "unauthorized (bad token)" in marker
+    )
+
+
+def _rpc(payload: dict, timeout: float | None = None) -> dict:
+    """Send one request, restarting the server on stale/broken connections.
+
+    A server left over from an older graphsift version (or a crashed one)
+    may accept the TCP connection but never reply. In that case we stop it,
+    spawn a fresh server, and retry once.
+    """
+    resp = _request(payload, timeout)
+    if _is_transport_error(resp):
+        stop()
+        start()
+        resp = _request(payload, timeout)
+    return resp
+
+
+def _token() -> str:
+    info = _read_info()
+    return (info or {}).get("token", "")
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def exec_code(
+    code: str,
+    cwd: str = "",
+    path: str = "",
+    module: str = "",
+) -> dict:
+    """Send *code* (or a script file / module) to the persistent server.
+
+    Returns a dict with keys: ok, stdout, stderr, exit_code, cached.
+    """
+    with _LOCK:
+        if not _ensure_running():
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": "failed to start daemon",
+                "exit_code": 1,
+            }
+        return _rpc({
+            "token": _token(),
+            "cmd": "exec",
+            "code": code,
+            "cwd": cwd,
+            "path": path,
+            "module": module,
+        })
+
+
+def sleep(duration: float = 1.0) -> dict:
+    """Ask the server to sleep *duration* seconds (capped at 30)."""
+    with _LOCK:
+        if not _ensure_running():
+            return {"ok": False, "stdout": "", "stderr": "failed to start daemon"}
+        return _rpc(
+            {"token": _token(), "cmd": "sleep", "duration": duration},
+            timeout=max(30.0, min(duration, 30.0) + 5.0),
+        )
+
+
+def cache_clear() -> dict:
+    """Clear the server-side result cache."""
+    with _LOCK:
+        if status().get("status") != "running":
+            return {"ok": True}
+        return _rpc({"token": _token(), "cmd": "cache_clear"})
+
+
+def cache_stats() -> dict:
+    """Return cache stats from the server."""
+    with _LOCK:
+        if status().get("status") != "running":
+            return {"ok": True, "in_process": 0, "daemon": "stopped"}
+        resp = _rpc({"token": _token(), "cmd": "cache_stats"})
+        return {
+            "ok": resp.get("ok", False),
+            "in_process": 0,  # cache now lives entirely server-side
+            "daemon": resp.get("stdout", "unknown"),
+        }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _main() -> int:
     import argparse
-    parser = argparse.ArgumentParser(description="Persistent Python daemon")
-    parser.add_argument('action', choices=['start', 'stop', 'status', 'exec', 'sleep', 'cache-clear', 'cache-stats'])
-    parser.add_argument('code', nargs='?', default='', help='Code to execute')
-    parser.add_argument('--cwd', default='', help='Working directory')
-    parser.add_argument('--duration', type=float, default=1.0, help='Sleep duration (seconds)')
+
+    parser = argparse.ArgumentParser(description="graphsift persistent daemon")
+    parser.add_argument(
+        "action",
+        choices=["start", "stop", "status", "exec", "sleep", "cache-clear", "cache-stats"],
+    )
+    parser.add_argument("code", nargs="?", default="", help="Code to execute")
+    parser.add_argument("--cwd", default="", help="Working directory")
+    parser.add_argument("--duration", type=float, default=1.0, help="Sleep duration")
     args = parser.parse_args()
 
-    if args.action == 'start':
+    if args.action == "start":
         result = start()
-    elif args.action == 'stop':
+    elif args.action == "stop":
         result = stop()
-    elif args.action == 'status':
+    elif args.action == "status":
         result = status()
-    elif args.action == 'exec':
+    elif args.action == "exec":
         result = exec_code(args.code, args.cwd)
-    elif args.action == 'sleep':
+    elif args.action == "sleep":
         result = sleep(args.duration)
-    elif args.action == 'cache-clear':
+    elif args.action == "cache-clear":
         result = cache_clear()
-    elif args.action == 'cache-stats':
+    elif args.action == "cache-stats":
         result = cache_stats()
-    else:
+    else:  # pragma: no cover
         result = {"error": f"Unknown action: {args.action}"}
 
     print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
