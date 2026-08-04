@@ -1,7 +1,7 @@
 # Contributing to graphsift
 
 > **graphsift v3.0** — by [Mahesh Makwana](https://github.com/maheshmakvana).
-> Token saver for Claude, GPT-5 & Gemini. 80-150x fewer tokens, F1 0.85, 826+ tests.
+> Token saver for Claude, GPT-5 & Gemini. 80-150x fewer tokens, F1 0.85, 907+ tests.
 
 Thank you for contributing! This guide covers everything you need to set up, code, test, and submit changes.
 

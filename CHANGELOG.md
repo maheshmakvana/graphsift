@@ -1,7 +1,7 @@
 # Changelog
 
 > **graphsift v4.10.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
-> Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 826+ tests, 50 modules, zero external dependencies.
+> Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 907+ tests, 50 modules, zero external dependencies.
 
 All notable changes to graphsift are documented here.
 

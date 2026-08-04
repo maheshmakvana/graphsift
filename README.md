@@ -2,10 +2,10 @@
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — LLM Token Optimization Engine for Claude, GPT-5 & Gemini" width="600" style="max-width:100%;height:auto">
 </p>
 
-<h1 align="center">graphsift v4.12.0</h1>
+<h1 align="center">graphsift v4.13.0</h1>
 <p align="center">
   <strong>Token Saver for Claude, GPT-5, Gemini & Every LLM —<br>
-  80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 826+ Tests, Zero External Dependencies<br>
+  80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 907+ Tests, Zero External Dependencies<br>
   Reduce LLM API Costs by Up to 99% — Works with Claude Code, Cursor, Windsurf, Continue.dev, Codex CLI, Copilot CLI & Any Terminal</strong>
 </p>
 
@@ -27,11 +27,27 @@
   <img src="https://img.shields.io/badge/F1-0.85-success" alt="Relevance F1 Score">
   <img src="https://img.shields.io/badge/languages-14-lightgrey" alt="Programming Languages Supported">
   <img src="https://img.shields.io/badge/modules-50-blue" alt="Python Modules">
-  <img src="https://img.shields.io/badge/tests-826%2B-brightgreen" alt="Unit Tests">
+  <img src="https://img.shields.io/badge/tests-907%2B-brightgreen" alt="Unit Tests">
   <img src="https://img.shields.io/badge/features-99%25-orange" alt="Feature Coverage">
   <img src="https://img.shields.io/badge/CLIs-7%20supported-success" alt="Supported CLIs">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="GitHub Stars"></a>
 </p>
+
+## ⚡ NEW in v4.13 — Fully Automated, Zero-Manual-Step Indexing
+
+**You never run `graphsift build` by hand again.** graphsift now indexes and
+maintains each repo's graph automatically, with per-repo isolation:
+
+| Trigger | What happens |
+|---|---|
+| **First Claude tool call** | The first time any graph tool (`get_context`, `graph_status`, `search_symbols` — 20+ MCP tools) touches a repo with no graph, it builds automatically, once per process. |
+| **Session start** | The MCP server indexes the project Claude opened in a background thread, so the graph is ready before Claude asks. |
+| **First edit** | The PostToolUse hook becomes a full build when no graph exists, and **persists** re-indexed files to the DB on every edit (a bug where the hook only touched the manifest is fixed). |
+| **Version change** | The manifest records which graphsift built each graph. On `build` / `build_graph` / `update` / `update_graph`, an older version's graph is **purged and rebuilt** with the current parser — no `--force` needed. |
+| **Honest output** | Incremental builds report the repo **totals** (`graph total: N files \| M nodes \| E edges`), not a misleading per-file delta. Edges are persisted to the DB (they never were before), and the walker prunes `.venv`/`.git`/`node_modules` so builds went from ~52s to ~0.4s. |
+
+**Install.** `pip install -U graphsift` — first import writes the hooks, starts
+the daemon, and auto-indexes the current repo.
 
 ## ⚡ NEW in v4.12 — Smart Execution Engine Actually Works
 
@@ -556,7 +572,7 @@ Built-in safety gates prevent performance issues on large repos:
 
 **graphsift** is a **Python library for LLM token optimization** — purpose-built for AI-assisted development with Claude Code, GPT-5, Gemini, and every major LLM. It combines **AST dependency graph analysis**, **BM25+graph ranked relevance scoring**, **14-language tree-sitter parsing**, **25 CLI output compressors**, and **50+ Python modules** into a single zero-dependency package.
 
-Every time you send code to an LLM for review, debugging, or generation, graphsift **ranks every file by relevance** (F1 0.85), **enforces hard token budgets**, **compresses CLI output** (60-97% savings), and **blocks prompt injection** — delivering **80–150× token reduction** with **826+ passing tests** and **99% feature coverage**.
+Every time you send code to an LLM for review, debugging, or generation, graphsift **ranks every file by relevance** (F1 0.85), **enforces hard token budgets**, **compresses CLI output** (60-97% savings), and **blocks prompt injection** — delivering **80–150× token reduction** with **907+ passing tests** and **99% feature coverage**.
 
 > **Save up to 99% on Claude Code API costs. Reduce OpenAI GPT bills by $0.036/review. Keep Gemini within context limits on large monorepos.**
 
