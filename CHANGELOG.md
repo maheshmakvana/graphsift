@@ -8,6 +8,39 @@ All notable changes to graphsift are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.13.0] — 2026-08-04
+
+### Added — fully automated indexing (no manual `graphsift build`)
+
+Claude Code now maintains each repo's graph by itself:
+
+- **MCP tools auto-build on first access.** `_get_builder` (used by 20+ tools
+  like `get_context`, `graph_status`, `search_symbols`) triggers a build for any
+  repo with no indexed graph, guarded so it happens exactly once per process.
+- **Server startup auto-build.** When the MCP server starts, it indexes the
+  project Claude opened in a background thread, so the graph is ready before
+  Claude asks.
+- **PostToolUse hook auto-builds + persists.** `graphsift update` now turns a
+  full build on the first edit in any repo (no more early `return 0` when there
+  is no manifest), and — a pre-existing bug — actually **persists** re-indexed
+  changed files' nodes/files to the DB instead of only updating the manifest.
+- **Honest partial-incremental summary.** A build where only some files changed
+  now reports the repo *totals* (`graph total: N files | M nodes | E edges`)
+  alongside this run's delta, instead of a misleading `1 files | 56 symbols`.
+  Post-processing is skipped on incremental builds because it needs the full
+  graph in memory (it was computing garbage `flows: 0` from a 1-file graph).
+
+### Added — version-aware cleanup + automatic `--force` on stale versions
+
+The manifest now records which graphsift version built a repo's graph. On
+`build`, `build_graph`, `update_graph`, or the PostToolUse `update` hook, if the
+stored version differs from the running graphsift (including pre-existing
+manifests with no version key), the old graph is **purged** (`nodes`, `files`,
+`edges`, `communities`, `risk`, `flows`, FTS) and rebuilt cleanly with the
+current parser — **automatically, no `--force` required**. `graphsift build
+--force` also purges so symbols deleted from files since the last build don't
+linger. No more stale nodes accumulating after an upgrade.
+
 ## [4.12.1] — 2026-08-04
 
 ### Fixed — per-repo builds now show real data (edges persisted, honest no-op summary)

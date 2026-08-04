@@ -1322,6 +1322,48 @@ class GraphStore:
         finally:
             self._pool.release(conn)
 
+    def purge_all_graph_data(self) -> dict[str, int]:
+        """Delete ALL graph data (nodes, files, edges, communities, risk, flows).
+
+        Used for version-aware clean rebuilds: when graphsift's parser changes,
+        data built by an older version must not linger in the DB — otherwise
+        stale symbols/nodes from previous releases accumulate and the graph no
+        longer matches the current code.
+
+        Returns:
+            Dict mapping table name → deleted row count.
+        """
+        with self._lock:
+            conn = self._pool.acquire()
+            try:
+                conn.execute("BEGIN")
+                counts: dict[str, int] = {}
+                for table in (
+                    "flow_snapshots",
+                    "community_summaries",
+                    "communities",
+                    "risk_index",
+                    "edges",
+                    "nodes",
+                    "files",
+                ):
+                    try:
+                        counts[table] = conn.execute(f"DELETE FROM {table}").rowcount
+                    except sqlite3.OperationalError:
+                        counts[table] = 0
+                # Rebuild the FTS index so it reflects the (now empty) node set.
+                try:
+                    conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+                except sqlite3.OperationalError:
+                    pass
+                conn.execute("COMMIT")
+                return counts
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                self._pool.release(conn)
+
     def delete_file_completely(self, file_path: str) -> dict[str, int]:
         """Remove ALL traces of a single file from the graph database.
 

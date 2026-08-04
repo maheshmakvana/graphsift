@@ -111,6 +111,45 @@ def _get_store(root: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Fully-automated indexing — build any repo's graph on first use.
+# Removes the manual ``graphsift build`` step for Claude Code.
+# ---------------------------------------------------------------------------
+
+_ensure_lock = threading.RLock()
+_ensured_roots: set[str] = set()
+
+
+def _ensure_graph(root: str) -> dict:
+    """Build the graph for *root* on first access, if it isn't indexed yet.
+
+    Idempotent per process: the first tool call that touches a repo with no
+    indexed graph triggers a build; every later call is a cheap set lookup.
+    Only runs on stderr-logged paths (never stdout), so it is safe to call
+    from the background startup thread without corrupting the stdio protocol.
+    """
+    if root in _ensured_roots:
+        return {}
+    with _ensure_lock:
+        if root in _ensured_roots:
+            return {}
+        try:
+            store = _get_store(root)
+            if store.stats().get("files", 0) > 0:
+                _ensured_roots.add(root)  # already indexed — nothing to do
+                return {}
+        except Exception:
+            pass
+        logger.info("graphsift: auto-indexing %s (no graph found)", root)
+        try:
+            result = _tool_build_graph({"root_path": root})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("graphsift: auto-index failed for %s: %s", root, exc)
+            result = {}
+        _ensured_roots.add(root)
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Graphsift state — one builder per working directory
 # ---------------------------------------------------------------------------
 
@@ -120,7 +159,12 @@ _source_maps: dict[str, dict[str, str]] = {}  # root_path -> source_map
 
 
 def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
-    """Return (builder, source_map) for *root*, creating if absent."""
+    """Return (builder, source_map) for *root*, creating if absent.
+
+    Fully automated: if the repo has no indexed graph yet, it is built
+    automatically on first access via ``_ensure_graph`` — Claude never has to
+    run ``graphsift build`` by hand.
+    """
     from graphsift.core import ContextBuilder
     from graphsift.models import ContextConfig
 
@@ -130,7 +174,9 @@ def _get_builder(root: str) -> tuple[Any, dict[str, str]]:
             _source_maps[root] = {}
             # Register reverse hash mapping for MCP resource URI resolution
             _roots_by_hash[hashlib.sha1(root.encode()).hexdigest()[:12]] = root
-        return _builders[root], _source_maps[root]
+
+    _ensure_graph(root)
+    return _builders[root], _source_maps[root]
 
 
 def _get_manual_selector(root: str) -> Any:
@@ -177,6 +223,19 @@ def _tool_build_graph(params: dict) -> dict:
 
     # -- Ensure SQLite DB is open and migrated
     store = _get_store(root)
+
+    # Version-aware cleanup: if the stored graph was built by an older graphsift,
+    # stale nodes from the previous parser must be purged before re-indexing.
+    _manifest_path = os.path.join(root, ".graphsift", "manifest.json")
+    _stored_version = "0"
+    try:
+        if os.path.isfile(_manifest_path):
+            with open(_manifest_path, "r", encoding="utf-8") as _mf:
+                _stored_version = json.load(_mf).get("graphsift_version", "0")
+    except Exception:
+        _stored_version = "0"
+    # Version-stale ⇒ clean rebuild automatically (no --force needed).
+    _version_changed = os.path.isfile(_manifest_path) and _stored_version != _GRAPHSIFT_VERSION
 
     # -- Walk paths, stat-check unchanged, read all content for source_map
     sha_cache = load_sha_cache(root)
@@ -255,6 +314,12 @@ def _tool_build_graph(params: dict) -> dict:
                                 language=file_node.language,
                             )
                         )
+            if _version_changed:
+                purged = store.purge_all_graph_data()
+                logger.info(
+                    "INFO: graphsift %s → %s — cleaned %d stale graph records",
+                    _stored_version, _GRAPHSIFT_VERSION, sum(purged.values()),
+                )
             store.save_nodes(all_nodes)
             store.save_files(all_file_nodes)
             graph_edges = graph.all_edges()
@@ -282,6 +347,26 @@ def _tool_build_graph(params: dict) -> dict:
                     sha_cache[file_node.path] = file_node.sha256  # plain str fallback
         save_sha_cache(root, sha_cache)
 
+    # Write a manifest so the PostToolUse hook and status/CLI paths see a built
+    # graph (previously only the CLI wrote one, so an MCP-built repo made the
+    # hook think it was unbuilt and re-index everything).
+    try:
+        os.makedirs(os.path.join(root, ".graphsift"), exist_ok=True)
+        SafeFileIO.write_json(
+            _manifest_path,
+            {
+                "root": root,
+                "files_indexed": stats.files_indexed,
+                "symbols_extracted": stats.symbols_extracted,
+                "edges_created": stats.edges_created,
+                "duration_ms": stats.duration_ms,
+                "graphsift_version": _GRAPHSIFT_VERSION,
+                "files": [str(p) for p in walk_paths],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("build_graph: manifest write failed: %s", exc)
+
     return {
         "status": "indexed",
         "root": root,
@@ -303,6 +388,18 @@ def _tool_update_graph(params: dict) -> dict:
     from graphsift.adapters.filesystem import load_changed_files
 
     root = params.get("root_path", os.getcwd())
+
+    # Version-stale ⇒ rebuild fully (same as --force); an incremental update on
+    # top of an older parser's data would leave stale nodes behind.
+    try:
+        _mp = os.path.join(root, ".graphsift", "manifest.json")
+        if os.path.isfile(_mp):
+            with open(_mp, "r", encoding="utf-8") as _mf:
+                if json.load(_mf).get("graphsift_version", "0") != _GRAPHSIFT_VERSION:
+                    return _tool_build_graph({"root_path": root})
+    except Exception:
+        pass
+
     candidates = params.get("changed_files", [])
 
     if not candidates:
@@ -4183,6 +4280,19 @@ def run_server() -> None:
     # stdin may also deliver non-ASCII arguments from the client.
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
+    # Fully automated: index the project Claude opened, in the background, so
+    # the graph is ready before Claude asks for it. Only touches things that
+    # look like a repo, and only writes to stderr (never stdout).
+    try:
+        cwd = os.getcwd()
+        if os.path.isdir(cwd) and (
+            os.path.isdir(os.path.join(cwd, ".git"))
+            or os.path.isfile(os.path.join(cwd, ".graphsift", "manifest.json"))
+        ):
+            threading.Thread(target=_ensure_graph, args=(cwd,), daemon=True).start()
+    except Exception:
+        pass
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()

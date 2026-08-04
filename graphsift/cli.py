@@ -181,7 +181,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                         "  print(f'[graphsift] Daemon ready (pid {r.get(\\\"pid\\\",\\\"?\\\")})'); "
                         "except Exception as e: "
                         "  print(f'[graphsift] Ready — daemon unavailable: {e}'); "
-                        "print('[graphsift] Use build_graph tool to index repo, then get_context for token-efficient context.')"
+                        "print('[graphsift] Graph is auto-maintained — no manual build needed.')"
                         "\""
                     ),
                 }
@@ -442,9 +442,26 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Step 1: Open / migrate SQLite DB ─────────────────────────────────────
     print("  [1/5] Opening database ...")
     db_path = _db_path_for_root(str(root))
+
+    # Version-aware cleanup: if this repo's graph was built by an older
+    # graphsift, stale nodes/edges from the previous parser must not linger —
+    # force a clean rebuild instead of reusing the old data.
+    from graphsift._version import __version__ as _GRAPHSIFT_VERSION
+    _manifest_path = root / ".graphsift" / "manifest.json"
+    _stored_version = "0"
+    try:
+        if _manifest_path.exists():
+            _stored_version = SafeFileIO.read_json(_manifest_path).get("graphsift_version", "0")
+    except Exception:
+        _stored_version = "0"
+    # Version-stale ⇒ automatically behave like --force (full clean rebuild) so
+    # the user never has to pass --force themselves. Only applies when a build
+    # already exists (a fresh repo just builds normally).
+    version_changed = _manifest_path.exists() and _stored_version != _GRAPHSIFT_VERSION
+
     from graphsift.sha_cache import load_sha_cache, save_sha_cache
     sha_cache = load_sha_cache(str(root))
-    incremental = bool(sha_cache) and not getattr(args, "force", False)
+    incremental = bool(sha_cache) and not getattr(args, "force", False) and not version_changed
     _t0 = time.monotonic()
 
     class _MigrationPrinter:
@@ -594,17 +611,20 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     stats = builder.index_files_incremental(source_map) if incremental else builder.index_files(source_map)
     graph_ms = (time.monotonic() - t_graph) * 1000
 
-    # No-op incremental build: every file matched the SHA cache, so nothing was
-    # re-indexed and the fresh in-memory graph is empty. Report the graph state
-    # already persisted in the DB instead of a misleading all-zero summary.
-    is_noop = incremental and stats.files_indexed == 0 and total_files > 0
-    db_cur = store.stats() if is_noop else None
+    # Incremental builds (no-op or partial) report only what was re-indexed
+    # this run, which is a misleading delta vs the whole repo. Always surface
+    # the stored graph totals from the DB so the output reflects reality.
+    noop = incremental and stats.files_indexed == 0 and total_files > 0
+    db_pre = store.stats() if incremental else None
 
-    if is_noop:
-        print(f"        graph is up to date — {db_cur['files']} files | "
-              f"{db_cur['nodes']} nodes | {db_cur['edges']} edges (no changes since last build)")
-        print(f"        time           : {graph_ms:.0f} ms")
-        print()
+    if noop:
+        print(f"        graph is up to date — {db_pre['files']} files | "
+              f"{db_pre['nodes']} nodes | {db_pre['edges']} edges (no changes since last build)")
+    elif incremental:
+        print(f"        files indexed  : {stats.files_indexed} (of {total_files})")
+        print(f"        symbols        : {stats.symbols_extracted} (this run)")
+        print(f"        edges          : {stats.edges_created} (this run)")
+        print(f"        graph total    : {db_pre['files']} files | {db_pre['nodes']} nodes | {db_pre['edges']} edges")
     else:
         # Language breakdown from stats
         lang_counts = stats.languages
@@ -615,8 +635,8 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         print(f"        dynamic imports: {stats.dynamic_imports_found}")
         if lang_counts:
             print(f"        languages      :", ", ".join(f"{k}:{v}" for k, v in sorted(lang_counts.items(), key=lambda x: -x[1])[:6]))
-        print(f"        time           : {graph_ms:.0f} ms")
-        print()
+    print(f"        time           : {graph_ms:.0f} ms")
+    print()
 
     # ── Step 5: Persist to SQLite ─────────────────────────────────────────────
     print("  [5/5] Persisting to database ...")
@@ -627,6 +647,20 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     edges_saved = 0
 
     if graph_obj is not None:
+        if version_changed:
+            # Built by an older graphsift — the previous parser's output may
+            # no longer be valid, so start clean.
+            purged = store.purge_all_graph_data()
+            _n_cleaned = sum(purged.values())
+            print(f"        version change {_stored_version} → {_GRAPHSIFT_VERSION} — "
+                  f"cleaned {_n_cleaned} stale graph records")
+        elif not incremental and db_stats.get("nodes", 0) > 0:
+            # Full rebuild (--force): symbols deleted from files since the last
+            # build must not linger in the DB.
+            purged = store.purge_all_graph_data()
+            _n_cleaned = sum(purged.values())
+            if _n_cleaned:
+                print(f"        cleaned {_n_cleaned} stale graph records (full rebuild)")
         all_nodes: list[GraphNode] = []
         all_file_nodes = []
         for file_node in graph_obj.all_files():
@@ -657,9 +691,9 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         files_saved = len(all_file_nodes)
 
     db_ms = (time.monotonic() - t_db) * 1000
-    if is_noop:
-        print(f"        graph unchanged — {db_cur['nodes']} nodes / {db_cur['files']} files / "
-              f"{db_cur['edges']} edges already in DB (nothing new to save)")
+    if noop:
+        print(f"        graph unchanged — {db_pre['nodes']} nodes / {db_pre['files']} files / "
+              f"{db_pre['edges']} edges already in DB (nothing new to save)")
     else:
         print(f"        nodes saved    : {nodes_saved}")
         print(f"        files saved    : {files_saved}")
@@ -671,8 +705,11 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Step 6: Post-processing (flows, communities, risk, FTS) ───────────────
     pp_result: dict = {}
     if getattr(args, "postprocess", False):
-        if incremental and changed == 0:
-            print("  [6/6] No changes detected — skipping post-processing")
+        if incremental:
+            # The in-memory graph only holds this run's re-indexed files, so
+            # flows/communities computed here would be wrong. Post-processing
+            # only makes sense on a full build.
+            print("  [6/6] Post-processing skipped on incremental build (run `graphsift build --force --postprocess` to refresh)")
             print()
         else:
             print("  [6/6] Post-processing (flows, communities, risk, FTS) ...")
@@ -706,13 +743,15 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         print()
 
     # ── Manifest ──────────────────────────────────────────────────────────────
-    # Persist real counts. On a no-op incremental build the in-memory stats are
-    # all zero even though the DB already holds the graph — write the actual
-    # stored numbers so the manifest never records a misleading empty build.
-    if is_noop:
-        manifest_indexed = db_cur["files"]
-        manifest_symbols = db_cur["nodes"]
-        manifest_edges = db_cur["edges"]
+    # Persist real counts. On incremental builds the in-memory stats reflect
+    # only this run's delta — write the actual stored graph totals (queried
+    # after persist) so the manifest never records a misleading partial or
+    # empty build.
+    db_after = store.stats() if incremental else None
+    if incremental:
+        manifest_indexed = db_after["files"]
+        manifest_symbols = db_after["nodes"]
+        manifest_edges = db_after["edges"]
     else:
         manifest_indexed = stats.files_indexed
         manifest_symbols = stats.symbols_extracted
@@ -724,9 +763,10 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         "symbols_extracted": manifest_symbols,
         "edges_created": manifest_edges,
         "duration_ms": stats.duration_ms,
+        "graphsift_version": _GRAPHSIFT_VERSION,
         "files": [str(p) for p in all_paths],
     }
-    manifest_path = root / ".graphsift" / "manifest.json"
+    manifest_path = _manifest_path
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     SafeFileIO.write_json(manifest_path, manifest)
 
@@ -750,8 +790,9 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Summary ───────────────────────────────────────────────────────────────
     print("  " + "-" * 45)
     print(f"  Build complete in {total_ms:.0f} ms")
-    if is_noop:
-        print(f"  {db_cur['files']} files  |  {db_cur['nodes']} nodes  |  {db_cur['edges']} edges  (unchanged — graph up to date)")
+    if incremental:
+        note = " (unchanged — graph up to date)" if stats.files_indexed == 0 else f" ({stats.files_indexed} file(s) updated)"
+        print(f"  {db_after['files']} files  |  {db_after['nodes']} nodes  |  {db_after['edges']} edges{note}")
     else:
         print(f"  {stats.files_indexed} files  |  {stats.symbols_extracted} symbols  |  {stats.edges_created} edges")
     if pp_result:
@@ -783,6 +824,23 @@ def _db_path_for_root(root: str) -> str:
 # update command  (incremental - called by PostToolUse hook)
 # ---------------------------------------------------------------------------
 
+def _hook_build_namespace(root: Path) -> argparse.Namespace:
+    """Build a ``cmd_build`` Namespace for the auto-build path in ``cmd_update``.
+
+    The PostToolUse hook runs on every Write/Edit/Bash; when a repo has no
+    graph yet, the hook turns into a full build so indexing is fully automatic.
+    """
+    return argparse.Namespace(
+        project_root=str(root),
+        extensions=None,
+        exclude_dirs=None,
+        depth="execution",
+        progress_interval=200,
+        force=False,
+        postprocess=False,
+    )
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     """Incremental graph update — called by PostToolUse hook.  Never raises."""
     try:
@@ -790,12 +848,25 @@ def cmd_update(args: argparse.Namespace) -> int:
         manifest_path = root / ".graphsift" / "manifest.json"
 
         if not manifest_path.exists():
-            return 0
+            # Fully automated: no graph for this repo yet — the first edit
+            # auto-creates it. This is what removes the manual `graphsift
+            # build` step for the PostToolUse hook.
+            try:
+                return cmd_build(_hook_build_namespace(root))
+            except Exception:
+                return 0
 
         try:
             manifest = SafeFileIO.read_json(manifest_path)
         except Exception:
             return 0
+
+        # Version-aware: if the graph was built by an older graphsift, purge it
+        # and rebuild with the current version instead of incrementally updating
+        # on top of data the previous parser produced.
+        from graphsift._version import __version__ as _GRAPHSIFT_VERSION
+        if manifest.get("graphsift_version", "0") != _GRAPHSIFT_VERSION:
+            return cmd_build(_hook_build_namespace(root))
 
         manifest_files: list[str] = manifest.get("files", [])
         manifest_mtime = manifest_path.stat().st_mtime
@@ -854,6 +925,37 @@ def cmd_update(args: argparse.Namespace) -> int:
                     builder.index_file(path, source)
                 except Exception:
                     pass
+
+            # Persist the re-indexed files to the DB — otherwise the hook only
+            # updates the manifest and the graph goes stale on every edit.
+            try:
+                from graphsift.adapters.storage import GraphStore
+                from graphsift.models import GraphNode, NodeKind
+                store = GraphStore(_db_path_for_root(str(root)))
+                graph_obj = getattr(builder, "_graph", None)
+                if graph_obj is not None:
+                    all_nodes: list[GraphNode] = []
+                    all_file_nodes = []
+                    for file_node in graph_obj.all_files():
+                        all_file_nodes.append(file_node)
+                        for sym in file_node.symbols:
+                            if hasattr(sym, "node_id"):
+                                all_nodes.append(sym)
+                            else:
+                                all_nodes.append(
+                                    GraphNode(
+                                        node_id=f"{file_node.path}::{sym}",
+                                        file_path=file_node.path,
+                                        kind=NodeKind.FUNCTION,
+                                        name=str(sym),
+                                        qualified_name=str(sym),
+                                        language=file_node.language,
+                                    )
+                                )
+                    store.save_nodes(all_nodes)
+                    store.save_files(all_file_nodes)
+            except Exception:
+                pass
 
         # ── 5. Auto-scan modified files for removed exports ─────────────────
         if changed and _should_auto_scan(str(root), len(changed), len(manifest_files)):
