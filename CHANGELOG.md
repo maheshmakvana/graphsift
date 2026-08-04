@@ -8,6 +8,32 @@ All notable changes to graphsift are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.12.1] — 2026-08-04
+
+### Fixed — per-repo builds now show real data (edges persisted, honest no-op summary)
+
+`graphsift build` reported the same empty-looking result in every repository,
+even though each repo has its own files and structure. Three root causes:
+
+1. **Edges were never persisted to SQLite.** `cmd_build` (CLI) and the MCP
+   `build_graph` tool saved nodes and files but never called `save_edges(...)`,
+   so every repo's database had `edges = 0` even when the in-memory graph had
+   built hundreds of import edges. Edges are now saved to the DB, and the
+   in-memory graph de-duplicates identical edges (e.g. `import a.b` +
+   `from a.b import x`) so the reported count matches what is actually
+   persisted.
+2. **No-op incremental builds printed/wrote all zeros.** When every file
+   matched the SHA cache (mtime+size), the build printed `0 files | 0 symbols
+   | 0 edges`, saved `0 nodes`, and overwrote `.graphsift/manifest.json` with
+   zeros — the identical summary in every repo. The build now loads the stored
+   graph state from the DB and reports it with a clear "graph is up to date"
+   message instead.
+3. **Builds were ~30–100× slower than they should be.** `walk_repo` and
+   `load_source_map` used `rglob`, which descends into `.venv`, `.git`,
+   `node_modules`, etc. (45k+ files in one `.venv` alone) and stats every file
+   before filtering. They now prune hidden/excluded directories while walking.
+   Angelbot: no-op build ~52s → ~0.4s, full rebuild ~60s → ~4s.
+
 ## [4.12.0] — 2026-08-01
 
 ### Fixed — Smart Execution Engine now actually works

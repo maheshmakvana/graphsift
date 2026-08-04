@@ -594,17 +594,29 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     stats = builder.index_files_incremental(source_map) if incremental else builder.index_files(source_map)
     graph_ms = (time.monotonic() - t_graph) * 1000
 
-    # Language breakdown from stats
-    lang_counts = stats.languages
-    print(f"        files indexed  : {stats.files_indexed}")
-    print(f"        files skipped  : {stats.files_skipped}")
-    print(f"        symbols        : {stats.symbols_extracted}")
-    print(f"        edges          : {stats.edges_created}")
-    print(f"        dynamic imports: {stats.dynamic_imports_found}")
-    if lang_counts:
-        print(f"        languages      :", ", ".join(f"{k}:{v}" for k, v in sorted(lang_counts.items(), key=lambda x: -x[1])[:6]))
-    print(f"        time           : {graph_ms:.0f} ms")
-    print()
+    # No-op incremental build: every file matched the SHA cache, so nothing was
+    # re-indexed and the fresh in-memory graph is empty. Report the graph state
+    # already persisted in the DB instead of a misleading all-zero summary.
+    is_noop = incremental and stats.files_indexed == 0 and total_files > 0
+    db_cur = store.stats() if is_noop else None
+
+    if is_noop:
+        print(f"        graph is up to date — {db_cur['files']} files | "
+              f"{db_cur['nodes']} nodes | {db_cur['edges']} edges (no changes since last build)")
+        print(f"        time           : {graph_ms:.0f} ms")
+        print()
+    else:
+        # Language breakdown from stats
+        lang_counts = stats.languages
+        print(f"        files indexed  : {stats.files_indexed}")
+        print(f"        files skipped  : {stats.files_skipped}")
+        print(f"        symbols        : {stats.symbols_extracted}")
+        print(f"        edges          : {stats.edges_created}")
+        print(f"        dynamic imports: {stats.dynamic_imports_found}")
+        if lang_counts:
+            print(f"        languages      :", ", ".join(f"{k}:{v}" for k, v in sorted(lang_counts.items(), key=lambda x: -x[1])[:6]))
+        print(f"        time           : {graph_ms:.0f} ms")
+        print()
 
     # ── Step 5: Persist to SQLite ─────────────────────────────────────────────
     print("  [5/5] Persisting to database ...")
@@ -612,6 +624,7 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     graph_obj = getattr(builder, "_graph", None)
     nodes_saved = 0
     files_saved = 0
+    edges_saved = 0
 
     if graph_obj is not None:
         all_nodes: list[GraphNode] = []
@@ -634,14 +647,24 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
                             language=file_node.language,
                         )
                     )
+        all_edges = graph_obj.all_edges()
         store.save_nodes(all_nodes)
         store.save_files(all_file_nodes)
+        if all_edges:
+            store.save_edges(all_edges)
+            edges_saved = len(all_edges)
         nodes_saved = len(all_nodes)
         files_saved = len(all_file_nodes)
 
     db_ms = (time.monotonic() - t_db) * 1000
-    print(f"        nodes saved    : {nodes_saved}")
-    print(f"        files saved    : {files_saved}")
+    if is_noop:
+        print(f"        graph unchanged — {db_cur['nodes']} nodes / {db_cur['files']} files / "
+              f"{db_cur['edges']} edges already in DB (nothing new to save)")
+    else:
+        print(f"        nodes saved    : {nodes_saved}")
+        print(f"        files saved    : {files_saved}")
+        if edges_saved:
+            print(f"        edges saved    : {edges_saved}")
     print(f"        time           : {db_ms:.0f} ms")
     print()
 
@@ -683,11 +706,23 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
         print()
 
     # ── Manifest ──────────────────────────────────────────────────────────────
+    # Persist real counts. On a no-op incremental build the in-memory stats are
+    # all zero even though the DB already holds the graph — write the actual
+    # stored numbers so the manifest never records a misleading empty build.
+    if is_noop:
+        manifest_indexed = db_cur["files"]
+        manifest_symbols = db_cur["nodes"]
+        manifest_edges = db_cur["edges"]
+    else:
+        manifest_indexed = stats.files_indexed
+        manifest_symbols = stats.symbols_extracted
+        manifest_edges = stats.edges_created
+
     manifest = {
         "root": str(root),
-        "files_indexed": stats.files_indexed,
-        "symbols_extracted": stats.symbols_extracted,
-        "edges_created": stats.edges_created,
+        "files_indexed": manifest_indexed,
+        "symbols_extracted": manifest_symbols,
+        "edges_created": manifest_edges,
         "duration_ms": stats.duration_ms,
         "files": [str(p) for p in all_paths],
     }
@@ -715,7 +750,10 @@ def cmd_build(args: argparse.Namespace) -> int:  # noqa: C901
     # ── Summary ───────────────────────────────────────────────────────────────
     print("  " + "-" * 45)
     print(f"  Build complete in {total_ms:.0f} ms")
-    print(f"  {stats.files_indexed} files  |  {stats.symbols_extracted} symbols  |  {stats.edges_created} edges")
+    if is_noop:
+        print(f"  {db_cur['files']} files  |  {db_cur['nodes']} nodes  |  {db_cur['edges']} edges  (unchanged — graph up to date)")
+    else:
+        print(f"  {stats.files_indexed} files  |  {stats.symbols_extracted} symbols  |  {stats.edges_created} edges")
     if pp_result:
         print(f"  flows    : {pp_result.get('flows_detected', 0)}  |  communities: {pp_result.get('communities_detected', 0)}  |  fts rows: {pp_result.get('fts_indexed', 0)}")
     print(f"  db       : {db_path}")

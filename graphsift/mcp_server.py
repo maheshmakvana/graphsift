@@ -257,7 +257,13 @@ def _tool_build_graph(params: dict) -> dict:
                         )
             store.save_nodes(all_nodes)
             store.save_files(all_file_nodes)
-            logger.info("INFO: Persisted %d nodes, %d files to SQLite", len(all_nodes), len(all_file_nodes))
+            graph_edges = graph.all_edges()
+            if graph_edges:
+                store.save_edges(graph_edges)
+            logger.info(
+                "INFO: Persisted %d nodes, %d files, %d edges to SQLite",
+                len(all_nodes), len(all_file_nodes), len(graph_edges),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("build_graph: SQLite persist failed: %s", exc)
 

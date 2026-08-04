@@ -876,7 +876,7 @@ class DependencyGraph:
         max_depth: Hard cap on BFS depth.
     """
 
-    __slots__ = ("_nodes", "_edges", "_adj_out", "_adj_in", "_file_nodes", "_lock", "_decay", "_max_depth")
+    __slots__ = ("_nodes", "_edges", "_adj_out", "_adj_in", "_file_nodes", "_edge_seen", "_lock", "_decay", "_max_depth")
 
     def __init__(self, decay: float = 0.7, max_depth: int = 4) -> None:
         self._nodes: dict[str, GraphNode] = {}
@@ -884,6 +884,7 @@ class DependencyGraph:
         self._adj_out: dict[str, list[GraphEdge]] = defaultdict(list)
         self._adj_in: dict[str, list[GraphEdge]] = defaultdict(list)
         self._file_nodes: dict[str, FileNode] = {}
+        self._edge_seen: set[tuple[str, str, str]] = set()
         self._lock = threading.RLock()
         self._decay = decay
         self._max_depth = max_depth
@@ -907,16 +908,30 @@ class DependencyGraph:
             for sym in file_node.symbols:
                 self._nodes[sym.node_id] = sym
 
-    def add_edge(self, edge: GraphEdge) -> None:
-        """Add a dependency edge.
+    def add_edge(self, edge: GraphEdge) -> bool:
+        """Add a dependency edge, de-duplicating identical edges.
+
+        Duplicates arise naturally when a file imports the same module in
+        several ways (``import a.b``, ``from a.b import x``); the SQLite
+        ``edges`` table collapses them via a UNIQUE constraint, so the
+        in-memory graph must mirror that or the reported edge count never
+        matches the persisted count.
 
         Args:
             edge: GraphEdge to add.
+
+        Returns:
+            True if the edge was added, False if it was a duplicate.
         """
         with self._lock:
+            key = (edge.source_id, edge.target_id, edge.kind.value)
+            if key in self._edge_seen:
+                return False
+            self._edge_seen.add(key)
             self._edges.append(edge)
             self._adj_out[edge.source_id].append(edge)
             self._adj_in[edge.target_id].append(edge)
+            return True
 
     def build_import_edges(self) -> int:
         """Build IMPORTS and DYNAMIC_IMPORT edges from file import lists.
@@ -940,10 +955,8 @@ class DependencyGraph:
                             target_id=tgt_id,
                             kind=EdgeKind.IMPORTS,
                         )
-                        self._edges.append(edge)
-                        self._adj_out[src_module_id].append(edge)
-                        self._adj_in[tgt_id].append(edge)
-                        created += 1
+                        if self.add_edge(edge):
+                            created += 1
 
                 for dyn in file_node.dynamic_imports:
                     targets = self._resolve_import(dyn, path_index)
@@ -955,10 +968,8 @@ class DependencyGraph:
                             kind=EdgeKind.DYNAMIC_IMPORT,
                             weight=0.6,  # lower weight — dynamic = uncertain
                         )
-                        self._edges.append(edge)
-                        self._adj_out[src_module_id].append(edge)
-                        self._adj_in[tgt_id].append(edge)
-                        created += 1
+                        if self.add_edge(edge):
+                            created += 1
 
         return created
 
@@ -982,10 +993,8 @@ class DependencyGraph:
                             kind=EdgeKind.INHERITS,
                             weight=1.5,  # inheritance = strong coupling
                         )
-                        self._edges.append(edge)
-                        self._adj_out[node.node_id].append(edge)
-                        self._adj_in[name_index[base]].append(edge)
-                        created += 1
+                        if self.add_edge(edge):
+                            created += 1
 
         return created
 
@@ -1012,10 +1021,8 @@ class DependencyGraph:
                             kind=EdgeKind.DECORATES,
                             weight=0.8,
                         )
-                        self._edges.append(edge)
-                        self._adj_out[node.node_id].append(edge)
-                        self._adj_in[name_index[base]].append(edge)
-                        created += 1
+                        if self.add_edge(edge):
+                            created += 1
 
         return created
 
@@ -1124,6 +1131,11 @@ class DependencyGraph:
         """Return all indexed FileNodes."""
         with self._lock:
             return list(self._file_nodes.values())
+
+    def all_edges(self) -> list[GraphEdge]:
+        """Return all dependency edges built in this graph."""
+        with self._lock:
+            return list(self._edges)
 
     def stats(self) -> dict[str, int]:
         """Return graph statistics."""

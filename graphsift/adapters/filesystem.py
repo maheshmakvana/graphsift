@@ -15,6 +15,7 @@ Example::
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from graphsift.read_cache import SafeFileIO
@@ -33,6 +34,50 @@ _DEFAULT_EXCLUDES = {
     "dist", "build", "target", "out", "cdk.out",
     "__pycache__", "*.egg-info", "coverage", "htmlcov",
 }
+
+
+def _prune_predicates(exclude_dirs: set[str]):
+    """Split an exclude set into exact names and glob suffixes (e.g. ``*.egg-info``).
+
+    Returns ``(exact, suffixes)`` where ``suffixes`` are the parts after ``*``.
+    """
+    exact = {e for e in exclude_dirs if not e.startswith("*")}
+    suffixes = {e[1:] for e in exclude_dirs if e.startswith("*")}
+    return exact, suffixes
+
+
+def _iter_source_paths(
+    root_path: Path,
+    extensions: set[str],
+    exclude_dirs: set[str],
+):
+    """Yield source file paths under *root_path*.
+
+    Uses ``os.walk`` and prunes hidden (dot) and excluded directories *while
+    descending*, so huge tooling trees (``.venv``, ``.git``, ``node_modules``)
+    are never traversed.  ``rglob`` was the previous implementation and walked
+    every file in those trees before filtering — e.g. a 45k-file ``.venv``
+    added ~33s to every build.
+    """
+    exact_excl, suffix_excl = _prune_predicates(exclude_dirs)
+    exts = extensions
+
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        # Prune hidden + excluded directories in-place so os.walk never descends
+        keep: list[str] = []
+        for d in dirnames:
+            if d.startswith("."):
+                continue
+            if d in exact_excl:
+                continue
+            if any(d.endswith(sfx) for sfx in suffix_excl):
+                continue
+            keep.append(d)
+        dirnames[:] = keep
+
+        for fname in filenames:
+            if Path(fname).suffix.lower() in exts:
+                yield os.path.join(dirpath, fname)
 
 
 def load_source_map(
@@ -59,26 +104,16 @@ def load_source_map(
     source_map: dict[str, str] = {}
     root_path = Path(root).resolve()
 
-    for path in root_path.rglob("*"):
-        if not path.is_file():
-            continue
-        # Skip hidden directories (.*) — they are tooling/build output, never source
-        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
-            continue
-        # Skip explicitly excluded directories
-        if any(part in excl for part in path.parts):
-            continue
-        if path.suffix.lower() not in exts:
-            continue
-        if path.stat().st_size > max_file_bytes:
-            logger.debug("graphsift: skipping large file %s", path)
-            continue
+    for fp in _iter_source_paths(root_path, exts, excl):
         try:
-            source_map[str(path)] = SafeFileIO.read(path, encoding=encoding)
+            if os.path.getsize(fp) > max_file_bytes:
+                logger.debug("graphsift: skipping large file %s", fp)
+                continue
+            source_map[fp] = SafeFileIO.read(fp, encoding=encoding)
         except OSError as exc:
             logger.warning(
                 "graphsift: could not read file",
-                extra={"path": str(path), "error": str(exc)},
+                extra={"path": str(fp), "error": str(exc)},
             )
 
     logger.info(
@@ -105,21 +140,9 @@ def walk_repo(
     """
     exts = extensions or _DEFAULT_EXTENSIONS
     excl = exclude_dirs or _DEFAULT_EXCLUDES
-    paths: list[str] = []
     root_path = Path(root).resolve()
 
-    for path in root_path.rglob("*"):
-        if not path.is_file():
-            continue
-        # Skip hidden directories (.*) — they are tooling/build output, never source
-        if any(part.startswith(".") for part in path.relative_to(root_path).parts):
-            continue
-        if any(part in excl for part in path.parts):
-            continue
-        if path.suffix.lower() in exts:
-            paths.append(str(path))
-
-    return paths
+    return list(_iter_source_paths(root_path, exts, excl))
 
 
 def load_changed_files(
