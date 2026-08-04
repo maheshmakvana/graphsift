@@ -1,12 +1,55 @@
 # Changelog
 
 > **graphsift v4.10.0** — Created by [Mahesh Makwana](https://github.com/maheshmakvana).
-> Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 907+ tests, 50 modules, zero external dependencies.
+> Python library to save Claude tokens, reduce GPT-5, Gemini & all LLM API costs. 928+ tests, 50 modules, zero external dependencies.
 
 All notable changes to graphsift are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [4.14.0] — 2026-08-04
+
+### Added — UI/UX design intelligence (`graphsift uiux`)
+
+Auto-triggering frontend design capability. graphsift does **not** vendor the
+upstream engine — it is a thin wrapper that locates the officially-installed,
+MIT-licensed `ui-ux-pro-max-skill` (© 2024 Next Level Builder) and delegates to
+its `search.py`.
+
+- **`graphsift uiux` CLI command** — `--design-system` (full design system:
+  style, WCAG-tested palette, typography, motion, anti-patterns, pre-delivery
+  checklist), `--domain` search (12 domains, auto-detect), `--stack` guidelines
+  (22 stacks), design dials `--variance/--motion/--density` (1-10), `--persist`
+  master+page overrides, `--json`, `--list-domains`, `--list-stacks`,
+  `--validate-data`, and `--install` (bootstraps the engine via its official
+  npm CLI).
+- **`graphsift-uiux` auto-triggering skill** — frontmatter description activates
+  it automatically on UI/UX/frontend design work (no manual command needed);
+  marked **`user-invocable: false`**, so it never appears as a `/graphsift-uiux`
+  slash command and only auto-triggers.
+- **Engine auto-installs on `graphsift install`** — when the ui-ux-pro-max
+  engine is missing, `graphsift install` (run on install or update) installs it
+  automatically via the upstream npm CLI; no manual `graphsift uiux --install`
+  needed. Skip with `--no-uiux-engine`; a missing npm fails gracefully.
+- **3 new MCP tools** — `uiux_design_system`, `uiux_search`, `uiux_stack_guide`
+  (return `{"error": ...}` with install instructions when the engine is absent).
+- **No upstream code shipped**: discovery honors `GRAPHSIFT_UIUX_SKILL`
+  override; MIT attribution documented in `docs/UIUX_DESIGN.md`.
+
+### Fixed
+
+- **`uiux_stack_guide` MCP tool returned 0 results for every stack** when no
+  `query` was passed — the default `"general best practices"` matched nothing in
+  the engine's BM25 index. The tool now falls back through a query chain (stack
+  name → first token → generic term) only when no explicit query is given, so
+  `uiux_stack_guide(stack="react")` returns real Do/Don't guidance.
+- **Duplicate `/graphsift-*` slash commands in Claude Code** — legacy
+  user-global skills in `~/.claude/skills/` (and `~/.claude/commands/`) from
+  older releases duplicated the project-scoped ones in the `/` menu.
+  `_cleanup_legacy_global_skills()` now removes all legacy forms (directories,
+  single-file `.md` skills, `.md`-named directories) and runs **self-healing on
+  every `graphsift` command**, so stale global copies never linger again.
 
 ## [4.13.0] — 2026-08-04
 

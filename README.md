@@ -2,10 +2,10 @@
   <img src="https://raw.githubusercontent.com/maheshmakvana/graphsift/master/docs/images/hero_banner.png" alt="graphsift — LLM Token Optimization Engine for Claude, GPT-5 & Gemini" width="600" style="max-width:100%;height:auto">
 </p>
 
-<h1 align="center">graphsift v4.13.0</h1>
+<h1 align="center">graphsift v4.14.0</h1>
 <p align="center">
   <strong>Token Saver for Claude, GPT-5, Gemini & Every LLM —<br>
-  80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 907+ Tests, Zero External Dependencies<br>
+  80–150× Fewer Tokens, F1 0.85 Relevance Accuracy, 928+ Tests, Zero External Dependencies<br>
   Reduce LLM API Costs by Up to 99% — Works with Claude Code, Cursor, Windsurf, Continue.dev, Codex CLI, Copilot CLI & Any Terminal</strong>
 </p>
 
@@ -27,11 +27,31 @@
   <img src="https://img.shields.io/badge/F1-0.85-success" alt="Relevance F1 Score">
   <img src="https://img.shields.io/badge/languages-14-lightgrey" alt="Programming Languages Supported">
   <img src="https://img.shields.io/badge/modules-50-blue" alt="Python Modules">
-  <img src="https://img.shields.io/badge/tests-907%2B-brightgreen" alt="Unit Tests">
+  <img src="https://img.shields.io/badge/tests-928%2B-brightgreen" alt="Unit Tests">
   <img src="https://img.shields.io/badge/features-99%25-orange" alt="Feature Coverage">
   <img src="https://img.shields.io/badge/CLIs-7%20supported-success" alt="Supported CLIs">
   <a href="https://github.com/maheshmakvana/graphsift/stargazers"><img src="https://img.shields.io/github/stars/maheshmakvana/graphsift?style=flat&color=yellow" alt="GitHub Stars"></a>
 </p>
+
+## 🎨 NEW in v4.14 — UI/UX Design Intelligence
+
+Ask Claude to design any UI and graphsift becomes your frontend design partner.
+`graphsift uiux` is an auto-triggering design engine backed by the MIT-licensed
+`ui-ux-pro-max-skill` (auto-installs the first time you run `graphsift install`):
+
+- **Full design systems** from one query — style, WCAG-tested palette, font
+  pairing, motion presets, anti-patterns and a pre-delivery checklist:
+  `graphsift uiux "saas analytics dashboard" --design-system`
+- **Targeted searches** — 12 domains (style, color, typography, ux, chart, …)
+  and 22 stacks (react, nextjs, shadcn, html-tailwind, …)
+- **Design dials** — `--variance`, `--motion`, `--density` (1–10) tune the output
+- **Auto-triggers in Claude Code — no slash command** — the `graphsift-uiux`
+  skill is `user-invocable: false`, so it never shows in the `/` menu; it fires
+  automatically on any UI/UX/frontend request
+- **3 new MCP tools** — `uiux_design_system`, `uiux_search`, `uiux_stack_guide`
+
+No upstream code is shipped — graphsift delegates to the installed MIT-licensed
+skill. Docs: [docs/UIUX_DESIGN.md](docs/UIUX_DESIGN.md).
 
 ## ⚡ NEW in v4.13 — Fully Automated, Zero-Manual-Step Indexing
 
@@ -1063,6 +1083,7 @@ graphsift is built on a **zero-exfiltration, local-first** architecture:
 
 | Document | What It Covers |
 |---|---|
+| [UI/UX Design Intelligence](docs/UIUX_DESIGN.md) | Auto-triggering `graphsift uiux` — design systems, palettes, typography, motion |
 | [Prompt Engineering Benchmark](docs/PROMPT_BENCHMARK_2026.md) | 4 prompt architectures compared — 12 scenarios, 9.4/10 winner |
 | [Architecture Guide](docs/GUIDE.md) | System design, use cases, FAQ, and detailed walkthrough |
 | [API Reference](docs/API_REFERENCE.md) | Complete reference for all public classes and functions |

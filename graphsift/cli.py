@@ -285,6 +285,26 @@ def cmd_install(args: argparse.Namespace) -> int:
         _write_skills(project_root)
         _cleanup_legacy_global_skills()
 
+    # 3b. UI/UX design engine — auto-install once when missing (skip with --no-uiux-engine)
+    if not args.no_uiux_engine:
+        try:
+            from graphsift.uiux import find_search_script, install_engine
+            if find_search_script() is None:
+                print("[graphsift] UI/UX engine not found — installing the MIT-licensed "
+                      "ui-ux-pro-max-skill now (one-time, npm required)...")
+                code, msg = install_engine()
+                if code == 0:
+                    print(f"[graphsift] {msg}")
+                else:
+                    print(f"[graphsift] UI/UX engine auto-install failed: {msg}", file=sys.stderr)
+                    print("[graphsift]   The graphsift-uiux skill will still auto-trigger and "
+                          "retry the install when you make your first UI/UX request.")
+            else:
+                print("[graphsift] UI/UX design engine found — `graphsift uiux` is ready.")
+        except Exception as exc:
+            print(f"[graphsift] UI/UX engine setup skipped ({exc}). "
+                  "Install it anytime with `graphsift uiux --install`.")
+
     # 4. Install bash wrapper (auto-compress commands)
     if args.bash_wrapper:
         from .hooks import get_bash_wrapper_script
@@ -1059,7 +1079,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
     # Remove skills (project + any stale user-global leftovers)
     skills_dir = project_root / ".claude" / "skills"
-    for skill_dir in ["graphsift-build", "graphsift-review", "graphsift-impact", "graphsift-compress"]:
+    for skill_dir in ["graphsift-build", "graphsift-review", "graphsift-impact", "graphsift-compress", "graphsift-uiux"]:
         import shutil
         target = skills_dir / skill_dir
         if target.exists():
@@ -1082,21 +1102,40 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 # Skill file writer
 # ---------------------------------------------------------------------------
 
-def _cleanup_legacy_global_skills() -> None:
-    """Remove stale user-global graphsift skills left by older versions.
+def _cleanup_legacy_global_skills() -> int:
+    """Remove stale user-global graphsift skills/commands left by older versions.
 
     Older releases installed skills into ``~/.claude/skills`` (and commands),
     so the same slash commands appeared twice — once user-global, once
     project-scoped. Current releases only install project-scoped skills; this
     removes the legacy global leftovers for anyone upgrading.
+
+    Handles both directory-form (``~/.claude/skills/graphsift-build/``) and
+    single-file legacy (``~/.claude/skills/graphsift-build.md``) leftovers.
+    Returns the number of paths removed.
     """
     import shutil
+    names = ["graphsift-build", "graphsift-compress", "graphsift-impact",
+             "graphsift-review", "graphsift-uiux"]
+    removed = 0
     for base in (Path.home() / ".claude" / "skills", Path.home() / ".claude" / "commands"):
-        if base.is_dir():
-            for name in ["graphsift-build", "graphsift-compress", "graphsift-impact", "graphsift-review"]:
-                target = base / name
-                if target.exists():
-                    shutil.rmtree(target, ignore_errors=True)
+        if not base.is_dir():
+            continue
+        for name in names:
+            target = base / name
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+                removed += 1
+        for legacy in base.glob("graphsift-*.md"):
+            try:
+                if legacy.is_dir():
+                    shutil.rmtree(legacy, ignore_errors=True)
+                else:
+                    legacy.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def _write_skills(project_root: Path) -> None:
@@ -1152,18 +1191,70 @@ def _write_skills(project_root: Path) -> None:
         example="Compress this pytest output before analyzing it",
     )
 
-    print(f"[graphsift] Wrote 4 skill files -> {skills_root}")
+    # Auto-triggering UI/UX design skill. Frontmatter description drives Claude
+    # Code's skill router, so it activates automatically on UI/UX/frontend work
+    # without the user running `graphsift uiux` by hand.
+    _write_skill(
+        skills_root / "graphsift-uiux" / "SKILL.md",
+        title="graphsift: UI/UX Design Intelligence",
+        description="UI/UX and frontend design intelligence for web and mobile. Use it whenever designing, building, styling, or reviewing any UI - landing pages, dashboards, SaaS apps, components, motion/animation, color palettes, typography, dark/light themes, responsive layouts. Auto-run `graphsift uiux \"<product/keywords>\" --design-system` for a complete design system (style, WCAG-tested colors, font pairing, motion presets, anti-patterns, pre-delivery checklist) and `graphsift uiux \"<keyword>\" --domain style|color|ux|typography|chart|...` for targeted design searches.",
+        steps=[
+            "Generate the design system first: run `graphsift uiux \"<product_type> <industry> <keywords>\" --design-system -p \"<Project>\"` to get style, palette, typography, motion, anti-patterns and a pre-delivery checklist. Tune with `--variance`, `--motion`, `--density` (1-10).",
+            "Supplement with targeted searches when needed: `--domain` (style, color, ux, typography, chart, landing, icons, gsap, react, web) and `--stack` (react, nextjs, shadcn, html-tailwind, ...) for framework-specific guidelines.",
+            "Apply the design system verbatim when writing UI code: exact WCAG-tested palette, font pairing, spacing scale and motion presets.",
+            "Before delivering, run the pre-delivery checklist: no emoji icons (use SVG), hover states 150-300ms, focus-visible rings, 4.5:1 text contrast, prefers-reduced-motion respected, responsive at 375/768/1024/1440.",
+            "If the engine is not installed, run `graphsift uiux --install` once (npm required). graphsift delegates to the MIT-licensed ui-ux-pro-max-skill; it ships no upstream code.",
+        ],
+        example="Design a landing page for a SaaS analytics tool",
+        frontmatter={
+            "name": "graphsift-uiux",
+            "user-invocable": False,
+            "description": ("UI/UX and frontend design intelligence for web and mobile. "
+                            "Use it whenever designing, building, styling, or reviewing any UI - "
+                            "landing pages, dashboards, SaaS apps, components, motion/animation, "
+                            "color palettes, typography, dark/light themes, responsive layouts. "
+                            "Auto-run `graphsift uiux \"<product/keywords>\" --design-system` for a "
+                            "complete design system (style, WCAG-tested colors, font pairing, motion "
+                            "presets, anti-patterns, pre-delivery checklist) and "
+                            "`graphsift uiux \"<keyword>\" --domain style|color|ux|typography|chart` "
+                            "for targeted design searches."),
+        },
+    )
+
+    print(f"[graphsift] Wrote 5 skill files -> {skills_root}")
 
 
-def _write_skill(path: Path, title: str, description: str, steps: list[str], example: str) -> None:
+def _write_skill(
+    path: Path,
+    title: str,
+    description: str,
+    steps: list[str],
+    example: str,
+    frontmatter: dict | None = None,
+) -> None:
+    """Write a Claude Code skill file.
+
+    If `frontmatter` is given (e.g. ``{"name": ..., "description": ...}``), a YAML
+    frontmatter block is prepended so the skill auto-triggers based on its
+    description. Skills without frontmatter are user-invocable only.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     steps_md = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(steps))
-    content = (
+    body = (
         f"# {title}\n\n"
         f"{description}\n\n"
         f"## Steps\n\n{steps_md}\n\n"
         f"## Example trigger\n\n> {example}\n"
     )
+    if frontmatter:
+        fm_lines = []
+        for k, v in frontmatter.items():
+            if isinstance(v, bool):
+                v = "true" if v else "false"
+            fm_lines.append(f"{k}: {v}")
+        content = "---\n" + "\n".join(fm_lines) + "\n---\n\n" + body
+    else:
+        content = body
     SafeFileIO.write(path, content)
 
 
@@ -3129,6 +3220,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--project-root", default=_cwd(), help="Repo root (default: cwd)")
     p_install.add_argument("--no-hooks", action="store_true", help="Skip hook injection")
     p_install.add_argument("--no-skills", action="store_true", help="Skip skill file creation")
+    p_install.add_argument("--no-uiux-engine", action="store_true",
+                           help="Skip auto-installing the ui-ux-pro-max design engine (npm -g install + uipro init)")
     p_install.add_argument("--bash-wrapper", action="store_true", help="Install transparent bash command compression")
     p_install.add_argument("--all", action="store_true", help="Show instructions for all supported CLIs")
     p_install.add_argument("--claude-code", action="store_true", help="Show Claude Code instructions (default)")
@@ -3537,7 +3630,177 @@ def _build_parser() -> argparse.ArgumentParser:
     p_loop_breaker.add_argument("pattern", help="Pattern name to reset")
     p_loop_breaker.add_argument("--project-root", default=_cwd())
 
+    # -----------------------------------------------------------------------
+    # uiux command  (UI/UX design intelligence — vendored ui-ux-pro-max engine)
+    # -----------------------------------------------------------------------
+    p_uiux = sub.add_parser(
+        "uiux",
+        help="UI/UX design intelligence: search 84 styles, 192 palettes, 74 font "
+             "pairings, 25 chart types and 98 UX guidelines, or generate a complete "
+             "design system (style, WCAG-tested colors, typography, motion, "
+             "anti-patterns, pre-delivery checklist).",
+    )
+    p_uiux.add_argument(
+        "query", nargs="?", default="",
+        help="Product/industry/keywords to design for (e.g. 'saas analytics dashboard')",
+    )
+    p_uiux.add_argument(
+        "--design-system", "-ds", action="store_true",
+        help="Generate a complete design system recommendation (takes priority over domain/stack search)",
+    )
+    p_uiux.add_argument(
+        "--project-name", "-p", default=None,
+        help="Project name for design-system output",
+    )
+    p_uiux.add_argument(
+        "--domain", "-d",
+        help="Search a specific domain: style, color, chart, landing, product, ux, "
+             "typography, google-fonts, icons, gsap, react, web (default: auto-detect)",
+    )
+    p_uiux.add_argument(
+        "--stack", "-s",
+        help="Stack-specific guidelines (react, nextjs, shadcn, html-tailwind, ...)",
+    )
+    p_uiux.add_argument(
+        "--max-results", "-n", type=int, default=3,
+        help="Max results for domain/stack search (default: 3)",
+    )
+    p_uiux.add_argument(
+        "--json", action="store_true", help="Output as JSON",
+    )
+    p_uiux.add_argument(
+        "--full", action="store_true",
+        help="Do not truncate long field values in text output",
+    )
+    p_uiux.add_argument(
+        "--format", "-f", choices=["ascii", "markdown"], default="ascii",
+        help="Output format for design system (ignored if --json)",
+    )
+    p_uiux.add_argument(
+        "--persist", action="store_true",
+        help="Save design system to design-system/<project-slug>/MASTER.md",
+    )
+    p_uiux.add_argument(
+        "--page", default=None,
+        help="Also create a page-specific override in design-system/<project-slug>/pages/",
+    )
+    p_uiux.add_argument(
+        "--output-dir", "-o", default=None,
+        help="Directory the design-system/ folder is created under (default: cwd)",
+    )
+    p_uiux.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing MASTER.md when persisting (default: skip if it exists)",
+    )
+    p_uiux.add_argument(
+        "--variance", type=int, choices=range(1, 11), metavar="1-10",
+        help="DESIGN_VARIANCE dial: 1=centered/minimal, 10=bold/asymmetric (only with --design-system)",
+    )
+    p_uiux.add_argument(
+        "--motion", type=int, choices=range(1, 11), metavar="1-10",
+        help="MOTION_INTENSITY dial: 1=subtle, 10=complex; pulls a matching GSAP snippet (only with --design-system)",
+    )
+    p_uiux.add_argument(
+        "--density", type=int, choices=range(1, 11), metavar="1-10",
+        help="VISUAL_DENSITY dial: 1=spacious, 10=dense/dashboard (only with --design-system)",
+    )
+    p_uiux.add_argument(
+        "--list-domains", action="store_true", help="List available search domains",
+    )
+    p_uiux.add_argument(
+        "--list-stacks", action="store_true", help="List available frontend stacks",
+    )
+    p_uiux.add_argument(
+        "--validate-data", action="store_true",
+        help="Run the installed skill's design-database integrity check (data guardrail)",
+    )
+    p_uiux.add_argument(
+        "--install", action="store_true",
+        help="Install the upstream ui-ux-pro-max-skill via its official npm CLI "
+             "(npm install -g ui-ux-pro-max-cli && uipro init --ai claude)",
+    )
+    p_uiux.set_defaults(func=cmd_uiux)
+
     return parser
+
+
+def cmd_uiux(args: argparse.Namespace) -> int:
+    """UI/UX design intelligence — search the design DB or generate a design system.
+
+    Thin wrapper: graphsift does not bundle the ui-ux-pro-max engine; it locates
+    the officially-installed skill on this machine and shells out to its
+    search.py (see graphsift.uiux). Install the engine once with
+    `graphsift uiux --install`.
+    """
+    from graphsift.uiux import DOMAINS, STACKS, find_search_script, install_engine, run_cli
+
+    if args.install:
+        code, msg = install_engine()
+        print(msg)
+        return code
+
+    if args.validate_data:
+        script = find_search_script()
+        if script is None:
+            from graphsift.uiux import install_hint
+            print(install_hint(), file=sys.stderr)
+            return 1
+        validator = script.parent / "validate_data.py"
+        if not validator.is_file():
+            print("error: validate_data.py not found next to the installed search.py", file=sys.stderr)
+            return 1
+        import subprocess as _sp
+        proc = _sp.run([sys.executable, str(validator)])
+        return proc.returncode if proc.returncode is not None else 1
+
+    if args.list_domains:
+        for d in DOMAINS:
+            print(d)
+        return 0
+
+    if args.list_stacks:
+        for s in STACKS:
+            print(s)
+        return 0
+
+    if not args.query:
+        print("error: uiux requires a query (e.g. 'graphsift uiux \"saas analytics dashboard\"')", file=sys.stderr)
+        return 2
+
+    # Map argparse Namespace -> upstream search.py argv.
+    argv: list[str] = []
+    if args.design_system:
+        argv.append("--design-system")
+    if args.project_name:
+        argv += ["--project-name", args.project_name]
+    if args.domain:
+        argv += ["--domain", args.domain]
+    if args.stack:
+        argv += ["--stack", args.stack]
+    if args.max_results:
+        argv += ["--max-results", str(args.max_results)]
+    if args.json:
+        argv.append("--json")
+    if args.full:
+        argv.append("--full")
+    if args.format:
+        argv += ["--format", args.format]
+    if args.persist:
+        argv.append("--persist")
+    if args.page:
+        argv += ["--page", args.page]
+    if args.output_dir:
+        argv += ["--output-dir", args.output_dir]
+    if args.force:
+        argv.append("--force")
+    if args.variance:
+        argv += ["--variance", str(args.variance)]
+    if args.motion:
+        argv += ["--motion", str(args.motion)]
+    if args.density:
+        argv += ["--density", str(args.density)]
+
+    return run_cli(argv, args.query)
 
 
 def main() -> None:
@@ -3549,6 +3812,14 @@ def main() -> None:
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     gc.freeze()  # freeze pre-import objects — GC never rescans them
+    # Self-heal: drop stale user-global graphsift skills/commands that
+    # duplicate the project-scoped ones in the Claude Code slash menu.
+    try:
+        if _cleanup_legacy_global_skills():
+            print("[graphsift] Removed stale user-global graphsift skills "
+                  "(duplicate slash commands). Restart Claude Code to refresh the / menu.")
+    except Exception:
+        pass
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -3680,6 +3951,7 @@ def main() -> None:
         "read-cache": cmd_read_cache,
         "evidence": cmd_evidence,
         "guard": cmd_guard,
+        "uiux": cmd_uiux,
         "claude-md": cmd_claude_md,
         "guide": cmd_guide,
     }

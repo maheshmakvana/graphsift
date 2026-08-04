@@ -2591,6 +2591,112 @@ def _should_auto_verify(file_path: str) -> bool:
     return True
 
 
+def _tool_uiux_design_system(params: dict) -> dict:
+    """Generate a complete UI/UX design system for a product/industry query.
+
+    Delegates to the MIT-licensed ui-ux-pro-max-skill engine (installed via
+    `graphsift uiux --install`). Returns style, WCAG-tested palette, typography,
+    motion presets, anti-patterns, key effects and the pre-delivery checklist.
+    """
+    from graphsift.uiux import run_json
+
+    query = params.get("query", "").strip()
+    if not query:
+        return {"error": "query parameter is required (e.g. 'saas analytics dashboard')"}
+
+    argv = ["--design-system", "--json"]
+    if params.get("project_name"):
+        argv += ["--project-name", str(params["project_name"])]
+    if params.get("format"):
+        argv += ["--format", str(params["format"])]
+    for dial, flag in (("variance", "--variance"), ("motion", "--motion"), ("density", "--density")):
+        val = params.get(dial)
+        if val is not None:
+            try:
+                argv += [flag, str(int(val))]
+            except (TypeError, ValueError):
+                return {"error": f"{dial} must be an integer 1-10"}
+
+    result = run_json([query, *argv])
+    if isinstance(result, dict) and "design_system" in result:
+        return result["design_system"]
+    return result
+
+
+def _tool_uiux_search(params: dict) -> dict:
+    """Search the UI/UX design database (styles, colors, typography, UX guidelines, charts, ...).
+
+    `domain` selects a domain (style, color, chart, landing, product, ux,
+    typography, google-fonts, icons, gsap, react, web); when omitted the engine
+    auto-detects it. Returns ranked BM25 matches from the installed engine.
+    """
+    from graphsift.uiux import run_json
+
+    query = params.get("query", "").strip()
+    if not query:
+        return {"error": "query parameter is required (e.g. 'glassmorphism landing page')"}
+
+    argv = ["--json"]
+    if params.get("domain"):
+        argv += ["--domain", str(params["domain"])]
+    if params.get("max_results"):
+        try:
+            argv += ["--max-results", str(int(params["max_results"]))]
+        except (TypeError, ValueError):
+            return {"error": "max_results must be an integer"}
+
+    return run_json([query, *argv])
+
+
+def _tool_uiux_stack_guide(params: dict) -> dict:
+    """Framework/stack-specific UI guidelines (react, nextjs, shadcn, html-tailwind, ...).
+
+    Returns Do/Don't guidance, severity and docs URLs for the requested stack.
+    When `query` is omitted, the engine's BM25 search needs a query whose terms
+    actually appear in the stack's guidelines, so we try a fallback chain
+    (stack name, first token, then a generic term) and return the first match.
+    """
+    from graphsift.uiux import run_json
+
+    stack = params.get("stack", "").strip()
+    if not stack:
+        return {"error": "stack parameter is required (e.g. 'react', 'nextjs', 'shadcn', 'html-tailwind')"}
+
+    max_results = None
+    if params.get("max_results"):
+        try:
+            max_results = int(params["max_results"])
+        except (TypeError, ValueError):
+            return {"error": "max_results must be an integer"}
+
+    def _call(q: str) -> dict:
+        argv = ["--stack", stack, "--json"]
+        if max_results:
+            argv += ["--max-results", str(max_results)]
+        return run_json([q, *argv])
+
+    query = params.get("query", "").strip()
+    if query:
+        # An explicit query is authoritative — never rewritten by fallback.
+        result = _call(query)
+        if isinstance(result, dict) and "query" not in result:
+            result["query"] = query
+        return result
+
+    # No explicit query: BM25 needs terms present in the stack's guidelines, so
+    # try a chain (stack name, first token, generic term) and return first hit.
+    for q in (stack, stack.split("-", 1)[0], "components"):
+        result = _call(q)
+        if not isinstance(result, dict):
+            return result
+        if "error" in result and result.get("count", 0) == 0:
+            return result  # engine error (e.g. missing install) — surface it
+        if result.get("count", 0) > 0:
+            result["query"] = q
+            return result
+    return {"error": f"no guidance found for stack '{stack}'", "count": 0}
+
+
 def _tool_auto_process_output(params: dict) -> dict:
     """Auto-detect and compress CLI output.
 
@@ -2787,6 +2893,61 @@ _TOOLS = {
                 "text": {"type": "string", "description": "CLI output text to compress"},
             },
             "required": ["text"],
+        },
+    },
+    "uiux_design_system": {
+        "fn": _tool_uiux_design_system,
+        "description": (
+            "Generate a complete UI/UX design system for a product/industry query "
+            "(style, WCAG-tested palette, typography, motion presets, anti-patterns, "
+            "pre-delivery checklist). Delegates to the MIT-licensed ui-ux-pro-max-skill "
+            "engine. Use before writing UI code and when reviewing visual design quality."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Product/industry/keywords, e.g. 'saas analytics dashboard'"},
+                "project_name": {"type": "string", "description": "Project name for the design system output"},
+                "format": {"type": "string", "enum": ["ascii", "markdown"], "description": "Output format (default ascii)"},
+                "variance": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Design variance dial: 1=centered/minimal, 10=bold/asymmetric"},
+                "motion": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Motion intensity dial: 1=subtle, 10=complex (pulls a GSAP snippet)"},
+                "density": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Visual density dial: 1=spacious, 10=dense/dashboard"},
+            },
+            "required": ["query"],
+        },
+    },
+    "uiux_search": {
+        "fn": _tool_uiux_search,
+        "description": (
+            "Search the UI/UX design database (styles, colors, typography, UX guidelines, "
+            "charts, landing patterns, icons, GSAP motion). domain selects the domain; "
+            "when omitted the engine auto-detects it. Returns ranked BM25 matches."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keywords, e.g. 'glassmorphism landing page'"},
+                "domain": {"type": "string", "enum": ["style", "color", "chart", "landing", "product", "ux", "typography", "google-fonts", "icons", "gsap", "react", "web"], "description": "Domain to search (default: auto-detect)"},
+                "max_results": {"type": "integer", "description": "Max results (default 3)"},
+            },
+            "required": ["query"],
+        },
+    },
+    "uiux_stack_guide": {
+        "fn": _tool_uiux_stack_guide,
+        "description": (
+            "Framework/stack-specific UI guidelines (react, nextjs, shadcn, html-tailwind, "
+            "vue, svelte, flutter, swiftui, ...). Returns Do/Don't guidance, severity "
+            "and docs URLs for the requested stack."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stack": {"type": "string", "description": "Stack name, e.g. 'react', 'nextjs', 'shadcn', 'html-tailwind'"},
+                "query": {"type": "string", "description": "Optional topic keyword (default: 'general best practices')"},
+                "max_results": {"type": "integer", "description": "Max results (default 3)"},
+            },
+            "required": ["stack"],
         },
     },
     "auto_verify_and_fix": {
